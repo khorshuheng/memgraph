@@ -11,7 +11,7 @@ use crate::{
             CreateNodeParameters, DeleteEdgeParameters, EdgeTypeResponse, NeighborResponse,
             NodeKindResponse, NodeResponse, SearchHitResponse, SearchParameters,
         },
-        wrapper::{ApiError, ApiSuccess},
+        wrapper::{ApiError, ApiList, ApiSuccess},
     },
     model::{Edge, EdgeType, Node, NodeKind},
     state::AppState,
@@ -40,15 +40,15 @@ pub async fn create_node_kind(
     tag = "Graph",
     get,
     path = "/node-kinds",
-    responses((status = 200, description = "List node kinds", body = [NodeKindResponse]))
+    responses((status = 200, description = "List node kinds", body = ApiList<NodeKindResponse>))
 )]
 pub async fn list_node_kinds(
     State(state): State<AppState>,
-) -> Result<ApiSuccess<Vec<NodeKindResponse>>, ApiError> {
+) -> Result<ApiList<NodeKindResponse>, ApiError> {
     let node_kinds = state.graph_service.list_node_kinds().await?;
-    Ok(ApiSuccess {
+    Ok(ApiList {
         status: StatusCode::OK,
-        data: node_kinds.into_iter().map(Into::into).collect(),
+        items: node_kinds.into_iter().map(Into::into).collect(),
     })
 }
 
@@ -75,15 +75,15 @@ pub async fn create_edge_type(
     tag = "Graph",
     get,
     path = "/edge-types",
-    responses((status = 200, description = "List edge types", body = [EdgeTypeResponse]))
+    responses((status = 200, description = "List edge types", body = ApiList<EdgeTypeResponse>))
 )]
 pub async fn list_edge_types(
     State(state): State<AppState>,
-) -> Result<ApiSuccess<Vec<EdgeTypeResponse>>, ApiError> {
+) -> Result<ApiList<EdgeTypeResponse>, ApiError> {
     let edge_types = state.graph_service.list_edge_types().await?;
-    Ok(ApiSuccess {
+    Ok(ApiList {
         status: StatusCode::OK,
-        data: edge_types.into_iter().map(Into::into).collect(),
+        items: edge_types.into_iter().map(Into::into).collect(),
     })
 }
 
@@ -110,15 +110,13 @@ pub async fn create_node(
     tag = "Graph",
     get,
     path = "/nodes",
-    responses((status = 200, description = "List nodes", body = [NodeResponse]))
+    responses((status = 200, description = "List nodes", body = ApiList<NodeResponse>))
 )]
-pub async fn list_nodes(
-    State(state): State<AppState>,
-) -> Result<ApiSuccess<Vec<NodeResponse>>, ApiError> {
+pub async fn list_nodes(State(state): State<AppState>) -> Result<ApiList<NodeResponse>, ApiError> {
     let nodes = state.graph_service.list_nodes().await?;
-    Ok(ApiSuccess {
+    Ok(ApiList {
         status: StatusCode::OK,
-        data: nodes.into_iter().map(Into::into).collect(),
+        items: nodes.into_iter().map(Into::into).collect(),
     })
 }
 
@@ -160,16 +158,16 @@ pub async fn delete_node(
     get,
     path = "/nodes/{node_id}/neighbors",
     params(("node_id" = i64, Path, description = "Node id")),
-    responses((status = 200, description = "Outgoing neighbors", body = [NeighborResponse]))
+    responses((status = 200, description = "Outgoing neighbors", body = ApiList<NeighborResponse>))
 )]
 pub async fn list_neighbors(
     State(state): State<AppState>,
     Path(node_id): Path<i64>,
-) -> Result<ApiSuccess<Vec<NeighborResponse>>, ApiError> {
+) -> Result<ApiList<NeighborResponse>, ApiError> {
     let neighbors = state.graph_service.neighbors(node_id).await?;
-    Ok(ApiSuccess {
+    Ok(ApiList {
         status: StatusCode::OK,
-        data: neighbors.into_iter().map(Into::into).collect(),
+        items: neighbors.into_iter().map(Into::into).collect(),
     })
 }
 
@@ -210,15 +208,15 @@ pub async fn remove_edge(
     get,
     path = "/search",
     params(SearchParameters),
-    responses((status = 200, description = "Full-text search hits", body = [SearchHitResponse]))
+    responses((status = 200, description = "Full-text search hits", body = ApiList<SearchHitResponse>))
 )]
 pub async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchParameters>,
-) -> Result<ApiSuccess<Vec<SearchHitResponse>>, ApiError> {
+) -> Result<ApiList<SearchHitResponse>, ApiError> {
     let hits = state.graph_service.search(&params.q).await?;
-    Ok(ApiSuccess {
+    Ok(ApiList {
         status: StatusCode::OK,
-        data: hits.into_iter().map(Into::into).collect(),
+        items: hits.into_iter().map(Into::into).collect(),
     })
 }

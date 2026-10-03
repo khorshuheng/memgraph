@@ -2,6 +2,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
+use utoipa::ToSchema;
 
 #[derive(Serialize)]
 pub struct ApiSuccess<T: Serialize> {
@@ -12,6 +13,20 @@ pub struct ApiSuccess<T: Serialize> {
 }
 
 impl<T: Serialize> IntoResponse for ApiSuccess<T> {
+    fn into_response(self) -> Response {
+        (self.status, Json(self)).into_response()
+    }
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ApiList<T: Serialize> {
+    #[serde(skip_serializing)]
+    #[schema(ignore)]
+    pub status: StatusCode,
+    pub items: Vec<T>,
+}
+
+impl<T: Serialize> IntoResponse for ApiList<T> {
     fn into_response(self) -> Response {
         (self.status, Json(self)).into_response()
     }
