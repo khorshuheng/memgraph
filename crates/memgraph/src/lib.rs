@@ -1,4 +1,5 @@
 pub mod config;
+pub mod database;
 pub mod dto;
 pub mod handler;
 pub mod model;

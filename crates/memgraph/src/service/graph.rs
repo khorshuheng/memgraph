@@ -108,8 +108,8 @@ impl GraphService {
 #[cfg(test)]
 mod tests {
     use crate::{
+        database::{create_sqlite_pool, migrate},
         repository::graph::SqliteGraphRepository,
-        state::{create_sqlite_pool, migrate},
     };
 
     use super::*;
