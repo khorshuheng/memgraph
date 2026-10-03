@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    model::graph::{Edge, Node, Relation, SearchHit},
+    model::{Edge, EdgeType, Node, NodeKind, SearchHit},
     repository::graph::GraphRepository,
 };
 
@@ -15,6 +15,34 @@ pub struct GraphService {
 impl GraphService {
     pub fn new(repository: Arc<dyn GraphRepository>) -> Self {
         Self { repository }
+    }
+
+    pub async fn create_node_kind(&self, node_kind: &NodeKind) -> Result<NodeKind, ServiceError> {
+        self.repository
+            .create_node_kind(node_kind)
+            .await
+            .map_err(ServiceError::from)
+    }
+
+    pub async fn list_node_kinds(&self) -> Result<Vec<NodeKind>, ServiceError> {
+        self.repository
+            .list_node_kinds()
+            .await
+            .map_err(ServiceError::from)
+    }
+
+    pub async fn create_edge_type(&self, edge_type: &EdgeType) -> Result<EdgeType, ServiceError> {
+        self.repository
+            .create_edge_type(edge_type)
+            .await
+            .map_err(ServiceError::from)
+    }
+
+    pub async fn list_edge_types(&self) -> Result<Vec<EdgeType>, ServiceError> {
+        self.repository
+            .list_edge_types()
+            .await
+            .map_err(ServiceError::from)
     }
 
     pub async fn upsert_node(&self, node: &Node) -> Result<Node, ServiceError> {
@@ -43,20 +71,6 @@ impl GraphService {
     pub async fn list_nodes(&self) -> Result<Vec<Node>, ServiceError> {
         self.repository
             .list_nodes()
-            .await
-            .map_err(ServiceError::from)
-    }
-
-    pub async fn upsert_relation(&self, relation: &Relation) -> Result<Relation, ServiceError> {
-        self.repository
-            .upsert_relation(relation)
-            .await
-            .map_err(ServiceError::from)
-    }
-
-    pub async fn list_relations(&self) -> Result<Vec<Relation>, ServiceError> {
-        self.repository
-            .list_relations()
             .await
             .map_err(ServiceError::from)
     }
@@ -112,29 +126,81 @@ mod tests {
         GraphService::new(Arc::new(SqliteGraphRepository::new(pool)))
     }
 
-    fn node(kind: &str, name: &str, content: &str) -> Node {
-        Node {
+    fn node_kind(name: &str) -> NodeKind {
+        NodeKind {
             id: 0,
-            kind: kind.to_string(),
             name: name.to_string(),
             description: String::new(),
-            content: content.to_string(),
         }
     }
 
-    fn relation(name: &str, description: &str) -> Relation {
-        Relation {
+    fn edge_type(name: &str, description: &str) -> EdgeType {
+        EdgeType {
             id: 0,
             name: name.to_string(),
             description: description.to_string(),
         }
     }
 
+    fn node(kind_id: i64, name: &str, content: &str) -> Node {
+        Node {
+            id: 0,
+            kind_id,
+            name: name.to_string(),
+            description: String::new(),
+            content: content.to_string(),
+        }
+    }
+
+    async fn seed_person(service: &GraphService) -> i64 {
+        service
+            .create_node_kind(&node_kind("person"))
+            .await
+            .unwrap()
+            .id
+    }
+
+    #[tokio::test]
+    async fn creates_and_lists_node_kinds() {
+        let service = service().await;
+        let created = service
+            .create_node_kind(&node_kind("person"))
+            .await
+            .unwrap();
+        assert!(created.id > 0);
+        assert_eq!(service.list_node_kinds().await.unwrap(), vec![created]);
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_node_kind() {
+        let service = service().await;
+        service
+            .create_node_kind(&node_kind("person"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            service.create_node_kind(&node_kind("person")).await,
+            Err(ServiceError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn creates_and_lists_edge_types() {
+        let service = service().await;
+        let created = service
+            .create_edge_type(&edge_type("knows", ""))
+            .await
+            .unwrap();
+        assert!(created.id > 0);
+        assert_eq!(service.list_edge_types().await.unwrap(), vec![created]);
+    }
+
     #[tokio::test]
     async fn assigns_id_on_insert() {
         let service = service().await;
+        let kind_id = seed_person(&service).await;
         let created = service
-            .upsert_node(&node("person", "Ada", ""))
+            .upsert_node(&node(kind_id, "Ada", ""))
             .await
             .unwrap();
         assert!(created.id > 0);
@@ -142,10 +208,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_node_with_unknown_kind() {
+        let service = service().await;
+        assert!(matches!(
+            service.upsert_node(&node(404, "Ada", "")).await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn keeps_id_on_conflict() {
         let service = service().await;
+        let kind_id = seed_person(&service).await;
         let created = service
-            .upsert_node(&node("person", "Ada", "a"))
+            .upsert_node(&node(kind_id, "Ada", "a"))
             .await
             .unwrap();
         let mut changed = created.clone();
@@ -159,8 +235,9 @@ mod tests {
     #[tokio::test]
     async fn deletes_node_and_fts_row() {
         let service = service().await;
+        let kind_id = seed_person(&service).await;
         let created = service
-            .upsert_node(&node("person", "Ada", ""))
+            .upsert_node(&node(kind_id, "Ada", ""))
             .await
             .unwrap();
         service.delete_node(created.id).await.unwrap();
@@ -172,40 +249,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_relation_is_idempotent_by_name() {
-        let service = service().await;
-        let first = service
-            .upsert_relation(&relation("knows", ""))
-            .await
-            .unwrap();
-        let second = service
-            .upsert_relation(&relation("knows", "knows someone"))
-            .await
-            .unwrap();
-        assert_eq!(first.id, second.id);
-        assert_eq!(second.description, "knows someone");
-        assert_eq!(service.list_relations().await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
     async fn traverses_directed_edges() {
         let service = service().await;
+        let kind_id = seed_person(&service).await;
         let ada = service
-            .upsert_node(&node("person", "Ada", ""))
+            .upsert_node(&node(kind_id, "Ada", ""))
             .await
             .unwrap();
         let bob = service
-            .upsert_node(&node("person", "Bob", ""))
+            .upsert_node(&node(kind_id, "Bob", ""))
             .await
             .unwrap();
         let knows = service
-            .upsert_relation(&relation("knows", ""))
+            .create_edge_type(&edge_type("knows", ""))
             .await
             .unwrap();
         let edge = Edge {
             source: ada.id,
             destination: bob.id,
-            relation_id: knows.id,
+            edge_type_id: knows.id,
         };
         service.add_edge(&edge).await.unwrap();
         service.add_edge(&edge).await.unwrap();
@@ -223,8 +285,9 @@ mod tests {
     #[tokio::test]
     async fn search_matches_and_reflects_updates() {
         let service = service().await;
+        let kind_id = seed_person(&service).await;
         let ada = service
-            .upsert_node(&node("person", "Ada Lovelace", "pioneer of computing"))
+            .upsert_node(&node(kind_id, "Ada Lovelace", "pioneer of computing"))
             .await
             .unwrap();
         let hits = service.search("computing").await.unwrap();

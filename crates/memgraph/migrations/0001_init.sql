@@ -1,22 +1,28 @@
-CREATE TABLE node (
-  id INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL,
-  name TEXT NOT NULL,
-  description TEXT NOT NULL,
-  content TEXT NOT NULL
-);
-
-CREATE TABLE relation (
+CREATE TABLE node_kind (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
   description TEXT NOT NULL
 );
 
+CREATE TABLE edge_type (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL
+);
+
+CREATE TABLE node (
+  id INTEGER PRIMARY KEY,
+  kind_id INTEGER NOT NULL REFERENCES node_kind(id),
+  name TEXT NOT NULL,
+  description TEXT NOT NULL,
+  content TEXT NOT NULL
+);
+
 CREATE TABLE edge (
   source INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
   destination INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
-  relation_id INTEGER NOT NULL REFERENCES relation(id) ON DELETE CASCADE,
-  PRIMARY KEY (source, relation_id, destination)
+  edge_type_id INTEGER NOT NULL REFERENCES edge_type(id),
+  PRIMARY KEY (source, edge_type_id, destination)
 );
 
 CREATE VIRTUAL TABLE node_fts USING fts5(
