@@ -8,7 +8,7 @@ async fn main() {
     tracing_subscriber::fmt::init();
     let app_config = AppConfig::new().expect("error parsing configuration");
     let app_state = AppState::new(&app_config).await;
-    let app_routes = routes::root::routes(app_state);
+    let app_routes = routes::router(app_state);
     let listener_address = app_config.server.listener_address();
     let listener = tokio::net::TcpListener::bind(&listener_address)
         .await
