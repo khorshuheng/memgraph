@@ -1,7 +1,7 @@
 use axum::http::StatusCode;
 use thiserror::Error;
 
-use crate::dto::wrapper::ApiError;
+use crate::{dto::wrapper::ApiError, repository::error::RepositoryError};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ServiceError {
@@ -11,6 +11,19 @@ pub enum ServiceError {
     EntityNotFound,
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("unprocessable entity: {0}")]
+    UnprocessableEntity(String),
+}
+
+impl From<RepositoryError> for ServiceError {
+    fn from(error: RepositoryError) -> Self {
+        match error {
+            RepositoryError::RowNotFound => ServiceError::EntityNotFound,
+            RepositoryError::UniqueConstraintViolation(err) => ServiceError::Conflict(err),
+            RepositoryError::ForeignKeyViolation(err) => ServiceError::UnprocessableEntity(err),
+            err => ServiceError::InternalError(err.to_string()),
+        }
+    }
 }
 
 impl From<ServiceError> for ApiError {
@@ -26,6 +39,10 @@ impl From<ServiceError> for ApiError {
             },
             ServiceError::Conflict(_) => ApiError {
                 status: StatusCode::CONFLICT,
+                message: error.to_string(),
+            },
+            ServiceError::UnprocessableEntity(_) => ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
                 message: error.to_string(),
             },
         }

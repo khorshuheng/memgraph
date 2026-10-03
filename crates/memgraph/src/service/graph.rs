@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     model::graph::{Edge, Node, Relation, SearchHit},
-    repository::{error::RepositoryError, graph::GraphRepository},
+    repository::graph::GraphRepository,
 };
 
 use super::error::ServiceError;
@@ -88,16 +88,6 @@ impl GraphService {
             .search(fts_query)
             .await
             .map_err(ServiceError::from)
-    }
-}
-
-impl From<RepositoryError> for ServiceError {
-    fn from(error: RepositoryError) -> Self {
-        match error {
-            RepositoryError::RowNotFound => ServiceError::EntityNotFound,
-            RepositoryError::UniqueConstraintViolation(err) => ServiceError::Conflict(err),
-            err => ServiceError::InternalError(err.to_string()),
-        }
     }
 }
 
