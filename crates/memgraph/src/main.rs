@@ -1,4 +1,4 @@
-use memgraph_server::{config::AppConfig, routes, state::AppState};
+use memgraph::{config::AppConfig, routes, state::AppState};
 use tokio::signal;
 use tracing::info;
 
