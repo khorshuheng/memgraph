@@ -13,7 +13,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&listener_address)
         .await
         .expect("error binding app server listener");
-    info!("memgraph-server listening on {}", listener_address);
+    info!("memgraph listening on {}", listener_address);
     axum::serve(listener, app_routes)
         .with_graceful_shutdown(shutdown_signal())
         .await
