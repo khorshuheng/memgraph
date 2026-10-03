@@ -3,3 +3,8 @@ target
 
 **/*.rs.bk
 
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+crates/memgraph-server/config/override.toml
+

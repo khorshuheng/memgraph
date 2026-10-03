@@ -1,0 +1,7 @@
+[server]
+host = "127.0.0.1"
+port = 7373
+
+[database]
+path = "memgraph.sqlite"
+max_connections = 5
