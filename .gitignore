@@ -6,5 +6,5 @@ target
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
-crates/memgraph-server/config/override.toml
+crates/memgraph/config/override.toml
 
