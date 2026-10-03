@@ -33,5 +33,13 @@ pub struct Edge {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {
     pub node: Node,
-    pub score: f64,
+    pub confidence: f64,
+    pub matched_terms: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentMatches {
+    pub segment: String,
+    pub matches: Vec<SearchHit>,
+    pub total_matches: usize,
 }

@@ -1,7 +1,10 @@
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
-    model::{Edge, EdgeType, Node, NodeKind, SearchHit},
+    config::SearchConfig,
+    model::{Edge, EdgeType, Node, NodeKind, SearchHit, SegmentMatches},
     repository::graph::GraphRepository,
 };
 
@@ -10,11 +13,15 @@ use super::error::ServiceError;
 #[derive(Clone)]
 pub struct GraphService {
     repository: Arc<dyn GraphRepository>,
+    search_config: SearchConfig,
 }
 
 impl GraphService {
-    pub fn new(repository: Arc<dyn GraphRepository>) -> Self {
-        Self { repository }
+    pub fn new(repository: Arc<dyn GraphRepository>, search_config: SearchConfig) -> Self {
+        Self {
+            repository,
+            search_config,
+        }
     }
 
     pub async fn create_node_kind(&self, node_kind: &NodeKind) -> Result<NodeKind, ServiceError> {
@@ -97,12 +104,179 @@ impl GraphService {
             .map_err(ServiceError::from)
     }
 
-    pub async fn search(&self, fts_query: &str) -> Result<Vec<SearchHit>, ServiceError> {
-        self.repository
-            .search(fts_query)
-            .await
-            .map_err(ServiceError::from)
+    pub async fn search(&self, query: &str) -> Result<Vec<SegmentMatches>, ServiceError> {
+        let mut segments = Vec::new();
+        for segment in split_segments(query, &self.search_config.split_characters()) {
+            let hits = self.score_segment(&segment).await?;
+            if hits.is_empty() {
+                continue;
+            }
+            let total_matches = hits.len();
+            let matches = hits
+                .into_iter()
+                .take(self.search_config.per_segment_limit)
+                .collect();
+            segments.push(SegmentMatches {
+                segment,
+                matches,
+                total_matches,
+            });
+        }
+        Ok(segments)
     }
+
+    pub async fn search_segment(
+        &self,
+        segment: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchHit>, ServiceError> {
+        let hits = self.score_segment(segment).await?;
+        Ok(hits.into_iter().skip(offset).take(limit).collect())
+    }
+
+    pub fn summary_chars(&self) -> usize {
+        self.search_config.summary_chars
+    }
+
+    pub fn default_segment_limit(&self) -> usize {
+        self.search_config.per_segment_limit
+    }
+
+    async fn score_segment(&self, segment: &str) -> Result<Vec<SearchHit>, ServiceError> {
+        let considered = self.considered_terms(segment).await?;
+        if considered.is_empty() {
+            return Ok(Vec::new());
+        }
+        let denominator: f64 = considered.iter().map(|(_, weight)| weight).sum();
+        let weights: HashMap<&str, f64> = considered
+            .iter()
+            .map(|(term, weight)| (term.as_str(), *weight))
+            .collect();
+        let terms: Vec<String> = considered.iter().map(|(term, _)| term.clone()).collect();
+        let fts_query = build_fts_query(&terms);
+        let candidates = self.repository.search_descriptions(&fts_query).await?;
+
+        let mut hits = Vec::new();
+        for node in candidates {
+            let tokens: HashSet<String> = tokenize(&node.description).into_iter().collect();
+            let matched: Vec<String> = terms
+                .iter()
+                .filter(|term| tokens.contains(*term))
+                .cloned()
+                .collect();
+            let mass: f64 = matched
+                .iter()
+                .map(|term| weights.get(term.as_str()).copied().unwrap_or(0.0))
+                .sum();
+            let confidence = if denominator > 0.0 {
+                mass / denominator
+            } else {
+                0.0
+            };
+            if matched.len() < self.search_config.min_matched_terms {
+                continue;
+            }
+            if mass < self.search_config.min_matched_idf {
+                continue;
+            }
+            if confidence < self.search_config.confidence_threshold {
+                continue;
+            }
+            hits.push(SearchHit {
+                node,
+                confidence,
+                matched_terms: matched,
+            });
+        }
+        hits.sort_by(|left, right| {
+            right
+                .confidence
+                .partial_cmp(&left.confidence)
+                .unwrap_or(Ordering::Equal)
+                .then(left.node.id.cmp(&right.node.id))
+        });
+        Ok(hits)
+    }
+
+    async fn considered_terms(&self, segment: &str) -> Result<Vec<(String, f64)>, ServiceError> {
+        let mut resolved: BTreeSet<String> = BTreeSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for token in tokenize(segment) {
+            if !seen.insert(token.clone()) {
+                continue;
+            }
+            for term in self.resolve_token(&token).await? {
+                resolved.insert(term);
+            }
+        }
+        if resolved.is_empty() {
+            return Ok(Vec::new());
+        }
+        let node_count = self.repository.count_nodes().await? as f64;
+        let mut weighted = Vec::new();
+        for term in resolved {
+            let frequency = self.repository.term_document_frequency(&term).await? as f64;
+            weighted.push((term, inverse_document_frequency(node_count, frequency)));
+        }
+        weighted.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(Ordering::Equal)
+                .then(left.0.cmp(&right.0))
+        });
+        weighted.truncate(self.search_config.max_terms);
+        Ok(weighted)
+    }
+
+    async fn resolve_token(&self, token: &str) -> Result<Vec<String>, ServiceError> {
+        let min_length = self.search_config.prefix_min_length;
+        let characters: Vec<char> = token.chars().collect();
+        let mut terms: BTreeSet<String> = BTreeSet::new();
+        if self.repository.term_exists(token).await? {
+            terms.insert(token.to_string());
+        }
+        if characters.len() >= min_length {
+            for term in self.repository.terms_with_prefix(token).await? {
+                terms.insert(term);
+            }
+        }
+        for length in min_length..characters.len() {
+            let candidate: String = characters[..length].iter().collect();
+            if self.repository.term_exists(&candidate).await? {
+                terms.insert(candidate);
+            }
+        }
+        Ok(terms.into_iter().collect())
+    }
+}
+
+fn tokenize(text: &str) -> Vec<String> {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_lowercase())
+        .collect()
+}
+
+fn inverse_document_frequency(node_count: f64, document_frequency: f64) -> f64 {
+    (1.0 + node_count / document_frequency).ln()
+}
+
+fn split_segments(text: &str, separators: &[char]) -> Vec<String> {
+    text.split(|character| separators.contains(&character))
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn build_fts_query(terms: &[String]) -> String {
+    terms
+        .iter()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<String>>()
+        .join(" OR ")
 }
 
 #[cfg(test)]
@@ -123,7 +297,17 @@ mod tests {
             .await
             .expect("failed to create database connection pool");
         migrate(&pool).await.expect("failed to migrate database");
-        GraphService::new(Arc::new(SqliteGraphRepository::new(pool)))
+        GraphService::new(
+            Arc::new(SqliteGraphRepository::new(pool)),
+            test_search_config(),
+        )
+    }
+
+    fn test_search_config() -> crate::config::SearchConfig {
+        crate::config::SearchConfig {
+            min_matched_idf: 0.0,
+            ..crate::config::SearchConfig::default()
+        }
     }
 
     fn node_kind(name: &str) -> NodeKind {
@@ -149,6 +333,16 @@ mod tests {
             name: name.to_string(),
             description: String::new(),
             content: content.to_string(),
+        }
+    }
+
+    fn described_node(kind_id: i64, name: &str, description: &str) -> Node {
+        Node {
+            id: 0,
+            kind_id,
+            name: name.to_string(),
+            description: description.to_string(),
+            content: String::new(),
         }
     }
 
@@ -237,15 +431,16 @@ mod tests {
         let service = service().await;
         let kind_id = seed_person(&service).await;
         let created = service
-            .upsert_node(&node(kind_id, "Ada", ""))
+            .upsert_node(&described_node(kind_id, "Ada", "ada lovelace"))
             .await
             .unwrap();
+        assert_eq!(service.search("ada lovelace").await.unwrap().len(), 1);
         service.delete_node(created.id).await.unwrap();
         assert_eq!(
             service.delete_node(created.id).await.unwrap_err(),
             ServiceError::EntityNotFound
         );
-        assert!(service.search("ada").await.unwrap().is_empty());
+        assert!(service.search("ada lovelace").await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -287,17 +482,63 @@ mod tests {
         let service = service().await;
         let kind_id = seed_person(&service).await;
         let ada = service
-            .upsert_node(&node(kind_id, "Ada Lovelace", "pioneer of computing"))
+            .upsert_node(&described_node(
+                kind_id,
+                "Ada Lovelace",
+                "pioneer of computing",
+            ))
             .await
             .unwrap();
-        let hits = service.search("computing").await.unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].node.id, ada.id);
+        let segments = service.search("pioneer computing").await.unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].matches.len(), 1);
+        assert_eq!(segments[0].matches[0].node.id, ada.id);
+        assert!(segments[0].matches[0].confidence >= 0.99);
 
         let mut changed = ada.clone();
-        changed.content = "mathematician".to_string();
+        changed.description = "mathematician and logician".to_string();
         service.upsert_node(&changed).await.unwrap();
-        assert!(service.search("computing").await.unwrap().is_empty());
-        assert_eq!(service.search("mathematician").await.unwrap().len(), 1);
+        assert!(
+            service
+                .search("pioneer computing")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let segments = service.search("mathematician logician").await.unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].matches[0].node.id, ada.id);
+    }
+
+    #[tokio::test]
+    async fn gates_out_single_term_overlap() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        service
+            .upsert_node(&described_node(kind_id, "Ledger", "owned debt record"))
+            .await
+            .unwrap();
+        assert!(service.search("debt repayment").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn splits_multi_topic_prompt() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let composer = service
+            .upsert_node(&described_node(kind_id, "Composer", "musical composition"))
+            .await
+            .unwrap();
+        let database = service
+            .upsert_node(&described_node(kind_id, "Database", "query storage engine"))
+            .await
+            .unwrap();
+        let segments = service
+            .search("musical composition? query storage engine")
+            .await
+            .unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].matches[0].node.id, composer.id);
+        assert_eq!(segments[1].matches[0].node.id, database.id);
     }
 }

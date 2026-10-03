@@ -19,7 +19,7 @@ impl AppState {
             .await
             .expect("failed to migrate database");
         let graph_repository = Arc::new(SqliteGraphRepository::new(pool));
-        let graph_service = GraphService::new(graph_repository);
+        let graph_service = GraphService::new(graph_repository, app_config.search.clone());
         Self { graph_service }
     }
 }

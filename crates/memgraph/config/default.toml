@@ -5,3 +5,13 @@ port = 7373
 [database]
 path = "memgraph.sqlite"
 max_connections = 5
+
+[search]
+confidence_threshold = 0.70
+min_matched_idf = 2.0
+min_matched_terms = 2
+max_terms = 6
+prefix_min_length = 4
+per_segment_limit = 5
+summary_chars = 160
+split_points = [".", "!", "?", ";", "\n"]

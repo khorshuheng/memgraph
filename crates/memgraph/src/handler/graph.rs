@@ -9,7 +9,8 @@ use crate::{
         graph::{
             CreateEdgeParameters, CreateEdgeTypeParameters, CreateNodeKindParameters,
             CreateNodeParameters, DeleteEdgeParameters, EdgeTypeResponse, NeighborResponse,
-            NodeKindResponse, NodeResponse, SearchHitResponse, SearchParameters,
+            NodeKindResponse, NodeResponse, SearchHitResponse, SearchParameters, SearchResponse,
+            SearchSegmentParameters, SegmentResponse,
         },
         wrapper::{ApiError, ApiList, ApiSuccess},
     },
@@ -208,15 +209,83 @@ pub async fn remove_edge(
     get,
     path = "/search",
     params(SearchParameters),
-    responses((status = 200, description = "Full-text search hits", body = ApiList<SearchHitResponse>))
+    responses((status = 200, description = "Per-segment full-text search hits", body = SearchResponse))
 )]
 pub async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchParameters>,
+) -> Result<ApiSuccess<SearchResponse>, ApiError> {
+    let segments = state.graph_service.search(&params.q).await?;
+    let summary_chars = state.graph_service.summary_chars();
+    let segments = segments
+        .into_iter()
+        .map(|segment| {
+            let hidden = segment.total_matches.saturating_sub(segment.matches.len());
+            let probe = (hidden > 0).then(|| {
+                format!(
+                    "/api/search/segment?segment={}&limit={}&offset={}",
+                    percent_encode(&segment.segment),
+                    segment.total_matches,
+                    segment.matches.len()
+                )
+            });
+            SegmentResponse {
+                segment: segment.segment,
+                matches: segment
+                    .matches
+                    .into_iter()
+                    .map(|hit| SearchHitResponse::new(hit, summary_chars))
+                    .collect(),
+                total_matches: segment.total_matches,
+                hidden,
+                probe,
+            }
+        })
+        .collect();
+    Ok(ApiSuccess {
+        status: StatusCode::OK,
+        data: SearchResponse { segments },
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    get,
+    path = "/search/segment",
+    params(SearchSegmentParameters),
+    responses((status = 200, description = "Additional matches for a single segment", body = ApiList<SearchHitResponse>))
+)]
+pub async fn search_segment(
+    State(state): State<AppState>,
+    Query(params): Query<SearchSegmentParameters>,
 ) -> Result<ApiList<SearchHitResponse>, ApiError> {
-    let hits = state.graph_service.search(&params.q).await?;
+    let limit = params
+        .limit
+        .unwrap_or_else(|| state.graph_service.default_segment_limit());
+    let offset = params.offset.unwrap_or(0);
+    let hits = state
+        .graph_service
+        .search_segment(&params.segment, limit, offset)
+        .await?;
+    let summary_chars = state.graph_service.summary_chars();
     Ok(ApiList {
         status: StatusCode::OK,
-        items: hits.into_iter().map(Into::into).collect(),
+        items: hits
+            .into_iter()
+            .map(|hit| SearchHitResponse::new(hit, summary_chars))
+            .collect(),
     })
+}
+
+fn percent_encode(input: &str) -> String {
+    let mut encoded = String::new();
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }

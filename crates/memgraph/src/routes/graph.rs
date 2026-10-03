@@ -10,6 +10,6 @@ pub(crate) fn routes(app_state: AppState) -> OpenApiRouter {
         .routes(routes!(get_node, delete_node))
         .routes(routes!(list_neighbors))
         .routes(routes!(add_edge, remove_edge))
-        .routes(routes!(search))
+        .routes(routes!(search, search_segment))
         .with_state(app_state)
 }

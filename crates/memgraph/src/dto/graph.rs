@@ -181,20 +181,59 @@ impl From<(EdgeModel, NodeModel)> for NeighborResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SearchHitResponse {
-    pub node: NodeResponse,
-    pub score: f64,
+    pub id: i64,
+    pub kind_id: i64,
+    pub name: String,
+    pub summary: String,
+    pub confidence: f64,
+    pub matched_terms: Vec<String>,
 }
 
-impl From<SearchHitModel> for SearchHitResponse {
-    fn from(hit: SearchHitModel) -> Self {
+impl SearchHitResponse {
+    pub fn new(hit: SearchHitModel, summary_chars: usize) -> Self {
         SearchHitResponse {
-            node: hit.node.into(),
-            score: hit.score,
+            id: hit.node.id,
+            kind_id: hit.node.kind_id,
+            name: hit.node.name,
+            summary: truncate_summary(&hit.node.description, summary_chars),
+            confidence: hit.confidence,
+            matched_terms: hit.matched_terms,
         }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SegmentResponse {
+    pub segment: String,
+    pub matches: Vec<SearchHitResponse>,
+    pub total_matches: usize,
+    pub hidden: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SearchResponse {
+    pub segments: Vec<SegmentResponse>,
+}
+
+fn truncate_summary(text: &str, max_chars: usize) -> String {
+    let truncated: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        format!("{truncated}…")
+    } else {
+        truncated
     }
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct SearchParameters {
     pub q: String,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct SearchSegmentParameters {
+    pub segment: String,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }

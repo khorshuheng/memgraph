@@ -1,7 +1,7 @@
 use async_trait::async_trait;
-use sqlx::{FromRow, Row, SqlitePool};
+use sqlx::{FromRow, SqlitePool};
 
-use crate::model::{Edge, EdgeType, Node, NodeKind, SearchHit};
+use crate::model::{Edge, EdgeType, Node, NodeKind};
 
 use super::error::RepositoryError;
 
@@ -26,7 +26,11 @@ pub trait GraphRepository: Send + Sync {
     async fn remove_edge(&self, edge: &Edge) -> Result<bool, RepositoryError>;
     async fn neighbors(&self, source: i64) -> Result<Vec<(Edge, Node)>, RepositoryError>;
 
-    async fn search(&self, fts_query: &str) -> Result<Vec<SearchHit>, RepositoryError>;
+    async fn count_nodes(&self) -> Result<i64, RepositoryError>;
+    async fn term_document_frequency(&self, term: &str) -> Result<i64, RepositoryError>;
+    async fn terms_with_prefix(&self, prefix: &str) -> Result<Vec<String>, RepositoryError>;
+    async fn term_exists(&self, term: &str) -> Result<bool, RepositoryError>;
+    async fn search_descriptions(&self, fts_query: &str) -> Result<Vec<Node>, RepositoryError>;
 }
 
 #[derive(Clone)]
@@ -179,23 +183,59 @@ impl GraphRepository for SqliteGraphRepository {
             .map_err(Into::into)
     }
 
-    async fn search(&self, fts_query: &str) -> Result<Vec<SearchHit>, RepositoryError> {
-        let rows = sqlx::query(
-            "SELECT n.id, n.kind_id, n.name, n.description, n.content, bm25(node_fts) AS score \
+    async fn count_nodes(&self) -> Result<i64, RepositoryError> {
+        let count = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM node")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    async fn term_document_frequency(&self, term: &str) -> Result<i64, RepositoryError> {
+        let frequency =
+            sqlx::query_scalar::<_, i64>("SELECT doc FROM node_fts_vocab WHERE term = ?")
+                .bind(term)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(frequency.unwrap_or(0))
+    }
+
+    async fn terms_with_prefix(&self, prefix: &str) -> Result<Vec<String>, RepositoryError> {
+        let pattern = format!("{}%", escape_like_pattern(prefix));
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT term FROM node_fts_vocab WHERE term LIKE ? ESCAPE '\\' ORDER BY term",
+        )
+        .bind(pattern)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn term_exists(&self, term: &str) -> Result<bool, RepositoryError> {
+        let exists =
+            sqlx::query_scalar::<_, i64>("SELECT 1 FROM node_fts_vocab WHERE term = ? LIMIT 1")
+                .bind(term)
+                .fetch_optional(&self.pool)
+                .await?
+                .is_some();
+        Ok(exists)
+    }
+
+    async fn search_descriptions(&self, fts_query: &str) -> Result<Vec<Node>, RepositoryError> {
+        let rows = sqlx::query_as::<_, Node>(
+            "SELECT n.id, n.kind_id, n.name, n.description, n.content \
              FROM node_fts JOIN node n ON n.id = node_fts.rowid \
-             WHERE node_fts MATCH ? ORDER BY score, n.id",
+             WHERE node_fts MATCH ? ORDER BY bm25(node_fts), n.id",
         )
         .bind(fts_query)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter()
-            .map(|row| {
-                Ok(SearchHit {
-                    node: Node::from_row(row)?,
-                    score: row.try_get("score")?,
-                })
-            })
-            .collect::<Result<_, sqlx::Error>>()
-            .map_err(Into::into)
+        Ok(rows)
     }
+}
+
+fn escape_like_pattern(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
