@@ -184,6 +184,7 @@ impl GraphService {
                 continue;
             }
             hits.push(SearchHit {
+                relations: self.repository.relation_summaries(node.id).await?,
                 node,
                 confidence,
                 matched_terms: matched,
@@ -283,6 +284,7 @@ fn build_fts_query(terms: &[String]) -> String {
 mod tests {
     use crate::{
         database::{create_sqlite_pool, migrate},
+        model::RelationDirection,
         repository::graph::SqliteGraphRepository,
     };
 
@@ -540,5 +542,47 @@ mod tests {
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].matches[0].node.id, composer.id);
         assert_eq!(segments[1].matches[0].node.id, database.id);
+    }
+
+    #[tokio::test]
+    async fn search_hit_includes_topology_probe() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let ada = service
+            .upsert_node(&described_node(kind_id, "Ada", "ada lovelace"))
+            .await
+            .unwrap();
+        let bob = service
+            .upsert_node(&described_node(kind_id, "Bob", "ada lovelace"))
+            .await
+            .unwrap();
+        let knows = service
+            .create_edge_type(&edge_type("knows", ""))
+            .await
+            .unwrap();
+        service
+            .add_edge(&Edge {
+                source: ada.id,
+                destination: bob.id,
+                edge_type_id: knows.id,
+            })
+            .await
+            .unwrap();
+        let segments = service.search("ada lovelace").await.unwrap();
+        let ada_hit = segments[0]
+            .matches
+            .iter()
+            .find(|hit| hit.node.id == ada.id)
+            .unwrap();
+        assert_eq!(ada_hit.relations.len(), 1);
+        assert_eq!(ada_hit.relations[0].direction, RelationDirection::Outgoing);
+        assert_eq!(ada_hit.relations[0].edge_type, "knows");
+        assert_eq!(ada_hit.relations[0].count, 1);
+        let bob_hit = segments[0]
+            .matches
+            .iter()
+            .find(|hit| hit.node.id == bob.id)
+            .unwrap();
+        assert_eq!(bob_hit.relations[0].direction, RelationDirection::Ingoing);
     }
 }

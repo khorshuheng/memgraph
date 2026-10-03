@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use sqlx::{FromRow, SqlitePool};
 
-use crate::model::{Edge, EdgeType, Node, NodeKind};
+use crate::model::{Edge, EdgeType, Node, NodeKind, RelationDirection, RelationSummary};
 
 use super::error::RepositoryError;
 
@@ -31,6 +31,10 @@ pub trait GraphRepository: Send + Sync {
     async fn terms_with_prefix(&self, prefix: &str) -> Result<Vec<String>, RepositoryError>;
     async fn term_exists(&self, term: &str) -> Result<bool, RepositoryError>;
     async fn search_descriptions(&self, fts_query: &str) -> Result<Vec<Node>, RepositoryError>;
+    async fn relation_summaries(
+        &self,
+        node_id: i64,
+    ) -> Result<Vec<RelationSummary>, RepositoryError>;
 }
 
 #[derive(Clone)]
@@ -230,6 +234,41 @@ impl GraphRepository for SqliteGraphRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    async fn relation_summaries(
+        &self,
+        node_id: i64,
+    ) -> Result<Vec<RelationSummary>, RepositoryError> {
+        let rows = sqlx::query_as::<_, (i64, i64, String, i64)>(
+            "SELECT 0 AS direction, e.edge_type_id, t.name, count(*) AS count \
+             FROM edge e JOIN edge_type t ON t.id = e.edge_type_id \
+             WHERE e.source = ? GROUP BY e.edge_type_id, t.name \
+             UNION ALL \
+             SELECT 1, e.edge_type_id, t.name, count(*) \
+             FROM edge e JOIN edge_type t ON t.id = e.edge_type_id \
+             WHERE e.destination = ? GROUP BY e.edge_type_id, t.name \
+             ORDER BY direction, edge_type_id",
+        )
+        .bind(node_id)
+        .bind(node_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(direction, edge_type_id, edge_type, count)| RelationSummary {
+                    direction: if direction == 0 {
+                        RelationDirection::Outgoing
+                    } else {
+                        RelationDirection::Ingoing
+                    },
+                    edge_type_id,
+                    edge_type,
+                    count,
+                },
+            )
+            .collect())
     }
 }
 

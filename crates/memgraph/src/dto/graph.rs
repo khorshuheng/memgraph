@@ -3,6 +3,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::model::{
     Edge as EdgeModel, EdgeType as EdgeTypeModel, Node as NodeModel, NodeKind as NodeKindModel,
+    RelationDirection as RelationDirectionModel, RelationSummary as RelationSummaryModel,
     SearchHit as SearchHitModel,
 };
 
@@ -180,6 +181,28 @@ impl From<(EdgeModel, NodeModel)> for NeighborResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct RelationSummaryResponse {
+    pub direction: String,
+    pub edge_type_id: i64,
+    pub edge_type: String,
+    pub count: i64,
+}
+
+impl From<RelationSummaryModel> for RelationSummaryResponse {
+    fn from(summary: RelationSummaryModel) -> Self {
+        RelationSummaryResponse {
+            direction: match summary.direction {
+                RelationDirectionModel::Outgoing => "outgoing".to_string(),
+                RelationDirectionModel::Ingoing => "incoming".to_string(),
+            },
+            edge_type_id: summary.edge_type_id,
+            edge_type: summary.edge_type,
+            count: summary.count,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SearchHitResponse {
     pub id: i64,
     pub kind_id: i64,
@@ -187,6 +210,7 @@ pub struct SearchHitResponse {
     pub summary: String,
     pub confidence: f64,
     pub matched_terms: Vec<String>,
+    pub relations: Vec<RelationSummaryResponse>,
 }
 
 impl SearchHitResponse {
@@ -198,6 +222,7 @@ impl SearchHitResponse {
             summary: truncate_summary(&hit.node.description, summary_chars),
             confidence: hit.confidence,
             matched_terms: hit.matched_terms,
+            relations: hit.relations.into_iter().map(Into::into).collect(),
         }
     }
 }

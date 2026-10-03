@@ -30,11 +30,26 @@ pub struct Edge {
     pub edge_type_id: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationDirection {
+    Outgoing,
+    Ingoing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationSummary {
+    pub direction: RelationDirection,
+    pub edge_type_id: i64,
+    pub edge_type: String,
+    pub count: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {
     pub node: Node,
     pub confidence: f64,
     pub matched_terms: Vec<String>,
+    pub relations: Vec<RelationSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
