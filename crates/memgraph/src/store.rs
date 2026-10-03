@@ -3,52 +3,11 @@ use sqlx::{FromRow, Row, SqlitePool};
 
 use crate::model::graph::{Edge, Node, Relation};
 
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS node (
-  id INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL,
-  name TEXT NOT NULL,
-  description TEXT NOT NULL,
-  content TEXT NOT NULL
-);
+const MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-CREATE TABLE IF NOT EXISTS relation (
-  id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE,
-  description TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS edge (
-  source INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
-  destination INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
-  relation_id INTEGER NOT NULL REFERENCES relation(id) ON DELETE CASCADE,
-  PRIMARY KEY (source, relation_id, destination)
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS node_fts USING fts5(
-  name, description, content,
-  content = 'node',
-  content_rowid = 'id',
-  tokenize = 'unicode61 remove_diacritics 2'
-);
-
-CREATE TRIGGER IF NOT EXISTS node_after_insert AFTER INSERT ON node BEGIN
-  INSERT INTO node_fts(rowid, name, description, content)
-  VALUES (new.id, new.name, new.description, new.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS node_after_delete AFTER DELETE ON node BEGIN
-  INSERT INTO node_fts(node_fts, rowid, name, description, content)
-  VALUES ('delete', old.id, old.name, old.description, old.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS node_after_update AFTER UPDATE ON node BEGIN
-  INSERT INTO node_fts(node_fts, rowid, name, description, content)
-  VALUES ('delete', old.id, old.name, old.description, old.content);
-  INSERT INTO node_fts(rowid, name, description, content)
-  VALUES (new.id, new.name, new.description, new.content);
-END;
-"#;
+pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::migrate::MigrateError> {
+    MIGRATOR.run(pool).await
+}
 
 const NODE_COLUMNS: &str = "id, kind, name, description, content";
 
@@ -83,9 +42,8 @@ impl Store {
         Ok(Self { pool })
     }
 
-    pub async fn migrate(&self) -> Result<(), sqlx::Error> {
-        sqlx::raw_sql(SCHEMA).execute(&self.pool).await?;
-        Ok(())
+    pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
+        migrate(&self.pool).await
     }
 
     pub async fn upsert_node(&self, node: &Node) -> Result<Node, sqlx::Error> {

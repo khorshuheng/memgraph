@@ -14,6 +14,9 @@ impl AppState {
         let pool = create_sqlite_pool(&app_config.database)
             .await
             .expect("failed to create database connection pool");
+        memgraph::store::migrate(&pool)
+            .await
+            .expect("failed to migrate database");
         Self { pool }
     }
 }
