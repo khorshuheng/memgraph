@@ -25,10 +25,6 @@ per_segment_limit = 5
 summary_chars = 160
 split_points = [".", "!", "?", ";", "\n"]
 
-[health]
-enabled = true
-interval_secs = 900
-
 [audit]
 retention_days = 30
 "#;
@@ -94,27 +90,6 @@ impl Default for SearchConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct HealthConfig {
-    pub enabled: bool,
-    pub interval_secs: u64,
-}
-
-impl HealthConfig {
-    pub fn interval(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.interval_secs.max(1))
-    }
-}
-
-impl Default for HealthConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            interval_secs: 900,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct AuditConfig {
     pub retention_days: u64,
 }
@@ -130,7 +105,6 @@ pub struct AppConfig {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
     pub search: SearchConfig,
-    pub health: HealthConfig,
     pub audit: AuditConfig,
 }
 

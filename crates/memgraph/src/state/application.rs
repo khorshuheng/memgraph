@@ -29,39 +29,8 @@ impl AppState {
             health_service,
             audit_service,
         };
-        state.spawn_health_reporter(&app_config.health);
         state.spawn_audit_pruner(&app_config.audit);
         state
-    }
-
-    fn spawn_health_reporter(&self, health_config: &crate::config::HealthConfig) {
-        if !health_config.enabled {
-            tracing::info!("periodic graph health reporting disabled");
-            return;
-        }
-
-        let health_service = self.health_service.clone();
-        let interval = health_config.interval();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
-                match health_service.report().await {
-                    Ok(report) => {
-                        tracing::info!(health = %report.summary_line(), "graph health");
-                        for duplicate in report.duplicates.iter().take(5) {
-                            tracing::warn!(
-                                kind = %duplicate.kind,
-                                name = %duplicate.name,
-                                node_ids = ?duplicate.node_ids,
-                                "duplicate nodes share a kind and name"
-                            );
-                        }
-                    }
-                    Err(error) => tracing::warn!(%error, "graph health report failed"),
-                }
-            }
-        });
     }
 
     fn spawn_audit_pruner(&self, audit_config: &crate::config::AuditConfig) {
