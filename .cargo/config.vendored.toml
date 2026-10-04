@@ -1,20 +1,3 @@
-# Opt-in source replacement for offline / air-gapped builds.
-#
-# This file is deliberately NOT named `.cargo/config.toml`, so cargo never
-# loads it implicitly: normal builds keep resolving from crates.io.
-#
-# With the `vendor/` submodule checked out, build against the vendored crates
-# with either a one-shot flag:
-#
-#   cargo --config .cargo/config.vendored.toml build --offline
-#
-# or by making it the default for this checkout:
-#
-#   cp .cargo/config.vendored.toml .cargo/config.toml
-#
-# `directory` is relative to the directory containing this config's parent
-# folder (the repository root here), so "vendor" is the submodule mount point.
-
 [source.crates-io]
 replace-with = "vendored-sources"
 

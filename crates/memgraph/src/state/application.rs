@@ -30,9 +30,6 @@ impl AppState {
         state
     }
 
-    /// Logs the graph shape report at startup and on every tick. The report is
-    /// read-only, so this task holds no locks worth releasing and is simply
-    /// dropped with the runtime at shutdown.
     fn spawn_health_reporter(&self, health_config: &crate::config::HealthConfig) {
         if !health_config.enabled {
             tracing::info!("periodic graph health reporting disabled");
@@ -44,8 +41,6 @@ impl AppState {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
-                // The first tick completes immediately, so this doubles as the
-                // startup report.
                 ticker.tick().await;
                 match health_service.report().await {
                     Ok(report) => {

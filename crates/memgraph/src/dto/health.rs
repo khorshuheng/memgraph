@@ -24,7 +24,6 @@ pub struct KindUsageResponse {
     pub kind_id: i64,
     pub kind: String,
     pub node_count: i64,
-    /// True when the kind was declared but never used by any node.
     pub dead: bool,
 }
 
@@ -44,8 +43,6 @@ pub struct EdgeTypeUsageResponse {
     pub edge_type_id: i64,
     pub edge_type: String,
     pub edge_count: i64,
-    /// True when the type carries zero or one edge, which usually means it was
-    /// declared speculatively rather than earned by use.
     pub underused: bool,
 }
 
@@ -96,8 +93,6 @@ impl From<IsolatedNodeModel> for IsolatedNodeResponse {
     }
 }
 
-/// Read-only shape report. Every field is derived from already-stored data, so
-/// requesting it neither creates nor removes anything.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct GraphHealthResponse {
     pub node_count: i64,
@@ -107,9 +102,7 @@ pub struct GraphHealthResponse {
     pub kinds: Vec<KindUsageResponse>,
     pub edge_types: Vec<EdgeTypeUsageResponse>,
     pub duplicate_groups: Vec<DuplicateGroupResponse>,
-    /// True total, which may exceed `isolated_nodes.len()`.
     pub isolated_node_count: i64,
-    /// Bounded sample of the isolated nodes.
     pub isolated_nodes: Vec<IsolatedNodeResponse>,
 }
 

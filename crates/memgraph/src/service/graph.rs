@@ -364,8 +364,6 @@ mod tests {
             .await
             .unwrap();
         assert!(created.id > 0);
-        // The seeded vocabulary is already present, so assert the round-trip
-        // rather than exact equality with an empty database.
         assert!(service.list_node_kinds().await.unwrap().contains(&created));
     }
 

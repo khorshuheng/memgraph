@@ -7,8 +7,6 @@ use std::{
 use config::{Config, ConfigError, Environment, File, FileFormat};
 use serde::Deserialize;
 
-/// Default configuration written to the user's home directory on first run and
-/// used as the base layer that the on-disk config overrides.
 const DEFAULT_CONFIG_TOML: &str = r#"[server]
 host = "127.0.0.1"
 port = 7373
@@ -92,8 +90,6 @@ impl Default for SearchConfig {
     }
 }
 
-/// Periodic, read-only graph health reporting. The report never mutates, so the
-/// interval exists only to make drift visible without anyone asking for it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct HealthConfig {
     pub enabled: bool,
@@ -101,8 +97,6 @@ pub struct HealthConfig {
 }
 
 impl HealthConfig {
-    /// Interval clamped to at least one second: `tokio::time::interval` panics
-    /// on a zero period, and a misconfigured zero should not take down startup.
     pub fn interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.interval_secs.max(1))
     }
@@ -126,8 +120,6 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    /// Loads configuration, seeding `$XDG_CONFIG_HOME/memgraph/config.toml`
-    /// (falling back to `$HOME/.config`) with defaults when it is missing.
     pub fn new() -> Result<Self, ConfigError> {
         let path = default_config_path()?;
         ensure_config_file(&path)?;
@@ -141,8 +133,6 @@ impl AppConfig {
     fn load_from(path: &Path, with_environment: bool) -> Result<Self, ConfigError> {
         let builder = Config::builder()
             .add_source(File::from_str(DEFAULT_CONFIG_TOML, FileFormat::Toml))
-            // The file is guaranteed to exist by `ensure_config_file`; keeping it
-            // required surfaces read errors instead of silently using defaults.
             .add_source(File::from(path));
         let builder = if with_environment {
             builder.add_source(Environment::with_prefix("MEMGRAPH").separator("__"))
@@ -153,7 +143,6 @@ impl AppConfig {
     }
 }
 
-/// Resolves the config location following the XDG base directory spec.
 fn default_config_path() -> Result<PathBuf, ConfigError> {
     let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -167,7 +156,6 @@ fn default_config_path() -> Result<PathBuf, ConfigError> {
     Ok(config_home.join("memgraph").join("config.toml"))
 }
 
-/// Creates the config file with defaults if it does not already exist.
 fn ensure_config_file(path: &Path) -> Result<(), ConfigError> {
     if path.is_file() {
         return Ok(());
@@ -182,7 +170,6 @@ fn ensure_config_file(path: &Path) -> Result<(), ConfigError> {
             tracing::info!(path = %path.display(), "created default configuration");
             Ok(())
         }
-        // Another process created it first; keep whatever is already there.
         Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(foreign(error)),
     }
@@ -206,7 +193,6 @@ mod tests {
             .expect("default config deserializes");
         assert_eq!(config.server.listener_address(), "127.0.0.1:7373");
         assert_eq!(config.database.max_connections, 5);
-        // Guard against the embedded template drifting from the built-in default.
         assert_eq!(config.search, SearchConfig::default());
     }
 
@@ -221,8 +207,6 @@ mod tests {
         let path = dir.join("config.toml");
         fs::write(&path, "[server]\nport = 9000\n").expect("write partial config");
 
-        // Load without the environment layer so ambient `MEMGRAPH__*` variables
-        // cannot make this test flaky.
         let config = AppConfig::load_from(&path, false).expect("partial config loads");
         assert_eq!(config.server.port, 9000);
         assert_eq!(config.server.host, "127.0.0.1");

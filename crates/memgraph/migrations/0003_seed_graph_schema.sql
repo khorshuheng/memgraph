@@ -1,12 +1,3 @@
--- Initial agentic-coding vocabulary. Deliberately small: a kind or edge type
--- earns its row only when it has a query behind it. Descriptions are the
--- agent-facing discovery surface (list_node_kinds / list_edge_types), so they
--- state purpose *and* intended endpoints; the endpoint notes are also the raw
--- material for a future edge_rule table that makes them enforceable.
---
--- INSERT OR IGNORE so an existing dev database that already created some of
--- these names through the API does not fail the migration.
-
 INSERT OR IGNORE INTO node_kind (name, description) VALUES
   ('repo',     'A repository. name is owner/name (e.g. khorshuheng/memgraph); content holds remote URL, local checkout paths and default branch.'),
   ('file',     'A file in a repository. name is the repo-relative path with forward slashes, no leading ./ (e.g. crates/memgraph/src/repository/graph.rs).'),

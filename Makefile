@@ -1,11 +1,3 @@
-# memgraph — build entry points.
-#
-#   make build          resolve dependencies from crates.io (normal, networked)
-#   make build-offline  build against the vendored crates in vendor/ (no network)
-#
-# The offline path uses .cargo/config.vendored.toml, which cargo only reads when
-# it is passed explicitly, so `make build` is unaffected by the vendor submodule.
-
 CARGO       ?= cargo
 PKG         ?= memgraph
 LOCK        ?= --locked

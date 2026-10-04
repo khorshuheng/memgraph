@@ -8,16 +8,8 @@ use crate::{
 
 use super::error::ServiceError;
 
-/// How many isolated nodes are returned as detail rows. The report always
-/// carries the true total in `isolated_count`; this only bounds the payload.
 pub const ISOLATED_NODE_SAMPLE: i64 = 50;
 
-/// Read-only introspection of the stored graph.
-///
-/// Every measurement here is derived from data that is already persisted, so
-/// the report needs no schema change and no write path. It exists to make dead
-/// vocabulary, duplicate nodes and unreachable nodes visible, so consolidation
-/// can later be driven by evidence instead of by guesswork.
 #[derive(Clone)]
 pub struct HealthService {
     repository: Arc<dyn GraphRepository>,
@@ -39,8 +31,6 @@ impl HealthService {
         let isolated_count = self.repository.isolated_node_count().await?;
         let isolated = self.repository.isolated_nodes(sample).await?;
 
-        // Totals come from the same rows the report displays, so the summary and
-        // the detail can never disagree.
         let node_count = kinds.iter().map(|usage| usage.node_count).sum();
         let edge_count = edge_types.iter().map(|usage| usage.edge_count).sum();
 
@@ -56,8 +46,6 @@ impl HealthService {
     }
 }
 
-/// Folds `(kind_id, kind, name, node_id)` rows into one group per name, keeping
-/// ids ascending and group order stable, so repeated runs report identically.
 fn group_duplicates(rows: Vec<(i64, String, String, i64)>) -> Vec<DuplicateGroup> {
     let mut groups: Vec<DuplicateGroup> = Vec::new();
     let mut index: HashMap<(i64, String), usize> = HashMap::new();
@@ -120,8 +108,6 @@ mod tests {
             .id
     }
 
-    /// The seeded vocabulary means a fresh database already has dead kinds and
-    /// underused edge types, which is exactly what the report should surface.
     #[tokio::test]
     async fn reports_seeded_vocabulary_as_unused() {
         let (service, _) = service().await;
@@ -178,8 +164,6 @@ mod tests {
             .find(|kind| kind.name == "file")
             .expect("seeded file kind");
 
-        // Nothing enforces uniqueness on (kind_id, name): this is the duplicate
-        // proliferation the report exists to expose.
         let first = node(&repository, file_kind.id, "src/main.rs").await;
         let second = node(&repository, file_kind.id, "src/main.rs").await;
         node(&repository, file_kind.id, "src/lib.rs").await;
@@ -234,7 +218,6 @@ mod tests {
         assert_eq!(report.isolated.len(), 1);
         assert_eq!(report.isolated[0].id, lonely);
         assert_eq!(report.isolated[0].kind, "task");
-        // Both endpoints of the edge are connected in one direction each.
         assert!(!report.isolated.iter().any(|node| node.id == task));
         assert!(!report.isolated.iter().any(|node| node.id == goal));
         assert_eq!(report.edge_count, 1);

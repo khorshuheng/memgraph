@@ -41,7 +41,6 @@ pub trait GraphRepository: Send + Sync {
 
     async fn kind_usage(&self) -> Result<Vec<KindUsage>, RepositoryError>;
     async fn edge_type_usage(&self) -> Result<Vec<EdgeTypeUsage>, RepositoryError>;
-    /// Rows for every node whose `(kind_id, name)` is shared with another node.
     async fn duplicate_node_rows(&self)
     -> Result<Vec<(i64, String, String, i64)>, RepositoryError>;
     async fn isolated_node_count(&self) -> Result<i64, RepositoryError>;
