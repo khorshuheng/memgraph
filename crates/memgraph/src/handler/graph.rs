@@ -9,14 +9,15 @@ use crate::{
         audit::{SessionHeader, SessionId},
         graph::{
             CreateEdgeParameters, CreateEdgeTypeParameters, CreateNodeKindParameters,
-            CreateNodeParameters, DeleteEdgeParameters, EdgeTypeResponse, NeighborResponse,
-            NodeKindResponse, NodeResponse, SearchHitResponse, SearchParameters, SearchResponse,
-            SearchSegmentParameters, SegmentResponse,
+            CreateNodeParameters, CreatePlanParameters, CreateTaskParameters, DeleteEdgeParameters,
+            EdgeTypeResponse, NeighborParameters, NeighborResponse, NodeKindResponse, NodeResponse,
+            PlanResponse, SearchHitResponse, SearchParameters, SearchResponse,
+            SearchSegmentParameters, SegmentResponse, UpdateTaskParameters,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
     },
-    model::{AccessAction, Edge, EdgeType, Node, NodeKind},
+    model::{AccessAction, Edge, EdgeType, Node, NodeKind, PlanDraft, TaskDraft, TaskPatch},
     state::AppState,
 };
 
@@ -117,24 +118,106 @@ pub async fn create_node(
 
 #[utoipa::path(
     tag = "Graph",
-    get,
-    path = "/nodes",
+    post,
+    path = "/tasks",
+    request_body = CreateTaskParameters,
     params(SessionHeader),
-    responses((status = 200, description = "List nodes", body = ApiList<NodeResponse>))
+    responses((status = 201, description = "Task created", body = NodeResponse))
 )]
-pub async fn list_nodes(
+pub async fn create_task(
     State(state): State<AppState>,
     SessionId(session_id): SessionId,
-) -> Result<ApiList<NodeResponse>, ApiError> {
-    let nodes = state.graph_service.list_nodes().await?;
-    let accessed: Vec<i64> = nodes.iter().map(|node| node.id).collect();
+    Json(params): Json<CreateTaskParameters>,
+) -> Result<ApiSuccess<NodeResponse>, ApiError> {
+    let draft: TaskDraft = params.into();
+    let created = state.graph_service.create_task(&draft).await?;
+    let mut accessed = vec![created.id];
+    accessed.extend(draft.parent);
+    accessed.extend(draft.depends_on.iter().copied());
+    accessed.extend(draft.affects.iter().copied());
     state
         .audit_service
-        .record(&session_id, &accessed, AccessAction::Read)
+        .record(&session_id, &accessed, AccessAction::Write)
         .await;
+    Ok(ApiSuccess {
+        status: StatusCode::CREATED,
+        data: created.into(),
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    post,
+    path = "/plans",
+    request_body = CreatePlanParameters,
+    params(SessionHeader),
+    responses((status = 201, description = "Plan created", body = PlanResponse))
+)]
+pub async fn create_plan(
+    State(state): State<AppState>,
+    SessionId(session_id): SessionId,
+    Json(params): Json<CreatePlanParameters>,
+) -> Result<ApiSuccess<PlanResponse>, ApiError> {
+    let draft: PlanDraft = params.into();
+    let plan = state.graph_service.create_plan(&draft).await?;
+    let mut accessed: Vec<i64> = plan.goal.iter().map(|goal| goal.id).collect();
+    accessed.extend(plan.tasks.iter().map(|task| task.node.id));
+    if let Some(goal_id) = draft.goal_id {
+        accessed.push(goal_id);
+    }
+    accessed.extend(
+        draft
+            .tasks
+            .iter()
+            .flat_map(|task| task.affects.iter().copied()),
+    );
+    state
+        .audit_service
+        .record(&session_id, &accessed, AccessAction::Write)
+        .await;
+    Ok(ApiSuccess {
+        status: StatusCode::CREATED,
+        data: plan.into(),
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    get,
+    path = "/nodes",
+    responses((status = 200, description = "List nodes", body = ApiList<NodeResponse>))
+)]
+pub async fn list_nodes(State(state): State<AppState>) -> Result<ApiList<NodeResponse>, ApiError> {
+    let nodes = state.graph_service.list_nodes().await?;
     Ok(ApiList {
         status: StatusCode::OK,
         items: nodes.into_iter().map(Into::into).collect(),
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    patch,
+    path = "/tasks/{task_id}",
+    request_body = UpdateTaskParameters,
+    params(SessionHeader, ("task_id" = i64, Path, description = "Task id")),
+    responses((status = 200, description = "Task updated", body = NodeResponse))
+)]
+pub async fn update_task(
+    State(state): State<AppState>,
+    SessionId(session_id): SessionId,
+    Path(task_id): Path<i64>,
+    Json(params): Json<UpdateTaskParameters>,
+) -> Result<ApiSuccess<NodeResponse>, ApiError> {
+    let patch: TaskPatch = params.into();
+    let updated = state.graph_service.update_task(task_id, &patch).await?;
+    state
+        .audit_service
+        .record(&session_id, &[updated.id], AccessAction::Write)
+        .await;
+    Ok(ApiSuccess {
+        status: StatusCode::OK,
+        data: updated.into(),
     })
 }
 
@@ -185,17 +268,25 @@ pub async fn delete_node(
     tag = "Graph",
     get,
     path = "/nodes/{node_id}/neighbors",
-    params(SessionHeader, ("node_id" = i64, Path, description = "Node id")),
-    responses((status = 200, description = "Outgoing neighbors", body = ApiList<NeighborResponse>))
+    params(SessionHeader, NeighborParameters, ("node_id" = i64, Path, description = "Node id")),
+    responses((status = 200, description = "Neighbors of a node", body = ApiList<NeighborResponse>))
 )]
 pub async fn list_neighbors(
     State(state): State<AppState>,
     SessionId(session_id): SessionId,
     Path(node_id): Path<i64>,
+    Query(params): Query<NeighborParameters>,
 ) -> Result<ApiList<NeighborResponse>, ApiError> {
-    let neighbors = state.graph_service.neighbors(node_id).await?;
+    let neighbors = state
+        .graph_service
+        .neighbors(
+            node_id,
+            params.direction.into(),
+            params.edge_type.as_deref(),
+        )
+        .await?;
     let mut accessed = vec![node_id];
-    accessed.extend(neighbors.iter().map(|(_, node)| node.id));
+    accessed.extend(neighbors.iter().map(|neighbor| neighbor.node.id));
     state
         .audit_service
         .record(&session_id, &accessed, AccessAction::Read)
@@ -269,7 +360,9 @@ pub async fn search(
     SessionId(session_id): SessionId,
     Query(params): Query<SearchParameters>,
 ) -> Result<ApiSuccess<SearchResponse>, ApiError> {
-    let segments = state.graph_service.search(&params.q).await?;
+    let scope_value = params.scope.as_str();
+    let scope = params.scope.into();
+    let segments = state.graph_service.search(&params.q, scope).await?;
     let accessed: Vec<i64> = segments
         .iter()
         .flat_map(|segment| segment.matches.iter().map(|hit| hit.node.id))
@@ -283,14 +376,12 @@ pub async fn search(
         .into_iter()
         .map(|segment| {
             let hidden = segment.total_matches.saturating_sub(segment.matches.len());
-            let probe = (hidden > 0).then(|| {
-                format!(
-                    "/api/search/segment?segment={}&limit={}&offset={}",
-                    percent_encode(&segment.segment),
-                    segment.total_matches,
-                    segment.matches.len()
-                )
-            });
+            let probe = segment_probe(
+                &segment.segment,
+                scope_value,
+                segment.total_matches,
+                segment.matches.len(),
+            );
             SegmentResponse {
                 segment: segment.segment,
                 matches: segment
@@ -300,6 +391,7 @@ pub async fn search(
                     .collect(),
                 total_matches: segment.total_matches,
                 hidden,
+                excluded_resolved: segment.excluded_resolved,
                 probe,
             }
         })
@@ -328,7 +420,7 @@ pub async fn search_segment(
     let offset = params.offset.unwrap_or(0);
     let hits = state
         .graph_service
-        .search_segment(&params.segment, limit, offset)
+        .search_segment(&params.segment, params.scope.into(), limit, offset)
         .await?;
     let accessed: Vec<i64> = hits.iter().map(|hit| hit.node.id).collect();
     state
@@ -361,6 +453,19 @@ pub async fn graph_health(
     })
 }
 
+fn segment_probe(segment: &str, scope: &str, total_matches: usize, shown: usize) -> Option<String> {
+    let hidden = total_matches.saturating_sub(shown);
+    (hidden > 0).then(|| {
+        format!(
+            "/api/search/segment?segment={}&scope={}&limit={}&offset={}",
+            percent_encode(segment),
+            scope,
+            total_matches,
+            shown
+        )
+    })
+}
+
 fn percent_encode(input: &str) -> String {
     let mut encoded = String::new();
     for byte in input.bytes() {
@@ -372,4 +477,18 @@ fn percent_encode(input: &str) -> String {
         }
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_preserves_scope_and_counts() {
+        assert_eq!(
+            segment_probe("a b", "all", 7, 5).as_deref(),
+            Some("/api/search/segment?segment=a%20b&scope=all&limit=7&offset=5")
+        );
+        assert!(segment_probe("a", "active", 5, 5).is_none());
+    }
 }

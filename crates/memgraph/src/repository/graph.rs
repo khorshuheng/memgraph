@@ -1,16 +1,30 @@
+use std::collections::HashSet;
+
 use async_trait::async_trait;
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, Row, SqlitePool};
 
 use crate::model::{
-    AccessAction, Edge, EdgeType, EdgeTypeUsage, IsolatedNode, KindUsage, Node, NodeKind,
-    RelationDirection, RelationSummary,
+    AccessAction, Edge, EdgeType, EdgeTypeUsage, IsolatedNode, KindUsage, Neighbor,
+    NeighborDirection, Node, NodeKind, NodeRef, PendingEdge, RelationDirection, RelationSummary,
 };
 
 use super::error::RepositoryError;
 
 const NODE_KIND_COLUMNS: &str = "id, name, description, updated_at";
-const EDGE_TYPE_COLUMNS: &str = "id, name, description, updated_at";
+const EDGE_TYPE_COLUMNS: &str = "id, name, description, resolves, updated_at";
 const NODE_COLUMNS: &str = "id, kind_id, name, description, content, updated_at";
+const OUTGOING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
+    n.id, n.kind_id, n.name, n.description, n.content, n.updated_at \
+    FROM edge e JOIN node n ON n.id = e.destination \
+    WHERE e.source = ? \
+      AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
+    ORDER BY e.edge_type_id, e.destination";
+const INCOMING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
+    n.id, n.kind_id, n.name, n.description, n.content, n.updated_at \
+    FROM edge e JOIN node n ON n.id = e.source \
+    WHERE e.destination = ? \
+      AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
+    ORDER BY e.edge_type_id, e.source";
 
 #[async_trait]
 pub trait GraphRepository: Send + Sync {
@@ -21,19 +35,33 @@ pub trait GraphRepository: Send + Sync {
     async fn list_edge_types(&self) -> Result<Vec<EdgeType>, RepositoryError>;
 
     async fn upsert_node(&self, node: &Node) -> Result<Node, RepositoryError>;
+    async fn insert_nodes_with_edges(
+        &self,
+        nodes: &[Node],
+        edges: &[PendingEdge],
+    ) -> Result<Vec<Node>, RepositoryError>;
     async fn get_node(&self, id: i64) -> Result<Option<Node>, RepositoryError>;
     async fn delete_node(&self, id: i64) -> Result<bool, RepositoryError>;
     async fn list_nodes(&self) -> Result<Vec<Node>, RepositoryError>;
+    async fn node_kinds_for_ids(&self, ids: &[i64]) -> Result<Vec<(i64, String)>, RepositoryError>;
 
     async fn add_edge(&self, edge: &Edge) -> Result<(), RepositoryError>;
     async fn remove_edge(&self, edge: &Edge) -> Result<bool, RepositoryError>;
-    async fn neighbors(&self, source: i64) -> Result<Vec<(Edge, Node)>, RepositoryError>;
+    async fn neighbors(
+        &self,
+        node_id: i64,
+        direction: NeighborDirection,
+        edge_type: Option<&str>,
+    ) -> Result<Vec<Neighbor>, RepositoryError>;
 
     async fn count_nodes(&self) -> Result<i64, RepositoryError>;
     async fn term_document_frequency(&self, term: &str) -> Result<i64, RepositoryError>;
     async fn terms_with_prefix(&self, prefix: &str) -> Result<Vec<String>, RepositoryError>;
     async fn term_exists(&self, term: &str) -> Result<bool, RepositoryError>;
-    async fn search_descriptions(&self, fts_query: &str) -> Result<Vec<Node>, RepositoryError>;
+    async fn search_descriptions(
+        &self,
+        fts_query: &str,
+    ) -> Result<Vec<(Node, bool)>, RepositoryError>;
     async fn relation_summaries(
         &self,
         node_id: i64,
@@ -89,10 +117,12 @@ impl GraphRepository for SqliteGraphRepository {
 
     async fn create_edge_type(&self, edge_type: &EdgeType) -> Result<EdgeType, RepositoryError> {
         let row = sqlx::query_as::<_, EdgeType>(&format!(
-            "INSERT INTO edge_type (name, description) VALUES (?, ?) RETURNING {EDGE_TYPE_COLUMNS}"
+            "INSERT INTO edge_type (name, description, resolves) VALUES (?, ?, ?) \
+             RETURNING {EDGE_TYPE_COLUMNS}"
         ))
         .bind(&edge_type.name)
         .bind(&edge_type.description)
+        .bind(edge_type.resolves)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -141,6 +171,66 @@ impl GraphRepository for SqliteGraphRepository {
         }
     }
 
+    async fn insert_nodes_with_edges(
+        &self,
+        nodes: &[Node],
+        edges: &[PendingEdge],
+    ) -> Result<Vec<Node>, RepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut created = Vec::with_capacity(nodes.len());
+        let mut ids = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let row = if node.id == 0 {
+                sqlx::query_as::<_, Node>(&format!(
+                    "INSERT INTO node (kind_id, name, description, content) VALUES (?, ?, ?, ?) \
+                     RETURNING {NODE_COLUMNS}"
+                ))
+                .bind(node.kind_id)
+                .bind(&node.name)
+                .bind(&node.description)
+                .bind(&node.content)
+                .fetch_one(&mut *transaction)
+                .await?
+            } else {
+                sqlx::query_as::<_, Node>(&format!(
+                    "INSERT INTO node (id, kind_id, name, description, content) \
+                     VALUES (?, ?, ?, ?, ?) \
+                     ON CONFLICT(id) DO UPDATE SET kind_id = excluded.kind_id, \
+                     name = excluded.name, description = excluded.description, \
+                     content = excluded.content, updated_at = CASE WHEN node.kind_id = excluded.kind_id \
+                       AND node.name = excluded.name AND node.description = excluded.description \
+                       AND node.content = excluded.content THEN node.updated_at ELSE excluded.updated_at END \
+                     RETURNING {NODE_COLUMNS}"
+                ))
+                .bind(node.id)
+                .bind(node.kind_id)
+                .bind(&node.name)
+                .bind(&node.description)
+                .bind(&node.content)
+                .fetch_one(&mut *transaction)
+                .await?
+            };
+            ids.push(row.id);
+            created.push(row);
+        }
+        let generated: HashSet<i64> = ids.iter().copied().collect();
+        for edge in edges {
+            let source = resolve_node_ref(edge.source, &ids, &generated)?;
+            let destination = resolve_node_ref(edge.destination, &ids, &generated)?;
+            sqlx::query(
+                "INSERT INTO edge (source, destination, edge_type_id) VALUES (?, ?, ?) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(source)
+            .bind(destination)
+            .bind(edge.edge_type_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(created)
+    }
+
     async fn get_node(&self, id: i64) -> Result<Option<Node>, RepositoryError> {
         let row =
             sqlx::query_as::<_, Node>(&format!("SELECT {NODE_COLUMNS} FROM node WHERE id = ?"))
@@ -163,6 +253,28 @@ impl GraphRepository for SqliteGraphRepository {
             sqlx::query_as::<_, Node>(&format!("SELECT {NODE_COLUMNS} FROM node ORDER BY id"))
                 .fetch_all(&self.pool)
                 .await?;
+        Ok(rows)
+    }
+
+    async fn node_kinds_for_ids(&self, ids: &[i64]) -> Result<Vec<(i64, String)>, RepositoryError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut builder = sqlx::QueryBuilder::new(
+            "SELECT n.id, k.name FROM node n JOIN node_kind k ON k.id = n.kind_id \
+             WHERE n.id IN (",
+        );
+        {
+            let mut separated = builder.separated(", ");
+            for id in ids {
+                separated.push_bind(*id);
+            }
+        }
+        builder.push(")");
+        let rows = builder
+            .build_query_as::<(i64, String)>()
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 
@@ -191,20 +303,50 @@ impl GraphRepository for SqliteGraphRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn neighbors(&self, source: i64) -> Result<Vec<(Edge, Node)>, RepositoryError> {
-        let rows = sqlx::query(
-            "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
-             n.id, n.kind_id, n.name, n.description, n.content, n.updated_at \
-             FROM edge e JOIN node n ON n.id = e.destination \
-             WHERE e.source = ? ORDER BY e.edge_type_id, e.destination",
-        )
-        .bind(source)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter()
-            .map(|row| Ok((Edge::from_row(row)?, Node::from_row(row)?)))
-            .collect::<Result<_, sqlx::Error>>()
-            .map_err(Into::into)
+    async fn neighbors(
+        &self,
+        node_id: i64,
+        direction: NeighborDirection,
+        edge_type: Option<&str>,
+    ) -> Result<Vec<Neighbor>, RepositoryError> {
+        let mut neighbors = Vec::new();
+        if matches!(
+            direction,
+            NeighborDirection::Outgoing | NeighborDirection::Both
+        ) {
+            let rows = sqlx::query(OUTGOING_NEIGHBORS)
+                .bind(node_id)
+                .bind(edge_type)
+                .bind(edge_type)
+                .fetch_all(&self.pool)
+                .await?;
+            for row in &rows {
+                neighbors.push(Neighbor {
+                    direction: RelationDirection::Outgoing,
+                    edge: Edge::from_row(row)?,
+                    node: Node::from_row(row)?,
+                });
+            }
+        }
+        if matches!(
+            direction,
+            NeighborDirection::Incoming | NeighborDirection::Both
+        ) {
+            let rows = sqlx::query(INCOMING_NEIGHBORS)
+                .bind(node_id)
+                .bind(edge_type)
+                .bind(edge_type)
+                .fetch_all(&self.pool)
+                .await?;
+            for row in &rows {
+                neighbors.push(Neighbor {
+                    direction: RelationDirection::Ingoing,
+                    edge: Edge::from_row(row)?,
+                    node: Node::from_row(row)?,
+                });
+            }
+        }
+        Ok(neighbors)
     }
 
     async fn count_nodes(&self) -> Result<i64, RepositoryError> {
@@ -244,16 +386,24 @@ impl GraphRepository for SqliteGraphRepository {
         Ok(exists)
     }
 
-    async fn search_descriptions(&self, fts_query: &str) -> Result<Vec<Node>, RepositoryError> {
-        let rows = sqlx::query_as::<_, Node>(
-            "SELECT n.id, n.kind_id, n.name, n.description, n.content, n.updated_at \
+    async fn search_descriptions(
+        &self,
+        fts_query: &str,
+    ) -> Result<Vec<(Node, bool)>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT n.id, n.kind_id, n.name, n.description, n.content, n.updated_at, \
+             EXISTS(SELECT 1 FROM edge e JOIN edge_type t ON t.id = e.edge_type_id \
+                    WHERE e.destination = n.id AND t.resolves = 1) AS resolved \
              FROM node_fts JOIN node n ON n.id = node_fts.rowid \
              WHERE node_fts MATCH ? ORDER BY bm25(node_fts), n.id",
         )
         .bind(fts_query)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows)
+        rows.iter()
+            .map(|row| Ok((Node::from_row(row)?, row.try_get::<bool, _>("resolved")?)))
+            .collect::<Result<_, sqlx::Error>>()
+            .map_err(Into::into)
     }
 
     async fn relation_summaries(
@@ -392,6 +542,26 @@ impl GraphRepository for SqliteGraphRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+}
+
+fn resolve_node_ref(
+    node_ref: NodeRef,
+    ids: &[i64],
+    generated: &HashSet<i64>,
+) -> Result<i64, RepositoryError> {
+    match node_ref {
+        NodeRef::Existing(id) if generated.contains(&id) => {
+            Err(RepositoryError::ForeignKeyViolation(format!(
+                "reference to node {id} collides with a node created in the same request"
+            )))
+        }
+        NodeRef::Existing(id) => Ok(id),
+        NodeRef::New(index) => ids.get(index).copied().ok_or_else(|| {
+            RepositoryError::SqlExecutionError(format!(
+                "node reference index {index} is out of range"
+            ))
+        }),
     }
 }
 

@@ -13,6 +13,7 @@ pub struct EdgeType {
     pub id: i64,
     pub name: String,
     pub description: String,
+    pub resolves: bool,
     pub updated_at: String,
 }
 
@@ -40,6 +41,27 @@ pub enum RelationDirection {
     Ingoing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeighborDirection {
+    Outgoing,
+    Incoming,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchScope {
+    Active,
+    All,
+    Resolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Neighbor {
+    pub direction: RelationDirection,
+    pub edge: Edge,
+    pub node: Node,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationSummary {
     pub direction: RelationDirection,
@@ -54,6 +76,7 @@ pub struct SearchHit {
     pub confidence: f64,
     pub matched_terms: Vec<String>,
     pub relations: Vec<RelationSummary>,
+    pub resolved: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -125,6 +148,7 @@ pub struct SegmentMatches {
     pub segment: String,
     pub matches: Vec<SearchHit>,
     pub total_matches: usize,
+    pub excluded_resolved: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,4 +164,80 @@ impl AccessAction {
             AccessAction::Write => "write",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRef {
+    Existing(i64),
+    New(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEdge {
+    pub source: NodeRef,
+    pub destination: NodeRef,
+    pub edge_type_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDraft {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub content: String,
+    pub parent: Option<i64>,
+    pub depends_on: Vec<i64>,
+    pub affects: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskPatch {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub content: Option<String>,
+}
+
+impl TaskPatch {
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none() && self.description.is_none() && self.content.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanGoalDraft {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanTaskDraft {
+    pub id: i64,
+    pub key: String,
+    pub name: String,
+    pub description: String,
+    pub content: String,
+    pub parent: Option<String>,
+    pub depends_on: Vec<String>,
+    pub affects: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanDraft {
+    pub goal: Option<PlanGoalDraft>,
+    pub goal_id: Option<i64>,
+    pub tasks: Vec<PlanTaskDraft>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanTask {
+    pub key: String,
+    pub node: Node,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub goal: Option<Node>,
+    pub tasks: Vec<PlanTask>,
 }
