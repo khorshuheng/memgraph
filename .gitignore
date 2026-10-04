@@ -8,3 +8,4 @@ target
 *.sqlite-wal
 
 .codegraph
+Makefile.local
