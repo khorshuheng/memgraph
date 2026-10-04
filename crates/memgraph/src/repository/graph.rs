@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use sqlx::{FromRow, SqlitePool};
 
-use crate::model::{Edge, EdgeType, Node, NodeKind, RelationDirection, RelationSummary};
+use crate::model::{
+    Edge, EdgeType, EdgeTypeUsage, IsolatedNode, KindUsage, Node, NodeKind, RelationDirection,
+    RelationSummary,
+};
 
 use super::error::RepositoryError;
 
@@ -35,6 +38,14 @@ pub trait GraphRepository: Send + Sync {
         &self,
         node_id: i64,
     ) -> Result<Vec<RelationSummary>, RepositoryError>;
+
+    async fn kind_usage(&self) -> Result<Vec<KindUsage>, RepositoryError>;
+    async fn edge_type_usage(&self) -> Result<Vec<EdgeTypeUsage>, RepositoryError>;
+    /// Rows for every node whose `(kind_id, name)` is shared with another node.
+    async fn duplicate_node_rows(&self)
+    -> Result<Vec<(i64, String, String, i64)>, RepositoryError>;
+    async fn isolated_node_count(&self) -> Result<i64, RepositoryError>;
+    async fn isolated_nodes(&self, limit: i64) -> Result<Vec<IsolatedNode>, RepositoryError>;
 }
 
 #[derive(Clone)]
@@ -269,6 +280,70 @@ impl GraphRepository for SqliteGraphRepository {
                 },
             )
             .collect())
+    }
+
+    async fn kind_usage(&self) -> Result<Vec<KindUsage>, RepositoryError> {
+        let rows = sqlx::query_as::<_, KindUsage>(
+            "SELECT k.id AS kind_id, k.name AS kind, count(n.id) AS node_count \
+             FROM node_kind k LEFT JOIN node n ON n.kind_id = k.id \
+             GROUP BY k.id, k.name ORDER BY k.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn edge_type_usage(&self) -> Result<Vec<EdgeTypeUsage>, RepositoryError> {
+        let rows = sqlx::query_as::<_, EdgeTypeUsage>(
+            "SELECT t.id AS edge_type_id, t.name AS edge_type, count(e.source) AS edge_count \
+             FROM edge_type t LEFT JOIN edge e ON e.edge_type_id = t.id \
+             GROUP BY t.id, t.name ORDER BY t.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn duplicate_node_rows(
+        &self,
+    ) -> Result<Vec<(i64, String, String, i64)>, RepositoryError> {
+        let rows = sqlx::query_as::<_, (i64, String, String, i64)>(
+            "SELECT n.kind_id, k.name, n.name, n.id \
+             FROM node n \
+             JOIN node_kind k ON k.id = n.kind_id \
+             JOIN (SELECT kind_id, name FROM node \
+                   GROUP BY kind_id, name HAVING count(*) > 1) d \
+               ON d.kind_id = n.kind_id AND d.name = n.name \
+             ORDER BY n.kind_id, n.name, n.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn isolated_node_count(&self) -> Result<i64, RepositoryError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM node n \
+             WHERE NOT EXISTS (SELECT 1 FROM edge e WHERE e.source = n.id) \
+               AND NOT EXISTS (SELECT 1 FROM edge e WHERE e.destination = n.id)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    async fn isolated_nodes(&self, limit: i64) -> Result<Vec<IsolatedNode>, RepositoryError> {
+        let rows = sqlx::query_as::<_, IsolatedNode>(
+            "SELECT n.id, k.name AS kind, n.name \
+             FROM node n JOIN node_kind k ON k.id = n.kind_id \
+             WHERE NOT EXISTS (SELECT 1 FROM edge e WHERE e.source = n.id) \
+               AND NOT EXISTS (SELECT 1 FROM edge e WHERE e.destination = n.id) \
+             ORDER BY n.id LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 }
 

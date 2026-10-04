@@ -26,6 +26,10 @@ prefix_min_length = 4
 per_segment_limit = 5
 summary_chars = 160
 split_points = [".", "!", "?", ";", "\n"]
+
+[health]
+enabled = true
+interval_secs = 900
 "#;
 
 #[derive(Debug, Deserialize)]
@@ -88,11 +92,37 @@ impl Default for SearchConfig {
     }
 }
 
+/// Periodic, read-only graph health reporting. The report never mutates, so the
+/// interval exists only to make drift visible without anyone asking for it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct HealthConfig {
+    pub enabled: bool,
+    pub interval_secs: u64,
+}
+
+impl HealthConfig {
+    /// Interval clamped to at least one second: `tokio::time::interval` panics
+    /// on a zero period, and a misconfigured zero should not take down startup.
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.interval_secs.max(1))
+    }
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 900,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
     pub search: SearchConfig,
+    pub health: HealthConfig,
 }
 
 impl AppConfig {

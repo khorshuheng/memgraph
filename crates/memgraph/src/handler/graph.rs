@@ -12,6 +12,7 @@ use crate::{
             NodeKindResponse, NodeResponse, SearchHitResponse, SearchParameters, SearchResponse,
             SearchSegmentParameters, SegmentResponse,
         },
+        health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
     },
     model::{Edge, EdgeType, Node, NodeKind},
@@ -274,6 +275,22 @@ pub async fn search_segment(
             .into_iter()
             .map(|hit| SearchHitResponse::new(hit, summary_chars))
             .collect(),
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    get,
+    path = "/graph-health",
+    responses((status = 200, description = "Read-only graph shape report", body = GraphHealthResponse))
+)]
+pub async fn graph_health(
+    State(state): State<AppState>,
+) -> Result<ApiSuccess<GraphHealthResponse>, ApiError> {
+    let health = state.health_service.report().await?;
+    Ok(ApiSuccess {
+        status: StatusCode::OK,
+        data: health.into(),
     })
 }
 
