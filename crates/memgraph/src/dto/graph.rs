@@ -149,6 +149,7 @@ impl From<EdgeModel> for EdgeResponse {
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct DeleteEdgeParameters {
     pub source: i64,
     pub destination: i64,
@@ -252,11 +253,13 @@ fn truncate_summary(text: &str, max_chars: usize) -> String {
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SearchParameters {
     pub q: String,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SearchSegmentParameters {
     pub segment: String,
     pub limit: Option<usize>,
