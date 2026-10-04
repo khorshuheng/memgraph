@@ -265,10 +265,11 @@ pub struct SearchHitResponse {
     pub matched_terms: Vec<String>,
     pub relations: Vec<RelationSummaryResponse>,
     pub resolved: bool,
+    pub access_id: Option<i64>,
 }
 
 impl SearchHitResponse {
-    pub fn new(hit: SearchHitModel, summary_chars: usize) -> Self {
+    pub fn new(hit: SearchHitModel, summary_chars: usize, access_id: Option<i64>) -> Self {
         SearchHitResponse {
             id: hit.node.id,
             kind_id: hit.node.kind_id,
@@ -278,6 +279,7 @@ impl SearchHitResponse {
             matched_terms: hit.matched_terms,
             relations: hit.relations.into_iter().map(Into::into).collect(),
             resolved: hit.resolved,
+            access_id,
         }
     }
 }
@@ -352,6 +354,11 @@ pub struct SearchSegmentParameters {
     pub scope: SearchScope,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct NodeAccessFeedbackParameters {
+    pub relevant: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

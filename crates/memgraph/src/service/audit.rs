@@ -1,7 +1,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::{model::AccessAction, repository::graph::GraphRepository};
+use crate::{
+    model::AccessAction,
+    repository::graph::{GraphRepository, NodeAccessRecord},
+    service::error::ServiceError,
+};
 
 #[derive(Clone)]
 pub struct AuditService {
@@ -13,7 +17,13 @@ impl AuditService {
         Self { repository }
     }
 
-    pub async fn record(&self, session_id: &str, node_ids: &[i64], action: AccessAction) {
+    pub async fn record(
+        &self,
+        session_id: &str,
+        node_ids: &[i64],
+        action: AccessAction,
+        query_term: Option<&str>,
+    ) -> Vec<NodeAccessRecord> {
         let mut seen = HashSet::new();
         let unique: Vec<i64> = node_ids
             .iter()
@@ -21,19 +31,40 @@ impl AuditService {
             .filter(|node_id| seen.insert(*node_id))
             .collect();
         if unique.is_empty() {
-            return;
+            return Vec::new();
         }
-        if let Err(error) = self
+        match self
             .repository
-            .record_node_accesses(session_id, &unique, action)
+            .record_node_accesses(session_id, &unique, action, query_term)
             .await
         {
-            tracing::warn!(
-                %error,
-                session_id = %session_id,
-                node_count = unique.len(),
-                "failed to record node access"
-            );
+            Ok(recorded) => recorded,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    session_id = %session_id,
+                    node_count = unique.len(),
+                    "failed to record node access"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    pub async fn mark_relevance(
+        &self,
+        session_id: &str,
+        access_id: i64,
+        relevant: bool,
+    ) -> Result<(), ServiceError> {
+        let updated = self
+            .repository
+            .set_node_access_relevance(session_id, access_id, relevant)
+            .await?;
+        if updated {
+            Ok(())
+        } else {
+            Err(ServiceError::EntityNotFound)
         }
     }
 
@@ -72,8 +103,8 @@ mod tests {
         (AuditService::new(repository.clone()), repository, pool)
     }
 
-    async fn seed_node(repository: &Arc<dyn GraphRepository>) -> i64 {
-        let kind = repository
+    async fn seed_kind(repository: &Arc<dyn GraphRepository>) -> i64 {
+        repository
             .create_node_kind(&NodeKind {
                 id: 0,
                 name: "widget".to_string(),
@@ -81,12 +112,20 @@ mod tests {
                 updated_at: String::new(),
             })
             .await
-            .expect("create node kind");
+            .expect("create node kind")
+            .id
+    }
+
+    async fn seed_named_node(
+        repository: &Arc<dyn GraphRepository>,
+        kind_id: i64,
+        name: &str,
+    ) -> i64 {
         repository
             .upsert_node(&Node {
                 id: 0,
-                kind_id: kind.id,
-                name: "a.widget".to_string(),
+                kind_id,
+                name: name.to_string(),
                 description: String::new(),
                 content: String::new(),
                 updated_at: String::new(),
@@ -96,13 +135,18 @@ mod tests {
             .id
     }
 
+    async fn seed_node(repository: &Arc<dyn GraphRepository>) -> i64 {
+        let kind_id = seed_kind(repository).await;
+        seed_named_node(repository, kind_id, "a.widget").await
+    }
+
     #[tokio::test]
     async fn records_session_node_action_and_time() {
         let (audit, repository, pool) = service().await;
         let node_id = seed_node(&repository).await;
 
         audit
-            .record("session-1", &[node_id], AccessAction::Write)
+            .record("session-1", &[node_id], AccessAction::Write, None)
             .await;
 
         let (session_id, stored_node_id, node_name, node_kind, action, accessed_at): (
@@ -132,7 +176,12 @@ mod tests {
         let node_id = seed_node(&repository).await;
 
         audit
-            .record("session-1", &[node_id, node_id, 9999], AccessAction::Read)
+            .record(
+                "session-1",
+                &[node_id, node_id, 9999],
+                AccessAction::Read,
+                None,
+            )
             .await;
 
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM node_access")
@@ -147,7 +196,7 @@ mod tests {
         let (audit, repository, pool) = service().await;
         let node_id = seed_node(&repository).await;
         audit
-            .record("session-1", &[node_id], AccessAction::Read)
+            .record("session-1", &[node_id], AccessAction::Read, None)
             .await;
         repository.delete_node(node_id).await.expect("delete node");
 
@@ -189,7 +238,7 @@ mod tests {
         }
 
         audit
-            .record("session-1", &node_ids, AccessAction::Read)
+            .record("session-1", &node_ids, AccessAction::Read, None)
             .await;
 
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM node_access")
@@ -203,14 +252,18 @@ mod tests {
     async fn prune_removes_only_rows_past_retention() {
         let (audit, repository, pool) = service().await;
         let node_id = seed_node(&repository).await;
-        audit.record("old", &[node_id], AccessAction::Read).await;
+        audit
+            .record("old", &[node_id], AccessAction::Read, None)
+            .await;
         sqlx::query(
             "UPDATE node_access SET accessed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-100 days')",
         )
         .execute(&pool)
         .await
         .expect("age the row");
-        audit.record("new", &[node_id], AccessAction::Read).await;
+        audit
+            .record("new", &[node_id], AccessAction::Read, None)
+            .await;
 
         audit.prune(30).await;
 
@@ -219,5 +272,74 @@ mod tests {
             .await
             .expect("remaining rows");
         assert_eq!(sessions, vec!["new".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn records_query_term_and_defaults_relevance_to_null() {
+        let (audit, repository, pool) = service().await;
+        let node_id = seed_node(&repository).await;
+
+        audit
+            .record(
+                "session-1",
+                &[node_id],
+                AccessAction::Read,
+                Some("rotated token"),
+            )
+            .await;
+
+        let (query_term, relevant): (Option<String>, Option<i64>) =
+            sqlx::query_as("SELECT query_term, relevant FROM node_access")
+                .fetch_one(&pool)
+                .await
+                .expect("audit row");
+        assert_eq!(query_term.as_deref(), Some("rotated token"));
+        assert_eq!(relevant, None);
+    }
+
+    #[tokio::test]
+    async fn returns_node_and_access_ids_in_their_own_fields() {
+        let (audit, repository, _pool) = service().await;
+        let kind_id = seed_kind(&repository).await;
+        let _first = seed_named_node(&repository, kind_id, "a").await;
+        let second = seed_named_node(&repository, kind_id, "b").await;
+
+        let recorded = audit
+            .record("session-1", &[second], AccessAction::Read, None)
+            .await;
+
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].node_id, second);
+        assert_eq!(recorded[0].access_id, 1);
+        assert_ne!(recorded[0].node_id, recorded[0].access_id);
+    }
+
+    #[tokio::test]
+    async fn marks_relevance_only_for_the_owning_session() {
+        let (audit, repository, pool) = service().await;
+        let node_id = seed_node(&repository).await;
+        let recorded = audit
+            .record("session-1", &[node_id], AccessAction::Read, None)
+            .await;
+        let access_id = recorded[0].access_id;
+
+        assert_eq!(
+            audit.mark_relevance("session-2", access_id, true).await,
+            Err(ServiceError::EntityNotFound)
+        );
+        assert_eq!(
+            audit.mark_relevance("session-1", 9999, true).await,
+            Err(ServiceError::EntityNotFound)
+        );
+        assert_eq!(
+            audit.mark_relevance("session-1", access_id, true).await,
+            Ok(())
+        );
+
+        let relevant: Option<i64> = sqlx::query_scalar("SELECT relevant FROM node_access")
+            .fetch_one(&pool)
+            .await
+            .expect("audit row");
+        assert_eq!(relevant, Some(1));
     }
 }

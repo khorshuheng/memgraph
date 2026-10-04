@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -10,9 +12,9 @@ use crate::{
         graph::{
             CreateEdgeParameters, CreateEdgeTypeParameters, CreateNodeKindParameters,
             CreateNodeParameters, CreatePlanParameters, CreateTaskParameters, DeleteEdgeParameters,
-            EdgeTypeResponse, NeighborParameters, NeighborResponse, NodeKindResponse, NodeResponse,
-            PlanResponse, SearchHitResponse, SearchParameters, SearchResponse,
-            SearchSegmentParameters, SegmentResponse, UpdateTaskParameters,
+            EdgeTypeResponse, NeighborParameters, NeighborResponse, NodeAccessFeedbackParameters,
+            NodeKindResponse, NodeResponse, PlanResponse, SearchHitResponse, SearchParameters,
+            SearchResponse, SearchSegmentParameters, SegmentResponse, UpdateTaskParameters,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
@@ -108,7 +110,7 @@ pub async fn create_node(
     let created = state.graph_service.upsert_node(&node).await?;
     state
         .audit_service
-        .record(&session_id, &[created.id], AccessAction::Write)
+        .record(&session_id, &[created.id], AccessAction::Write, None)
         .await;
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
@@ -137,7 +139,7 @@ pub async fn create_task(
     accessed.extend(draft.affects.iter().copied());
     state
         .audit_service
-        .record(&session_id, &accessed, AccessAction::Write)
+        .record(&session_id, &accessed, AccessAction::Write, None)
         .await;
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
@@ -173,7 +175,7 @@ pub async fn create_plan(
     );
     state
         .audit_service
-        .record(&session_id, &accessed, AccessAction::Write)
+        .record(&session_id, &accessed, AccessAction::Write, None)
         .await;
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
@@ -213,7 +215,7 @@ pub async fn update_task(
     let updated = state.graph_service.update_task(task_id, &patch).await?;
     state
         .audit_service
-        .record(&session_id, &[updated.id], AccessAction::Write)
+        .record(&session_id, &[updated.id], AccessAction::Write, None)
         .await;
     Ok(ApiSuccess {
         status: StatusCode::OK,
@@ -236,7 +238,7 @@ pub async fn get_node(
     let node = state.graph_service.get_node(node_id).await?;
     state
         .audit_service
-        .record(&session_id, &[node.id], AccessAction::Read)
+        .record(&session_id, &[node.id], AccessAction::Read, None)
         .await;
     Ok(ApiSuccess {
         status: StatusCode::OK,
@@ -258,7 +260,7 @@ pub async fn delete_node(
 ) -> Result<StatusCode, ApiError> {
     state
         .audit_service
-        .record(&session_id, &[node_id], AccessAction::Write)
+        .record(&session_id, &[node_id], AccessAction::Write, None)
         .await;
     state.graph_service.delete_node(node_id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -289,7 +291,7 @@ pub async fn list_neighbors(
     accessed.extend(neighbors.iter().map(|neighbor| neighbor.node.id));
     state
         .audit_service
-        .record(&session_id, &accessed, AccessAction::Read)
+        .record(&session_id, &accessed, AccessAction::Read, None)
         .await;
     Ok(ApiList {
         status: StatusCode::OK,
@@ -318,6 +320,7 @@ pub async fn add_edge(
             &session_id,
             &[edge.source, edge.destination],
             AccessAction::Write,
+            None,
         )
         .await;
     Ok(StatusCode::NO_CONTENT)
@@ -343,6 +346,7 @@ pub async fn remove_edge(
             &session_id,
             &[edge.source, edge.destination],
             AccessAction::Write,
+            None,
         )
         .await;
     Ok(StatusCode::NO_CONTENT)
@@ -363,42 +367,51 @@ pub async fn search(
     let scope_value = params.scope.as_str();
     let scope = params.scope.into();
     let segments = state.graph_service.search(&params.q, scope).await?;
-    let accessed: Vec<i64> = segments
-        .iter()
-        .flat_map(|segment| segment.matches.iter().map(|hit| hit.node.id))
-        .collect();
-    state
-        .audit_service
-        .record(&session_id, &accessed, AccessAction::Read)
-        .await;
     let summary_chars = state.graph_service.summary_chars();
-    let segments = segments
-        .into_iter()
-        .map(|segment| {
-            let hidden = segment.total_matches.saturating_sub(segment.matches.len());
-            let probe = segment_probe(
-                &segment.segment,
-                scope_value,
-                segment.total_matches,
-                segment.matches.len(),
-            );
-            SegmentResponse {
-                segment: segment.segment,
-                matches: segment
-                    .matches
-                    .into_iter()
-                    .map(|hit| SearchHitResponse::new(hit, summary_chars))
-                    .collect(),
-                total_matches: segment.total_matches,
-                hidden,
-                excluded_resolved: segment.excluded_resolved,
-                probe,
-            }
-        })
-        .collect();
+    let mut responses = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let node_ids: Vec<i64> = segment.matches.iter().map(|hit| hit.node.id).collect();
+        let recorded = state
+            .audit_service
+            .record(
+                &session_id,
+                &node_ids,
+                AccessAction::Read,
+                Some(&segment.segment),
+            )
+            .await;
+        let access_ids: HashMap<i64, i64> = recorded
+            .into_iter()
+            .map(|record| (record.node_id, record.access_id))
+            .collect();
+        let hidden = segment.total_matches.saturating_sub(segment.matches.len());
+        let probe = segment_probe(
+            &segment.segment,
+            scope_value,
+            segment.total_matches,
+            segment.matches.len(),
+        );
+        responses.push(SegmentResponse {
+            segment: segment.segment,
+            matches: segment
+                .matches
+                .into_iter()
+                .map(|hit| {
+                    let access_id = access_ids.get(&hit.node.id).copied();
+                    SearchHitResponse::new(hit, summary_chars, access_id)
+                })
+                .collect(),
+            total_matches: segment.total_matches,
+            hidden,
+            excluded_resolved: segment.excluded_resolved,
+            probe,
+        });
+    }
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: SearchResponse { segments },
+        data: SearchResponse {
+            segments: responses,
+        },
     })
 }
 
@@ -422,19 +435,55 @@ pub async fn search_segment(
         .graph_service
         .search_segment(&params.segment, params.scope.into(), limit, offset)
         .await?;
-    let accessed: Vec<i64> = hits.iter().map(|hit| hit.node.id).collect();
-    state
+    let node_ids: Vec<i64> = hits.iter().map(|hit| hit.node.id).collect();
+    let recorded = state
         .audit_service
-        .record(&session_id, &accessed, AccessAction::Read)
+        .record(
+            &session_id,
+            &node_ids,
+            AccessAction::Read,
+            Some(&params.segment),
+        )
         .await;
+    let access_ids: HashMap<i64, i64> = recorded
+        .into_iter()
+        .map(|record| (record.node_id, record.access_id))
+        .collect();
     let summary_chars = state.graph_service.summary_chars();
     Ok(ApiList {
         status: StatusCode::OK,
         items: hits
             .into_iter()
-            .map(|hit| SearchHitResponse::new(hit, summary_chars))
+            .map(|hit| {
+                let access_id = access_ids.get(&hit.node.id).copied();
+                SearchHitResponse::new(hit, summary_chars, access_id)
+            })
             .collect(),
     })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    patch,
+    path = "/node-access/{access_id}",
+    request_body = NodeAccessFeedbackParameters,
+    params(SessionHeader, ("access_id" = i64, Path, description = "Node access row id")),
+    responses(
+        (status = 204, description = "Relevance verdict recorded"),
+        (status = 404, description = "Node access row not found for this session")
+    )
+)]
+pub async fn set_node_access_relevance(
+    State(state): State<AppState>,
+    SessionId(session_id): SessionId,
+    Path(access_id): Path<i64>,
+    Json(params): Json<NodeAccessFeedbackParameters>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .audit_service
+        .mark_relevance(&session_id, access_id, params.relevant)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
@@ -482,6 +531,10 @@ fn percent_encode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        config::{AppConfig, AuditConfig, DatabaseConfig, SearchConfig, ServerConfig},
+        dto::graph::SearchScope,
+    };
 
     #[test]
     fn probe_preserves_scope_and_counts() {
@@ -490,5 +543,102 @@ mod tests {
             Some("/api/search/segment?segment=a%20b&scope=all&limit=7&offset=5")
         );
         assert!(segment_probe("a", "active", 5, 5).is_none());
+    }
+
+    async fn test_state() -> AppState {
+        AppState::new(&AppConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            database: DatabaseConfig {
+                path: ":memory:".to_string(),
+                max_connections: 1,
+            },
+            search: SearchConfig::default(),
+            audit: AuditConfig { retention_days: 0 },
+        })
+        .await
+    }
+
+    async fn seed_search_graph(state: &AppState) -> i64 {
+        let kind = state
+            .graph_service
+            .create_node_kind(&NodeKind {
+                id: 0,
+                name: "widget".to_string(),
+                description: String::new(),
+                updated_at: String::new(),
+            })
+            .await
+            .expect("create node kind");
+        let mut target = 0;
+        for index in 0..7 {
+            let description = if index == 0 {
+                "rotated token".to_string()
+            } else {
+                format!("decoy{index} filler")
+            };
+            let node = state
+                .graph_service
+                .upsert_node(&Node {
+                    id: 0,
+                    kind_id: kind.id,
+                    name: format!("node-{index}"),
+                    description,
+                    content: String::new(),
+                    updated_at: String::new(),
+                })
+                .await
+                .expect("create node");
+            if index == 0 {
+                target = node.id;
+            }
+        }
+        target
+    }
+
+    #[tokio::test]
+    async fn search_hits_expose_access_ids_and_accept_feedback() {
+        let state = test_state().await;
+        let target = seed_search_graph(&state).await;
+
+        let response = search(
+            State(state.clone()),
+            SessionId("session-1".to_string()),
+            Query(SearchParameters {
+                q: "rotated token. rotated token".to_string(),
+                scope: SearchScope::default(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("search failed: {}", error.message));
+        assert_eq!(response.data.segments.len(), 2);
+        let first = &response.data.segments[0].matches[0];
+        let second = &response.data.segments[1].matches[0];
+        assert_eq!(first.id, target);
+        assert_eq!(second.id, target);
+        let first_access = first.access_id.expect("first access id recorded");
+        let access_id = second.access_id.expect("second access id recorded");
+        assert_ne!(first_access, access_id);
+
+        let foreign = set_node_access_relevance(
+            State(state.clone()),
+            SessionId("session-2".to_string()),
+            Path(access_id),
+            Json(NodeAccessFeedbackParameters { relevant: true }),
+        )
+        .await;
+        assert!(foreign.is_err());
+
+        let accepted = set_node_access_relevance(
+            State(state.clone()),
+            SessionId("session-1".to_string()),
+            Path(access_id),
+            Json(NodeAccessFeedbackParameters { relevant: true }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("owning session update failed: {}", error.message));
+        assert_eq!(accepted, StatusCode::NO_CONTENT);
     }
 }

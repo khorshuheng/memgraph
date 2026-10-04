@@ -15,6 +15,7 @@ pub(crate) fn routes(app_state: AppState) -> OpenApiRouter {
         .routes(routes!(add_edge, remove_edge))
         .routes(routes!(search))
         .routes(routes!(search_segment))
+        .routes(routes!(set_node_access_relevance))
         .routes(routes!(graph_health))
         .with_state(app_state)
 }

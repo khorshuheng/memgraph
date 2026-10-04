@@ -26,6 +26,12 @@ const INCOMING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id
       AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
     ORDER BY e.edge_type_id, e.source";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromRow)]
+pub struct NodeAccessRecord {
+    pub node_id: i64,
+    pub access_id: i64,
+}
+
 #[async_trait]
 pub trait GraphRepository: Send + Sync {
     async fn create_node_kind(&self, node_kind: &NodeKind) -> Result<NodeKind, RepositoryError>;
@@ -78,7 +84,14 @@ pub trait GraphRepository: Send + Sync {
         session_id: &str,
         node_ids: &[i64],
         action: AccessAction,
-    ) -> Result<(), RepositoryError>;
+        query_term: Option<&str>,
+    ) -> Result<Vec<NodeAccessRecord>, RepositoryError>;
+    async fn set_node_access_relevance(
+        &self,
+        session_id: &str,
+        access_id: i64,
+        relevant: bool,
+    ) -> Result<bool, RepositoryError>;
     async fn prune_node_access(&self, retention_days: u64) -> Result<u64, RepositoryError>;
 }
 
@@ -510,26 +523,49 @@ impl GraphRepository for SqliteGraphRepository {
         session_id: &str,
         node_ids: &[i64],
         action: AccessAction,
-    ) -> Result<(), RepositoryError> {
+        query_term: Option<&str>,
+    ) -> Result<Vec<NodeAccessRecord>, RepositoryError> {
         if node_ids.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut transaction = self.pool.begin().await?;
+        let mut recorded = Vec::with_capacity(node_ids.len());
         for node_id in node_ids {
-            sqlx::query(
-                "INSERT INTO node_access (session_id, node_id, node_name, node_kind, action) \
-                 SELECT ?, n.id, n.name, k.name, ? \
+            let row = sqlx::query_as::<_, NodeAccessRecord>(
+                "INSERT INTO node_access (session_id, node_id, node_name, node_kind, action, query_term) \
+                 SELECT ?, n.id, n.name, k.name, ?, ? \
                  FROM node n JOIN node_kind k ON k.id = n.kind_id \
-                 WHERE n.id = ?",
+                 WHERE n.id = ? \
+                 RETURNING id AS access_id, node_id",
             )
             .bind(session_id)
             .bind(action.as_str())
+            .bind(query_term)
             .bind(node_id)
-            .execute(&mut *transaction)
+            .fetch_optional(&mut *transaction)
             .await?;
+            if let Some(record) = row {
+                recorded.push(record);
+            }
         }
         transaction.commit().await?;
-        Ok(())
+        Ok(recorded)
+    }
+
+    async fn set_node_access_relevance(
+        &self,
+        session_id: &str,
+        access_id: i64,
+        relevant: bool,
+    ) -> Result<bool, RepositoryError> {
+        let result =
+            sqlx::query("UPDATE node_access SET relevant = ? WHERE id = ? AND session_id = ?")
+                .bind(relevant)
+                .bind(access_id)
+                .bind(session_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn prune_node_access(&self, retention_days: u64) -> Result<u64, RepositoryError> {
