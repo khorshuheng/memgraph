@@ -11,7 +11,7 @@ CREATE TABLE edge_type (
 );
 
 CREATE TABLE node (
-  id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   kind_id INTEGER NOT NULL REFERENCES node_kind(id),
   name TEXT NOT NULL,
   description TEXT NOT NULL,
