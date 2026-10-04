@@ -8,3 +8,4 @@ target
 *.sqlite-wal
 crates/memgraph/config/override.toml
 
+.codegraph
