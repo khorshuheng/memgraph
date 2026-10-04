@@ -6,6 +6,7 @@ use axum::{
 
 use crate::{
     dto::{
+        audit::{SessionHeader, SessionId},
         graph::{
             CreateEdgeParameters, CreateEdgeTypeParameters, CreateNodeKindParameters,
             CreateNodeParameters, DeleteEdgeParameters, EdgeTypeResponse, NeighborResponse,
@@ -15,7 +16,7 @@ use crate::{
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
     },
-    model::{Edge, EdgeType, Node, NodeKind},
+    model::{AccessAction, Edge, EdgeType, Node, NodeKind},
     state::AppState,
 };
 
@@ -94,14 +95,20 @@ pub async fn list_edge_types(
     post,
     path = "/nodes",
     request_body = CreateNodeParameters,
+    params(SessionHeader),
     responses((status = 201, description = "Node created", body = NodeResponse))
 )]
 pub async fn create_node(
     State(state): State<AppState>,
+    SessionId(session_id): SessionId,
     Json(params): Json<CreateNodeParameters>,
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let node: Node = params.into();
     let created = state.graph_service.upsert_node(&node).await?;
+    state
+        .audit_service
+        .record(&session_id, &[created.id], AccessAction::Write)
+        .await;
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
         data: created.into(),
@@ -112,10 +119,19 @@ pub async fn create_node(
     tag = "Graph",
     get,
     path = "/nodes",
+    params(SessionHeader),
     responses((status = 200, description = "List nodes", body = ApiList<NodeResponse>))
 )]
-pub async fn list_nodes(State(state): State<AppState>) -> Result<ApiList<NodeResponse>, ApiError> {
+pub async fn list_nodes(
+    State(state): State<AppState>,
+    SessionId(session_id): SessionId,
+) -> Result<ApiList<NodeResponse>, ApiError> {
     let nodes = state.graph_service.list_nodes().await?;
+    let accessed: Vec<i64> = nodes.iter().map(|node| node.id).collect();
+    state
+        .audit_service
+        .record(&session_id, &accessed, AccessAction::Read)
+        .await;
     Ok(ApiList {
         status: StatusCode::OK,
         items: nodes.into_iter().map(Into::into).collect(),
@@ -126,14 +142,19 @@ pub async fn list_nodes(State(state): State<AppState>) -> Result<ApiList<NodeRes
     tag = "Graph",
     get,
     path = "/nodes/{node_id}",
-    params(("node_id" = i64, Path, description = "Node id")),
+    params(SessionHeader, ("node_id" = i64, Path, description = "Node id")),
     responses((status = 200, description = "Node", body = NodeResponse))
 )]
 pub async fn get_node(
     State(state): State<AppState>,
+    SessionId(session_id): SessionId,
     Path(node_id): Path<i64>,
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let node = state.graph_service.get_node(node_id).await?;
+    state
+        .audit_service
+        .record(&session_id, &[node.id], AccessAction::Read)
+        .await;
     Ok(ApiSuccess {
         status: StatusCode::OK,
         data: node.into(),
@@ -144,13 +165,18 @@ pub async fn get_node(
     tag = "Graph",
     delete,
     path = "/nodes/{node_id}",
-    params(("node_id" = i64, Path, description = "Node id")),
+    params(SessionHeader, ("node_id" = i64, Path, description = "Node id")),
     responses((status = 204, description = "Node deleted"))
 )]
 pub async fn delete_node(
     State(state): State<AppState>,
+    SessionId(session_id): SessionId,
     Path(node_id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
+    state
+        .audit_service
+        .record(&session_id, &[node_id], AccessAction::Write)
+        .await;
     state.graph_service.delete_node(node_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -159,14 +185,21 @@ pub async fn delete_node(
     tag = "Graph",
     get,
     path = "/nodes/{node_id}/neighbors",
-    params(("node_id" = i64, Path, description = "Node id")),
+    params(SessionHeader, ("node_id" = i64, Path, description = "Node id")),
     responses((status = 200, description = "Outgoing neighbors", body = ApiList<NeighborResponse>))
 )]
 pub async fn list_neighbors(
     State(state): State<AppState>,
+    SessionId(session_id): SessionId,
     Path(node_id): Path<i64>,
 ) -> Result<ApiList<NeighborResponse>, ApiError> {
     let neighbors = state.graph_service.neighbors(node_id).await?;
+    let mut accessed = vec![node_id];
+    accessed.extend(neighbors.iter().map(|(_, node)| node.id));
+    state
+        .audit_service
+        .record(&session_id, &accessed, AccessAction::Read)
+        .await;
     Ok(ApiList {
         status: StatusCode::OK,
         items: neighbors.into_iter().map(Into::into).collect(),
@@ -178,14 +211,24 @@ pub async fn list_neighbors(
     post,
     path = "/edges",
     request_body = CreateEdgeParameters,
+    params(SessionHeader),
     responses((status = 204, description = "Edge created"))
 )]
 pub async fn add_edge(
     State(state): State<AppState>,
+    SessionId(session_id): SessionId,
     Json(params): Json<CreateEdgeParameters>,
 ) -> Result<StatusCode, ApiError> {
     let edge: Edge = params.into();
     state.graph_service.add_edge(&edge).await?;
+    state
+        .audit_service
+        .record(
+            &session_id,
+            &[edge.source, edge.destination],
+            AccessAction::Write,
+        )
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -193,15 +236,24 @@ pub async fn add_edge(
     tag = "Graph",
     delete,
     path = "/edges",
-    params(DeleteEdgeParameters),
+    params(SessionHeader, DeleteEdgeParameters),
     responses((status = 204, description = "Edge removed"))
 )]
 pub async fn remove_edge(
     State(state): State<AppState>,
+    SessionId(session_id): SessionId,
     Query(params): Query<DeleteEdgeParameters>,
 ) -> Result<StatusCode, ApiError> {
     let edge: Edge = params.into();
     state.graph_service.remove_edge(&edge).await?;
+    state
+        .audit_service
+        .record(
+            &session_id,
+            &[edge.source, edge.destination],
+            AccessAction::Write,
+        )
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -209,14 +261,23 @@ pub async fn remove_edge(
     tag = "Graph",
     get,
     path = "/search",
-    params(SearchParameters),
+    params(SessionHeader, SearchParameters),
     responses((status = 200, description = "Per-segment full-text search hits", body = SearchResponse))
 )]
 pub async fn search(
     State(state): State<AppState>,
+    SessionId(session_id): SessionId,
     Query(params): Query<SearchParameters>,
 ) -> Result<ApiSuccess<SearchResponse>, ApiError> {
     let segments = state.graph_service.search(&params.q).await?;
+    let accessed: Vec<i64> = segments
+        .iter()
+        .flat_map(|segment| segment.matches.iter().map(|hit| hit.node.id))
+        .collect();
+    state
+        .audit_service
+        .record(&session_id, &accessed, AccessAction::Read)
+        .await;
     let summary_chars = state.graph_service.summary_chars();
     let segments = segments
         .into_iter()
@@ -253,11 +314,12 @@ pub async fn search(
     tag = "Graph",
     get,
     path = "/search/segment",
-    params(SearchSegmentParameters),
+    params(SessionHeader, SearchSegmentParameters),
     responses((status = 200, description = "Additional matches for a single segment", body = ApiList<SearchHitResponse>))
 )]
 pub async fn search_segment(
     State(state): State<AppState>,
+    SessionId(session_id): SessionId,
     Query(params): Query<SearchSegmentParameters>,
 ) -> Result<ApiList<SearchHitResponse>, ApiError> {
     let limit = params
@@ -268,6 +330,11 @@ pub async fn search_segment(
         .graph_service
         .search_segment(&params.segment, limit, offset)
         .await?;
+    let accessed: Vec<i64> = hits.iter().map(|hit| hit.node.id).collect();
+    state
+        .audit_service
+        .record(&session_id, &accessed, AccessAction::Read)
+        .await;
     let summary_chars = state.graph_service.summary_chars();
     Ok(ApiList {
         status: StatusCode::OK,

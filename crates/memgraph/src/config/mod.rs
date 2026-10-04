@@ -28,6 +28,9 @@ split_points = [".", "!", "?", ";", "\n"]
 [health]
 enabled = true
 interval_secs = 900
+
+[audit]
+retention_days = 30
 "#;
 
 #[derive(Debug, Deserialize)]
@@ -111,12 +114,24 @@ impl Default for HealthConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AuditConfig {
+    pub retention_days: u64,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self { retention_days: 30 }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
     pub search: SearchConfig,
     pub health: HealthConfig,
+    pub audit: AuditConfig,
 }
 
 impl AppConfig {

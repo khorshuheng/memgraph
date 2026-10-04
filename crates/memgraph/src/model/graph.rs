@@ -122,3 +122,18 @@ pub struct SegmentMatches {
     pub matches: Vec<SearchHit>,
     pub total_matches: usize,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessAction {
+    Read,
+    Write,
+}
+
+impl AccessAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AccessAction::Read => "read",
+            AccessAction::Write => "write",
+        }
+    }
+}

@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use sqlx::{FromRow, SqlitePool};
 
 use crate::model::{
-    Edge, EdgeType, EdgeTypeUsage, IsolatedNode, KindUsage, Node, NodeKind, RelationDirection,
-    RelationSummary,
+    AccessAction, Edge, EdgeType, EdgeTypeUsage, IsolatedNode, KindUsage, Node, NodeKind,
+    RelationDirection, RelationSummary,
 };
 
 use super::error::RepositoryError;
@@ -45,6 +45,13 @@ pub trait GraphRepository: Send + Sync {
     -> Result<Vec<(i64, String, String, i64)>, RepositoryError>;
     async fn isolated_node_count(&self) -> Result<i64, RepositoryError>;
     async fn isolated_nodes(&self, limit: i64) -> Result<Vec<IsolatedNode>, RepositoryError>;
+    async fn record_node_accesses(
+        &self,
+        session_id: &str,
+        node_ids: &[i64],
+        action: AccessAction,
+    ) -> Result<(), RepositoryError>;
+    async fn prune_node_access(&self, retention_days: u64) -> Result<u64, RepositoryError>;
 }
 
 #[derive(Clone)]
@@ -343,6 +350,45 @@ impl GraphRepository for SqliteGraphRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    async fn record_node_accesses(
+        &self,
+        session_id: &str,
+        node_ids: &[i64],
+        action: AccessAction,
+    ) -> Result<(), RepositoryError> {
+        if node_ids.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self.pool.begin().await?;
+        for node_id in node_ids {
+            sqlx::query(
+                "INSERT INTO node_access (session_id, node_id, node_name, node_kind, action) \
+                 SELECT ?, n.id, n.name, k.name, ? \
+                 FROM node n JOIN node_kind k ON k.id = n.kind_id \
+                 WHERE n.id = ?",
+            )
+            .bind(session_id)
+            .bind(action.as_str())
+            .bind(node_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn prune_node_access(&self, retention_days: u64) -> Result<u64, RepositoryError> {
+        let modifier = format!("-{retention_days} days");
+        let result = sqlx::query(
+            "DELETE FROM node_access \
+             WHERE accessed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
+        )
+        .bind(modifier)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 }
 
