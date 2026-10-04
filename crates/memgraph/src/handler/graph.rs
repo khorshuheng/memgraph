@@ -379,7 +379,11 @@ pub async fn search(
     let scope_value = params.scope.as_str();
     let scope = params.scope.into();
     let reach = params.reach();
-    let segments = state.graph_service.search(&params.q, scope, &reach).await?;
+    let exclude = state.audit_service.accessed_node_ids(&session_id).await;
+    let segments = state
+        .graph_service
+        .search(&params.q, scope, &reach, &exclude)
+        .await?;
     let summary_chars = state.graph_service.summary_chars();
     let mut responses = Vec::with_capacity(segments.len());
     for segment in segments {
@@ -445,6 +449,7 @@ pub async fn search_segment(
         .limit
         .unwrap_or_else(|| state.graph_service.default_segment_limit());
     let offset = params.offset.unwrap_or(0);
+    let exclude = state.audit_service.accessed_node_ids(&session_id).await;
     let hits = state
         .graph_service
         .search_segment(
@@ -453,6 +458,7 @@ pub async fn search_segment(
             &params.reach(),
             limit,
             offset,
+            &exclude,
         )
         .await?;
     let node_ids: Vec<i64> = hits.iter().map(|hit| hit.node.id).collect();
@@ -693,5 +699,47 @@ mod tests {
         .await
         .unwrap_or_else(|error| panic!("owning session update failed: {}", error.message));
         assert_eq!(accepted, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn search_hides_nodes_the_session_already_retrieved() {
+        let state = test_state().await;
+        let target = seed_search_graph(&state).await;
+        let params = || SearchParameters {
+            q: "rotated token".to_string(),
+            scope: SearchScope::default(),
+            within: None,
+            via: None,
+            descend: None,
+        };
+
+        let first = search(
+            State(state.clone()),
+            SessionId("session-1".to_string()),
+            Query(params()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("first search failed: {}", error.message));
+        assert_eq!(first.data.segments[0].matches[0].id, target);
+
+        let repeat = search(
+            State(state.clone()),
+            SessionId("session-1".to_string()),
+            Query(params()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("repeat search failed: {}", error.message));
+        assert!(repeat.data.segments[0].matches.is_empty());
+        assert_eq!(repeat.data.segments[0].total_matches, 1);
+        assert_eq!(repeat.data.segments[0].hidden, 1);
+
+        let other = search(
+            State(state.clone()),
+            SessionId("session-2".to_string()),
+            Query(params()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("other session search failed: {}", error.message));
+        assert_eq!(other.data.segments[0].matches[0].id, target);
     }
 }

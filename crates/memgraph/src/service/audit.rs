@@ -51,6 +51,20 @@ impl AuditService {
         }
     }
 
+    pub async fn accessed_node_ids(&self, session_id: &str) -> HashSet<i64> {
+        match self.repository.accessed_node_ids(session_id).await {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    session_id = %session_id,
+                    "failed to load accessed nodes"
+                );
+                HashSet::new()
+            }
+        }
+    }
+
     pub async fn mark_relevance(
         &self,
         session_id: &str,
@@ -168,6 +182,31 @@ mod tests {
         assert_eq!(node_kind, "widget");
         assert_eq!(action, "write");
         assert!(!accessed_at.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lists_node_ids_recorded_for_a_session() {
+        let (audit, repository, _) = service().await;
+        let kind_id = seed_kind(&repository).await;
+        let first = seed_named_node(&repository, kind_id, "a.widget").await;
+        let second = seed_named_node(&repository, kind_id, "b.widget").await;
+
+        audit
+            .record("session-1", &[first, second], AccessAction::Read, None)
+            .await;
+        audit
+            .record("session-2", &[first], AccessAction::Read, None)
+            .await;
+
+        assert_eq!(
+            audit.accessed_node_ids("session-1").await,
+            HashSet::from([first, second])
+        );
+        assert_eq!(
+            audit.accessed_node_ids("session-2").await,
+            HashSet::from([first])
+        );
+        assert!(audit.accessed_node_ids("unknown").await.is_empty());
     }
 
     #[tokio::test]

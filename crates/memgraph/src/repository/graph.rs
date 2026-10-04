@@ -134,6 +134,7 @@ pub trait GraphRepository: Send + Sync {
         action: AccessAction,
         query_term: Option<&str>,
     ) -> Result<Vec<NodeAccessRecord>, RepositoryError>;
+    async fn accessed_node_ids(&self, session_id: &str) -> Result<HashSet<i64>, RepositoryError>;
     async fn set_node_access_relevance(
         &self,
         session_id: &str,
@@ -700,6 +701,16 @@ impl GraphRepository for SqliteGraphRepository {
         }
         transaction.commit().await?;
         Ok(recorded)
+    }
+
+    async fn accessed_node_ids(&self, session_id: &str) -> Result<HashSet<i64>, RepositoryError> {
+        let rows = sqlx::query_scalar::<_, i64>(
+            "SELECT DISTINCT node_id FROM node_access WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
     }
 
     async fn set_node_access_relevance(

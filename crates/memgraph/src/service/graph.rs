@@ -649,6 +649,7 @@ impl GraphService {
         query: &str,
         scope: SearchScope,
         reach: &ReachFilter,
+        exclude: &HashSet<i64>,
     ) -> Result<Vec<SegmentMatches>, ServiceError> {
         let reach = self.normalize_reach(reach).await?;
         let mut segments = Vec::new();
@@ -661,6 +662,7 @@ impl GraphService {
             let matches = score
                 .hits
                 .into_iter()
+                .filter(|hit| !exclude.contains(&hit.node.id))
                 .take(self.search_config.per_segment_limit)
                 .collect();
             segments.push(SegmentMatches {
@@ -680,10 +682,17 @@ impl GraphService {
         reach: &ReachFilter,
         limit: usize,
         offset: usize,
+        exclude: &HashSet<i64>,
     ) -> Result<Vec<SearchHit>, ServiceError> {
         let reach = self.normalize_reach(reach).await?;
         let score = self.score_segment(segment, scope, &reach).await?;
-        Ok(score.hits.into_iter().skip(offset).take(limit).collect())
+        Ok(score
+            .hits
+            .into_iter()
+            .filter(|hit| !exclude.contains(&hit.node.id))
+            .skip(offset)
+            .take(limit)
+            .collect())
     }
 
     pub fn summary_chars(&self) -> usize {
@@ -1206,7 +1215,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             service
-                .search("ada lovelace", SearchScope::All, &ReachFilter::default())
+                .search(
+                    "ada lovelace",
+                    SearchScope::All,
+                    &ReachFilter::default(),
+                    &HashSet::new()
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -1219,7 +1233,12 @@ mod tests {
         );
         assert!(
             service
-                .search("ada lovelace", SearchScope::All, &ReachFilter::default())
+                .search(
+                    "ada lovelace",
+                    SearchScope::All,
+                    &ReachFilter::default(),
+                    &HashSet::new()
+                )
                 .await
                 .unwrap()
                 .is_empty()
@@ -1298,6 +1317,7 @@ mod tests {
                 "pioneer computing",
                 SearchScope::All,
                 &ReachFilter::default(),
+                &HashSet::new(),
             )
             .await
             .unwrap();
@@ -1314,7 +1334,8 @@ mod tests {
                 .search(
                     "pioneer computing",
                     SearchScope::All,
-                    &ReachFilter::default()
+                    &ReachFilter::default(),
+                    &HashSet::new(),
                 )
                 .await
                 .unwrap()
@@ -1325,6 +1346,7 @@ mod tests {
                 "mathematician logician",
                 SearchScope::All,
                 &ReachFilter::default(),
+                &HashSet::new(),
             )
             .await
             .unwrap();
@@ -1342,7 +1364,12 @@ mod tests {
             .unwrap();
         assert!(
             service
-                .search("debt repayment", SearchScope::All, &ReachFilter::default())
+                .search(
+                    "debt repayment",
+                    SearchScope::All,
+                    &ReachFilter::default(),
+                    &HashSet::new()
+                )
                 .await
                 .unwrap()
                 .is_empty()
@@ -1369,6 +1396,7 @@ mod tests {
                 "refresh rotation",
                 SearchScope::All,
                 &ReachFilter::default(),
+                &HashSet::new(),
             )
             .await
             .unwrap();
@@ -1390,7 +1418,12 @@ mod tests {
             .unwrap();
         assert!(
             service
-                .search("refresh", SearchScope::All, &ReachFilter::default())
+                .search(
+                    "refresh",
+                    SearchScope::All,
+                    &ReachFilter::default(),
+                    &HashSet::new()
+                )
                 .await
                 .unwrap()
                 .is_empty()
@@ -1414,6 +1447,7 @@ mod tests {
                 "musical composition? query storage engine",
                 SearchScope::All,
                 &ReachFilter::default(),
+                &HashSet::new(),
             )
             .await
             .unwrap();
@@ -1448,7 +1482,12 @@ mod tests {
             .await
             .unwrap();
         let segments = service
-            .search("ada lovelace", SearchScope::All, &ReachFilter::default())
+            .search(
+                "ada lovelace",
+                SearchScope::All,
+                &ReachFilter::default(),
+                &HashSet::new(),
+            )
             .await
             .unwrap();
         let ada_hit = segments[0]
@@ -2109,6 +2148,7 @@ mod tests {
                 "recalibrated widget",
                 SearchScope::All,
                 &ReachFilter::default(),
+                &HashSet::new(),
             )
             .await
             .unwrap();
@@ -2245,6 +2285,7 @@ mod tests {
                 "recalibrated widget",
                 SearchScope::Active,
                 &ReachFilter::default(),
+                &HashSet::new(),
             )
             .await
             .unwrap();
@@ -2268,6 +2309,7 @@ mod tests {
                 "recalibrated widget",
                 SearchScope::Active,
                 &ReachFilter::default(),
+                &HashSet::new(),
             )
             .await
             .unwrap();
@@ -2281,6 +2323,7 @@ mod tests {
                 "recalibrated widget",
                 SearchScope::All,
                 &ReachFilter::default(),
+                &HashSet::new(),
             )
             .await
             .unwrap();
@@ -2293,6 +2336,7 @@ mod tests {
                 "recalibrated widget",
                 SearchScope::Resolved,
                 &ReachFilter::default(),
+                &HashSet::new(),
             )
             .await
             .unwrap();
@@ -2670,6 +2714,7 @@ mod tests {
                 "recalibrated widget",
                 SearchScope::All,
                 &ReachFilter::default(),
+                &HashSet::new(),
             )
             .await
             .unwrap();
@@ -2681,12 +2726,81 @@ mod tests {
             descend: None,
         };
         let filtered = service
-            .search("recalibrated widget", SearchScope::All, &reach)
+            .search(
+                "recalibrated widget",
+                SearchScope::All,
+                &reach,
+                &HashSet::new(),
+            )
             .await
             .unwrap();
         assert_eq!(filtered[0].total_matches, 1);
         assert_eq!(filtered[0].matches[0].node.id, scoped.id);
         assert_ne!(filtered[0].matches[0].node.id, loose.id);
+    }
+
+    #[tokio::test]
+    async fn search_hides_nodes_already_accessed_by_the_session() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let first = service
+            .upsert_node(&described_node(kind_id, "Ada", "rotated token"))
+            .await
+            .unwrap();
+        let second = service
+            .upsert_node(&described_node(kind_id, "Bob", "rotated token"))
+            .await
+            .unwrap();
+        for index in 0..2 {
+            service
+                .upsert_node(&described_node(
+                    kind_id,
+                    &format!("decoy-{index}"),
+                    "unrelated filler",
+                ))
+                .await
+                .unwrap();
+        }
+
+        let visible = service
+            .search(
+                "rotated token",
+                SearchScope::All,
+                &ReachFilter::default(),
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(visible[0].matches.len(), 2);
+        assert_eq!(visible[0].total_matches, 2);
+
+        let exclude: HashSet<i64> = [first.id].into_iter().collect();
+        let suppressed = service
+            .search(
+                "rotated token",
+                SearchScope::All,
+                &ReachFilter::default(),
+                &exclude,
+            )
+            .await
+            .unwrap();
+        assert_eq!(suppressed[0].matches.len(), 1);
+        assert_eq!(suppressed[0].matches[0].node.id, second.id);
+        assert_eq!(suppressed[0].total_matches, 2);
+
+        let paged = service
+            .search_segment(
+                "rotated token",
+                SearchScope::All,
+                &ReachFilter::default(),
+                5,
+                0,
+                &exclude,
+            )
+            .await
+            .unwrap();
+        assert_eq!(paged.len(), 1);
+        assert_eq!(paged[0].node.id, second.id);
     }
 
     #[tokio::test]
