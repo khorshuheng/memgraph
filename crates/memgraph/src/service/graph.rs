@@ -5,16 +5,17 @@ use std::sync::Arc;
 use crate::{
     config::SearchConfig,
     model::{
-        Edge, EdgeType, Neighbor, NeighborDirection, Node, NodeKind, NodeRef, PendingEdge, Plan,
-        PlanDraft, PlanTask, PlanTaskDraft, SearchHit, SearchScope, SegmentMatches, TaskDraft,
-        TaskPatch,
+        Edge, EdgeType, Neighbor, NeighborDirection, Node, NodeFilter, NodeKind, NodeRef,
+        PendingEdge, Plan, PlanDraft, PlanTask, PlanTaskDraft, ReachFilter, SearchHit, SearchScope,
+        SegmentMatches, TaskDraft, TaskPatch,
     },
     repository::graph::GraphRepository,
 };
 
 use super::error::ServiceError;
 
-const RESOLVABLE_KINDS: &[&str] = &["task", "bug"];
+const DEFAULT_DESCEND: &str = "part_of";
+const DESCEND_NONE: &str = "none";
 
 #[derive(Clone)]
 pub struct GraphService {
@@ -81,11 +82,75 @@ impl GraphService {
         }
     }
 
-    pub async fn list_nodes(&self) -> Result<Vec<Node>, ServiceError> {
+    pub async fn list_nodes(&self, filter: &NodeFilter) -> Result<Vec<Node>, ServiceError> {
+        let filter = self.normalize_node_filter(filter).await?;
         self.repository
-            .list_nodes()
+            .list_nodes(&filter)
             .await
             .map_err(ServiceError::from)
+    }
+
+    async fn normalize_node_filter(&self, filter: &NodeFilter) -> Result<NodeFilter, ServiceError> {
+        if let Some(kind) = &filter.kind {
+            let exists = self
+                .repository
+                .list_node_kinds()
+                .await?
+                .iter()
+                .any(|node_kind| &node_kind.name == kind);
+            if !exists {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "node kind '{kind}' is not defined"
+                )));
+            }
+        }
+        Ok(NodeFilter {
+            kind: filter.kind.clone(),
+            scope: filter.scope,
+            reach: self.normalize_reach(&filter.reach).await?,
+        })
+    }
+
+    async fn normalize_reach(&self, reach: &ReachFilter) -> Result<ReachFilter, ServiceError> {
+        if reach.within.is_none() {
+            if reach.via.is_some() || reach.descend.is_some() {
+                return Err(ServiceError::UnprocessableEntity(
+                    "via and descend require within".to_string(),
+                ));
+            }
+            return Ok(ReachFilter::default());
+        }
+        let within = reach.within.expect("within is present");
+        if self.repository.get_node(within).await?.is_none() {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "within references unknown node {within}"
+            )));
+        }
+        let edge_types = self.repository.list_edge_types().await?;
+        if let Some(via) = &reach.via
+            && !edge_types.iter().any(|edge_type| &edge_type.name == via)
+        {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "edge type '{via}' is not defined"
+            )));
+        }
+        let descend = match reach.descend.as_deref() {
+            None => Some(DEFAULT_DESCEND.to_string()),
+            Some(DESCEND_NONE) => None,
+            Some(name) => {
+                if !edge_types.iter().any(|edge_type| edge_type.name == name) {
+                    return Err(ServiceError::UnprocessableEntity(format!(
+                        "edge type '{name}' is not defined"
+                    )));
+                }
+                Some(name.to_string())
+            }
+        };
+        Ok(ReachFilter {
+            within: Some(within),
+            via: reach.via.clone(),
+            descend,
+        })
     }
 
     pub async fn add_edge(&self, edge: &Edge) -> Result<(), ServiceError> {
@@ -99,19 +164,54 @@ impl GraphService {
                     edge.edge_type_id
                 ))
             })?;
-        if edge_type.resolves {
-            let kinds = self.node_kind_names(&[edge.destination]).await?;
-            require_kind(
-                &kinds,
-                edge.destination,
-                RESOLVABLE_KINDS,
-                "resolving edge destination",
-            )?;
-        }
+        let kinds = self
+            .node_kind_names(&[edge.source, edge.destination])
+            .await?;
+        require_kind(
+            &kinds,
+            edge.source,
+            &edge_type.source_kind_list(),
+            &format!("edge type '{}' source", edge_type.name),
+        )?;
+        require_kind(
+            &kinds,
+            edge.destination,
+            &edge_type.destination_kind_list(),
+            &format!("edge type '{}' destination", edge_type.name),
+        )?;
+        self.require_single_outgoing(edge.source, edge.destination, edge_type)
+            .await?;
         self.repository
             .add_edge(edge)
             .await
             .map_err(ServiceError::from)
+    }
+
+    async fn require_single_outgoing(
+        &self,
+        source: i64,
+        destination: i64,
+        edge_type: &EdgeType,
+    ) -> Result<(), ServiceError> {
+        if !edge_type.single_outgoing {
+            return Ok(());
+        }
+        let targets = self
+            .repository
+            .outgoing_edge_targets(source, edge_type.id)
+            .await?;
+        if targets.iter().any(|target| *target != destination) {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "edge type '{}' allows one outgoing edge, and node {source} already points at {}",
+                edge_type.name,
+                targets
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )));
+        }
+        Ok(())
     }
 
     pub async fn remove_edge(&self, edge: &Edge) -> Result<(), ServiceError> {
@@ -184,6 +284,17 @@ impl GraphService {
     }
 
     pub async fn create_task(&self, draft: &TaskDraft) -> Result<Node, ServiceError> {
+        if draft.id < 0 {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "task has invalid node id {}",
+                draft.id
+            )));
+        }
+        let Some(parent) = draft.parent else {
+            return Err(ServiceError::UnprocessableEntity(
+                "a task requires a parent: provide the goal or task it belongs to".to_string(),
+            ));
+        };
         let task_kind = self
             .repository
             .list_node_kinds()
@@ -195,16 +306,10 @@ impl GraphService {
             })?
             .id;
         let edge_types = self.repository.list_edge_types().await?;
-        let part_of = edge_type_id(&edge_types, "part_of")?;
-        let depends_on = edge_type_id(&edge_types, "depends_on")?;
-        let affects = edge_type_id(&edge_types, "affects")?;
+        let part_of = edge_type_ref(&edge_types, "part_of")?;
+        let depends_on = edge_type_ref(&edge_types, "depends_on")?;
+        let affects = edge_type_ref(&edge_types, "affects")?;
 
-        if draft.id < 0 {
-            return Err(ServiceError::UnprocessableEntity(format!(
-                "task has invalid node id {}",
-                draft.id
-            )));
-        }
         let mut referenced = Vec::new();
         if let Some(parent) = draft.parent {
             referenced.push(parent);
@@ -212,14 +317,32 @@ impl GraphService {
         referenced.extend(draft.depends_on.iter().copied());
         referenced.extend(draft.affects.iter().copied());
         let kinds = self.node_kind_names(&referenced).await?;
-        if let Some(parent) = draft.parent {
-            require_kind(&kinds, parent, &["task", "goal"], "part_of parent")?;
-        }
+        require_kind(
+            &kinds,
+            parent,
+            &part_of.destination_kind_list(),
+            "part_of parent",
+        )?;
         for dependency in &draft.depends_on {
-            require_kind(&kinds, *dependency, &["task"], "depends_on target")?;
+            require_kind(
+                &kinds,
+                *dependency,
+                &depends_on.destination_kind_list(),
+                "depends_on target",
+            )?;
         }
         for target in &draft.affects {
-            require_kind(&kinds, *target, &["file", "db_table"], "affects target")?;
+            require_kind(
+                &kinds,
+                *target,
+                &affects.destination_kind_list(),
+                "affects target",
+            )?;
+        }
+        if !self.repository.is_anchored(parent).await? {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "part_of parent references node {parent}, which is not attached to a repo via belongs_to"
+            )));
         }
 
         let node = Node {
@@ -231,25 +354,23 @@ impl GraphService {
             updated_at: String::new(),
         };
         let mut edges = Vec::new();
-        if let Some(parent) = draft.parent {
-            edges.push(PendingEdge {
-                source: NodeRef::New(0),
-                destination: NodeRef::Existing(parent),
-                edge_type_id: part_of,
-            });
-        }
+        edges.push(PendingEdge {
+            source: NodeRef::New(0),
+            destination: NodeRef::Existing(parent),
+            edge_type_id: part_of.id,
+        });
         for dependency in &draft.depends_on {
             edges.push(PendingEdge {
                 source: NodeRef::New(0),
                 destination: NodeRef::Existing(*dependency),
-                edge_type_id: depends_on,
+                edge_type_id: depends_on.id,
             });
         }
         for target in &draft.affects {
             edges.push(PendingEdge {
                 source: NodeRef::New(0),
                 destination: NodeRef::Existing(*target),
-                edge_type_id: affects,
+                edge_type_id: affects.id,
             });
         }
 
@@ -275,6 +396,12 @@ impl GraphService {
                 ));
             }
             _ => {}
+        }
+        if draft.goal.is_some() && draft.anchor.is_none() {
+            return Err(ServiceError::UnprocessableEntity(
+                "a plan requires an anchor: provide anchor to attach the goal to a repo"
+                    .to_string(),
+            ));
         }
 
         let mut supplied_ids: HashSet<i64> = HashSet::new();
@@ -313,13 +440,16 @@ impl GraphService {
             None
         };
         let edge_types = self.repository.list_edge_types().await?;
-        let part_of = edge_type_id(&edge_types, "part_of")?;
-        let depends_on = edge_type_id(&edge_types, "depends_on")?;
-        let affects = edge_type_id(&edge_types, "affects")?;
+        let part_of = edge_type_ref(&edge_types, "part_of")?;
+        let depends_on = edge_type_ref(&edge_types, "depends_on")?;
+        let affects = edge_type_ref(&edge_types, "affects")?;
 
         let mut referenced = Vec::new();
         if let Some(goal_id) = draft.goal_id {
             referenced.push(goal_id);
+        }
+        if let Some(anchor) = &draft.anchor {
+            referenced.push(anchor.node_id);
         }
         for task in &draft.tasks {
             referenced.extend(task.affects.iter().copied());
@@ -327,17 +457,47 @@ impl GraphService {
         let kinds = self.node_kind_names(&referenced).await?;
         if let Some(goal_id) = draft.goal_id {
             require_kind(&kinds, goal_id, &["goal"], "goal_id")?;
+            if draft.anchor.is_none() && !self.repository.is_anchored(goal_id).await? {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "goal_id references node {goal_id}, which is not attached to a repo; provide anchor"
+                )));
+            }
         }
         for task in &draft.tasks {
             for target in &task.affects {
                 require_kind(
                     &kinds,
                     *target,
-                    &["file", "db_table"],
+                    &affects.destination_kind_list(),
                     &format!("plan task '{}' affects", task.key),
                 )?;
             }
         }
+
+        let anchor_edge = match &draft.anchor {
+            Some(anchor) => {
+                let edge_type = edge_type_ref(&edge_types, &anchor.edge_type)?;
+                let source_kinds = edge_type.source_kind_list();
+                if !source_kinds.is_empty() && !source_kinds.contains(&"goal") {
+                    return Err(ServiceError::UnprocessableEntity(format!(
+                        "edge type '{}' does not accept a goal source",
+                        edge_type.name
+                    )));
+                }
+                require_kind(
+                    &kinds,
+                    anchor.node_id,
+                    &edge_type.destination_kind_list(),
+                    &format!("plan anchor edge '{}' destination", edge_type.name),
+                )?;
+                if let Some(goal_id) = draft.goal_id {
+                    self.require_single_outgoing(goal_id, anchor.node_id, edge_type)
+                        .await?;
+                }
+                Some((edge_type.id, anchor.node_id))
+            }
+            None => None,
+        };
 
         let mut key_index: HashMap<&str, usize> = HashMap::new();
         let offset = if draft.goal.is_some() { 1 } else { 0 };
@@ -420,6 +580,13 @@ impl GraphService {
         };
 
         let mut edges = Vec::new();
+        if let Some((edge_type_id, node_id)) = anchor_edge {
+            edges.push(PendingEdge {
+                source: root,
+                destination: NodeRef::Existing(node_id),
+                edge_type_id,
+            });
+        }
         for (position, task) in draft.tasks.iter().enumerate() {
             let task_ref = NodeRef::New(offset + position);
             let parent = match &task.parent {
@@ -429,20 +596,20 @@ impl GraphService {
             edges.push(PendingEdge {
                 source: task_ref,
                 destination: parent,
-                edge_type_id: part_of,
+                edge_type_id: part_of.id,
             });
             for dependency in &task.depends_on {
                 edges.push(PendingEdge {
                     source: task_ref,
                     destination: NodeRef::New(key_index[dependency.as_str()]),
-                    edge_type_id: depends_on,
+                    edge_type_id: depends_on.id,
                 });
             }
             for target in &task.affects {
                 edges.push(PendingEdge {
                     source: task_ref,
                     destination: NodeRef::Existing(*target),
-                    edge_type_id: affects,
+                    edge_type_id: affects.id,
                 });
             }
         }
@@ -481,10 +648,12 @@ impl GraphService {
         &self,
         query: &str,
         scope: SearchScope,
+        reach: &ReachFilter,
     ) -> Result<Vec<SegmentMatches>, ServiceError> {
+        let reach = self.normalize_reach(reach).await?;
         let mut segments = Vec::new();
         for segment in split_segments(query, &self.search_config.split_characters()) {
-            let score = self.score_segment(&segment, scope).await?;
+            let score = self.score_segment(&segment, scope, &reach).await?;
             if score.hits.is_empty() && score.excluded_resolved == 0 {
                 continue;
             }
@@ -508,10 +677,12 @@ impl GraphService {
         &self,
         segment: &str,
         scope: SearchScope,
+        reach: &ReachFilter,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<SearchHit>, ServiceError> {
-        let score = self.score_segment(segment, scope).await?;
+        let reach = self.normalize_reach(reach).await?;
+        let score = self.score_segment(segment, scope, &reach).await?;
         Ok(score.hits.into_iter().skip(offset).take(limit).collect())
     }
 
@@ -527,6 +698,7 @@ impl GraphService {
         &self,
         segment: &str,
         scope: SearchScope,
+        reach: &ReachFilter,
     ) -> Result<SegmentScore, ServiceError> {
         let considered = self.considered_terms(segment).await?;
         if considered.is_empty() {
@@ -545,7 +717,10 @@ impl GraphService {
             .map(|considered_term| considered_term.term.as_str())
             .collect();
         let fts_query = build_fts_query(&terms);
-        let candidates = self.repository.search_descriptions(&fts_query).await?;
+        let candidates = self
+            .repository
+            .search_descriptions(&fts_query, reach)
+            .await?;
 
         let mut hits = Vec::new();
         let mut excluded_resolved = 0;
@@ -672,11 +847,10 @@ impl GraphService {
     }
 }
 
-fn edge_type_id(edge_types: &[EdgeType], name: &str) -> Result<i64, ServiceError> {
+fn edge_type_ref<'a>(edge_types: &'a [EdgeType], name: &str) -> Result<&'a EdgeType, ServiceError> {
     edge_types
         .iter()
         .find(|edge_type| edge_type.name == name)
-        .map(|edge_type| edge_type.id)
         .ok_or_else(|| {
             ServiceError::UnprocessableEntity(format!("edge type '{name}' is not defined"))
         })
@@ -692,6 +866,7 @@ fn require_kind(
         None => Err(ServiceError::UnprocessableEntity(format!(
             "{context} references unknown node {id}"
         ))),
+        Some(_) if allowed.is_empty() => Ok(()),
         Some(kind) if allowed.contains(&kind.as_str()) => Ok(()),
         Some(kind) => Err(ServiceError::UnprocessableEntity(format!(
             "{context} references node {id} of kind '{kind}', expected {}",
@@ -833,7 +1008,7 @@ fn build_fts_query(terms: &[&str]) -> String {
 mod tests {
     use crate::{
         database::{create_sqlite_pool, migrate},
-        model::{PlanGoalDraft, RelationDirection},
+        model::{PlanAnchorDraft, PlanGoalDraft, RelationDirection},
         repository::graph::SqliteGraphRepository,
     };
 
@@ -876,6 +1051,9 @@ mod tests {
             name: name.to_string(),
             description: description.to_string(),
             resolves: false,
+            single_outgoing: false,
+            source_kinds: None,
+            destination_kinds: None,
             updated_at: String::new(),
         }
     }
@@ -979,7 +1157,14 @@ mod tests {
         let updated = service.upsert_node(&changed).await.unwrap();
         assert_eq!(updated.id, created.id);
         assert_eq!(updated.content, "b");
-        assert_eq!(service.list_nodes().await.unwrap().len(), 1);
+        assert_eq!(
+            service
+                .list_nodes(&NodeFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1021,7 +1206,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             service
-                .search("ada lovelace", SearchScope::All)
+                .search("ada lovelace", SearchScope::All, &ReachFilter::default())
                 .await
                 .unwrap()
                 .len(),
@@ -1034,7 +1219,7 @@ mod tests {
         );
         assert!(
             service
-                .search("ada lovelace", SearchScope::All)
+                .search("ada lovelace", SearchScope::All, &ReachFilter::default())
                 .await
                 .unwrap()
                 .is_empty()
@@ -1109,7 +1294,11 @@ mod tests {
             .await
             .unwrap();
         let segments = service
-            .search("pioneer computing", SearchScope::All)
+            .search(
+                "pioneer computing",
+                SearchScope::All,
+                &ReachFilter::default(),
+            )
             .await
             .unwrap();
         assert_eq!(segments.len(), 1);
@@ -1122,13 +1311,21 @@ mod tests {
         service.upsert_node(&changed).await.unwrap();
         assert!(
             service
-                .search("pioneer computing", SearchScope::All)
+                .search(
+                    "pioneer computing",
+                    SearchScope::All,
+                    &ReachFilter::default()
+                )
                 .await
                 .unwrap()
                 .is_empty()
         );
         let segments = service
-            .search("mathematician logician", SearchScope::All)
+            .search(
+                "mathematician logician",
+                SearchScope::All,
+                &ReachFilter::default(),
+            )
             .await
             .unwrap();
         assert_eq!(segments.len(), 1);
@@ -1145,7 +1342,7 @@ mod tests {
             .unwrap();
         assert!(
             service
-                .search("debt repayment", SearchScope::All)
+                .search("debt repayment", SearchScope::All, &ReachFilter::default())
                 .await
                 .unwrap()
                 .is_empty()
@@ -1168,7 +1365,11 @@ mod tests {
                 .unwrap();
         }
         let segments = service
-            .search("refresh rotation", SearchScope::All)
+            .search(
+                "refresh rotation",
+                SearchScope::All,
+                &ReachFilter::default(),
+            )
             .await
             .unwrap();
         assert_eq!(segments.len(), 1);
@@ -1189,7 +1390,7 @@ mod tests {
             .unwrap();
         assert!(
             service
-                .search("refresh", SearchScope::All)
+                .search("refresh", SearchScope::All, &ReachFilter::default())
                 .await
                 .unwrap()
                 .is_empty()
@@ -1212,6 +1413,7 @@ mod tests {
             .search(
                 "musical composition? query storage engine",
                 SearchScope::All,
+                &ReachFilter::default(),
             )
             .await
             .unwrap();
@@ -1246,7 +1448,7 @@ mod tests {
             .await
             .unwrap();
         let segments = service
-            .search("ada lovelace", SearchScope::All)
+            .search("ada lovelace", SearchScope::All, &ReachFilter::default())
             .await
             .unwrap();
         let ada_hit = segments[0]
@@ -1301,7 +1503,7 @@ mod tests {
         }
     }
 
-    fn plan_draft(tasks: Vec<PlanTaskDraft>) -> PlanDraft {
+    fn plan_draft(repo: i64, tasks: Vec<PlanTaskDraft>) -> PlanDraft {
         PlanDraft {
             goal: Some(PlanGoalDraft {
                 id: 0,
@@ -1310,8 +1512,47 @@ mod tests {
                 content: String::new(),
             }),
             goal_id: None,
+            anchor: Some(PlanAnchorDraft {
+                node_id: repo,
+                edge_type: "belongs_to".to_string(),
+            }),
             tasks,
         }
+    }
+
+    fn rejection(error: ServiceError) -> String {
+        match error {
+            ServiceError::UnprocessableEntity(message) => message,
+            other => panic!("expected an unprocessable entity, got {other:?}"),
+        }
+    }
+
+    async fn seeded_repo(service: &GraphService) -> i64 {
+        let repo_kind = seeded_kind(service, "repo").await;
+        service
+            .upsert_node(&node(repo_kind, "acme/widget", ""))
+            .await
+            .unwrap()
+            .id
+    }
+
+    async fn anchored_goal(service: &GraphService, repo: i64) -> i64 {
+        let goal_kind = seeded_kind(service, "goal").await;
+        let belongs_to = seeded_edge_type(service, "belongs_to").await;
+        let goal = service
+            .upsert_node(&node(goal_kind, "ship widget", ""))
+            .await
+            .unwrap();
+        service
+            .add_edge(&Edge {
+                source: goal.id,
+                destination: repo,
+                edge_type_id: belongs_to,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+        goal.id
     }
 
     fn new_task(name: &str) -> TaskDraft {
@@ -1329,17 +1570,14 @@ mod tests {
     #[tokio::test]
     async fn creates_task_with_wiring() {
         let service = service().await;
-        let goal_kind = seeded_kind(&service, "goal").await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
         let task_kind = seeded_kind(&service, "task").await;
         let file_kind = seeded_kind(&service, "file").await;
         let part_of = seeded_edge_type(&service, "part_of").await;
         let depends_on = seeded_edge_type(&service, "depends_on").await;
         let affects = seeded_edge_type(&service, "affects").await;
 
-        let goal = service
-            .upsert_node(&node(goal_kind, "ship", ""))
-            .await
-            .unwrap();
         let prerequisite = service
             .upsert_node(&node(task_kind, "prepare", ""))
             .await
@@ -1351,7 +1589,7 @@ mod tests {
 
         let mut draft = new_task("implement");
         draft.description = "write the code".to_string();
-        draft.parent = Some(goal.id);
+        draft.parent = Some(goal);
         draft.depends_on = vec![prerequisite.id];
         draft.affects = vec![target.id];
         let created = service.create_task(&draft).await.unwrap();
@@ -1368,7 +1606,7 @@ mod tests {
         assert_eq!(
             wired,
             HashSet::from([
-                (part_of, goal.id),
+                (part_of, goal),
                 (depends_on, prerequisite.id),
                 (affects, target.id),
             ])
@@ -1378,6 +1616,7 @@ mod tests {
     #[tokio::test]
     async fn creates_plan_tree_with_dependencies() {
         let service = service().await;
+        let repo = seeded_repo(&service).await;
         let file_kind = seeded_kind(&service, "file").await;
         let target = service
             .upsert_node(&node(file_kind, "src/lib.rs", ""))
@@ -1387,7 +1626,10 @@ mod tests {
         let mut build = plan_task("build", Some("design"), &["design"]);
         build.affects = vec![target.id];
         let plan = service
-            .create_plan(&plan_draft(vec![plan_task("design", None, &[]), build]))
+            .create_plan(&plan_draft(
+                repo,
+                vec![plan_task("design", None, &[]), build],
+            ))
             .await
             .unwrap();
 
@@ -1420,16 +1662,14 @@ mod tests {
     #[tokio::test]
     async fn attaches_plan_to_existing_goal() {
         let service = service().await;
-        let goal_kind = seeded_kind(&service, "goal").await;
-        let goal = service
-            .upsert_node(&node(goal_kind, "existing", ""))
-            .await
-            .unwrap();
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
 
         let plan = service
             .create_plan(&PlanDraft {
                 goal: None,
-                goal_id: Some(goal.id),
+                goal_id: Some(goal),
+                anchor: None,
                 tasks: vec![plan_task("t", None, &[])],
             })
             .await
@@ -1441,57 +1681,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(neighbors.len(), 1);
-        assert_eq!(neighbors[0].node.id, goal.id);
+        assert_eq!(neighbors[0].node.id, goal);
     }
 
     #[tokio::test]
     async fn rejects_invalid_plans_without_writing() {
         let service = service().await;
+        let repo = seeded_repo(&service).await;
 
-        let duplicate = plan_draft(vec![plan_task("a", None, &[]), plan_task("a", None, &[])]);
+        let duplicate = plan_draft(
+            repo,
+            vec![plan_task("a", None, &[]), plan_task("a", None, &[])],
+        );
         assert!(matches!(
             service.create_plan(&duplicate).await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
 
-        let unknown_parent = plan_draft(vec![plan_task("a", Some("missing"), &[])]);
+        let unknown_parent = plan_draft(repo, vec![plan_task("a", Some("missing"), &[])]);
         assert!(matches!(
             service.create_plan(&unknown_parent).await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
 
-        let unknown_dependency = plan_draft(vec![plan_task("a", None, &["missing"])]);
+        let unknown_dependency = plan_draft(repo, vec![plan_task("a", None, &["missing"])]);
         assert!(matches!(
             service.create_plan(&unknown_dependency).await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
 
-        let self_dependency = plan_draft(vec![plan_task("a", None, &["a"])]);
+        let self_dependency = plan_draft(repo, vec![plan_task("a", None, &["a"])]);
         assert!(matches!(
             service.create_plan(&self_dependency).await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
 
-        let parent_cycle = plan_draft(vec![
-            plan_task("a", Some("b"), &[]),
-            plan_task("b", Some("a"), &[]),
-        ]);
+        let parent_cycle = plan_draft(
+            repo,
+            vec![
+                plan_task("a", Some("b"), &[]),
+                plan_task("b", Some("a"), &[]),
+            ],
+        );
         assert!(matches!(
             service.create_plan(&parent_cycle).await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
 
-        let dependency_cycle = plan_draft(vec![
-            plan_task("a", None, &["b"]),
-            plan_task("b", None, &["a"]),
-        ]);
+        let dependency_cycle = plan_draft(
+            repo,
+            vec![plan_task("a", None, &["b"]), plan_task("b", None, &["a"])],
+        );
         assert!(matches!(
             service.create_plan(&dependency_cycle).await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
 
-        let mut both_roots = plan_draft(vec![]);
-        both_roots.goal_id = Some(1);
+        let mut both_roots = plan_draft(repo, vec![]);
+        both_roots.goal_id = Some(repo);
         assert!(matches!(
             service.create_plan(&both_roots).await,
             Err(ServiceError::UnprocessableEntity(_))
@@ -1500,6 +1747,7 @@ mod tests {
         let no_root = PlanDraft {
             goal: None,
             goal_id: None,
+            anchor: None,
             tasks: vec![],
         };
         assert!(matches!(
@@ -1507,31 +1755,46 @@ mod tests {
             Err(ServiceError::UnprocessableEntity(_))
         ));
 
-        assert!(service.list_nodes().await.unwrap().is_empty());
+        assert_eq!(
+            service
+                .list_nodes(&NodeFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
     async fn rejects_plan_with_unknown_affects_target() {
         let service = service().await;
+        let repo = seeded_repo(&service).await;
         let mut broken = plan_task("t", None, &[]);
         broken.affects = vec![9999];
-        let draft = plan_draft(vec![broken]);
+        let draft = plan_draft(repo, vec![broken]);
 
         assert!(matches!(
             service.create_plan(&draft).await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
-        assert!(service.list_nodes().await.unwrap().is_empty());
+        assert_eq!(
+            service
+                .list_nodes(&NodeFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
     async fn rejects_self_referencing_task_id_and_rolls_back() {
         let service = service().await;
-        let task_kind = seeded_kind(&service, "task").await;
-        let existing = service
-            .upsert_node(&node(task_kind, "existing", ""))
-            .await
-            .unwrap();
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+        let mut seed = new_task("existing");
+        seed.parent = Some(goal);
+        let existing = service.create_task(&seed).await.unwrap();
 
         let mut draft = new_task("self");
         draft.id = existing.id;
@@ -1545,27 +1808,35 @@ mod tests {
             service.get_node(existing.id).await.unwrap().name,
             "existing"
         );
-        assert!(
+        let neighbors = service
+            .neighbors(existing.id, NeighborDirection::Outgoing, None)
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].node.id, goal);
+        assert_eq!(
             service
-                .neighbors(existing.id, NeighborDirection::Outgoing, None)
+                .list_nodes(&NodeFilter::default())
                 .await
                 .unwrap()
-                .is_empty()
+                .len(),
+            3
         );
-        assert_eq!(service.list_nodes().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn rejects_task_wiring_to_wrong_kinds() {
         let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
         let file_kind = seeded_kind(&service, "file").await;
         let goal_kind = seeded_kind(&service, "goal").await;
         let file = service
             .upsert_node(&node(file_kind, "src/lib.rs", ""))
             .await
             .unwrap();
-        let goal = service
-            .upsert_node(&node(goal_kind, "ship", ""))
+        let other_goal = service
+            .upsert_node(&node(goal_kind, "other", ""))
             .await
             .unwrap();
 
@@ -1577,6 +1848,7 @@ mod tests {
         ));
 
         let mut dependency = new_task("b");
+        dependency.parent = Some(goal);
         dependency.depends_on = vec![file.id];
         assert!(matches!(
             service.create_task(&dependency).await,
@@ -1584,7 +1856,8 @@ mod tests {
         ));
 
         let mut affects = new_task("c");
-        affects.affects = vec![goal.id];
+        affects.parent = Some(goal);
+        affects.affects = vec![other_goal.id];
         assert!(matches!(
             service.create_task(&affects).await,
             Err(ServiceError::UnprocessableEntity(_))
@@ -1594,6 +1867,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_plan_targets_of_wrong_kind() {
         let service = service().await;
+        let repo = seeded_repo(&service).await;
         let task_kind = seeded_kind(&service, "task").await;
         let file_kind = seeded_kind(&service, "file").await;
         let existing_task = service
@@ -1608,13 +1882,14 @@ mod tests {
         let mut affects = plan_task("a", None, &[]);
         affects.affects = vec![existing_task.id];
         assert!(matches!(
-            service.create_plan(&plan_draft(vec![affects])).await,
+            service.create_plan(&plan_draft(repo, vec![affects])).await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
 
         let draft = PlanDraft {
             goal: None,
             goal_id: Some(file.id),
+            anchor: None,
             tasks: vec![plan_task("a", None, &[])],
         };
         assert!(matches!(
@@ -1626,23 +1901,32 @@ mod tests {
     #[tokio::test]
     async fn upserts_task_with_supplied_id() {
         let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
         let mut first = new_task("implement");
         first.id = 100;
+        first.parent = Some(goal);
         service.create_task(&first).await.unwrap();
 
         let mut second = new_task("implement");
         second.id = 100;
+        second.parent = Some(goal);
         second.description = "changed".to_string();
         service.create_task(&second).await.unwrap();
 
-        let nodes = service.list_nodes().await.unwrap();
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].description, "changed");
+        let nodes = service.list_nodes(&NodeFilter::default()).await.unwrap();
+        assert_eq!(nodes.len(), 3);
+        let created = nodes
+            .iter()
+            .find(|node| node.id == 100)
+            .expect("upserted task");
+        assert_eq!(created.description, "changed");
     }
 
     #[tokio::test]
     async fn upserts_plan_with_supplied_ids() {
         let service = service().await;
+        let repo = seeded_repo(&service).await;
         let mut task = plan_task("a", None, &[]);
         task.id = 101;
         let draft = PlanDraft {
@@ -1653,18 +1937,30 @@ mod tests {
                 content: String::new(),
             }),
             goal_id: None,
+            anchor: Some(PlanAnchorDraft {
+                node_id: repo,
+                edge_type: "belongs_to".to_string(),
+            }),
             tasks: vec![task],
         };
 
         service.create_plan(&draft).await.unwrap();
         service.create_plan(&draft).await.unwrap();
 
-        assert_eq!(service.list_nodes().await.unwrap().len(), 2);
+        assert_eq!(
+            service
+                .list_nodes(&NodeFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[tokio::test]
     async fn rejects_invalid_supplied_ids() {
         let service = service().await;
+        let repo = seeded_repo(&service).await;
 
         let mut negative = new_task("a");
         negative.id = -1;
@@ -1678,10 +1974,19 @@ mod tests {
         let mut second = plan_task("b", None, &[]);
         second.id = 100;
         assert!(matches!(
-            service.create_plan(&plan_draft(vec![first, second])).await,
+            service
+                .create_plan(&plan_draft(repo, vec![first, second]))
+                .await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
-        assert!(service.list_nodes().await.unwrap().is_empty());
+        assert_eq!(
+            service
+                .list_nodes(&NodeFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1768,13 +2073,10 @@ mod tests {
     #[tokio::test]
     async fn updates_task_description_without_touching_wiring() {
         let service = service().await;
-        let goal_kind = seeded_kind(&service, "goal").await;
-        let goal = service
-            .upsert_node(&node(goal_kind, "ship", ""))
-            .await
-            .unwrap();
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
         let mut draft = new_task("implement");
-        draft.parent = Some(goal.id);
+        draft.parent = Some(goal);
         let created = service.create_task(&draft).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1800,10 +2102,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(neighbors.len(), 1);
-        assert_eq!(neighbors[0].node.id, goal.id);
+        assert_eq!(neighbors[0].node.id, goal);
 
         let segments = service
-            .search("recalibrated widget", SearchScope::All)
+            .search(
+                "recalibrated widget",
+                SearchScope::All,
+                &ReachFilter::default(),
+            )
             .await
             .unwrap();
         assert_eq!(segments[0].matches[0].node.id, created.id);
@@ -1913,11 +2219,14 @@ mod tests {
     #[tokio::test]
     async fn scopes_search_by_resolving_edges() {
         let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
         let change_kind = seeded_kind(&service, "change").await;
         let implements = seeded_edge_type(&service, "implements").await;
 
         let mut draft = new_task("audited");
         draft.description = "recalibrated widget".to_string();
+        draft.parent = Some(goal);
         let task = service.create_task(&draft).await.unwrap();
         let change = service
             .upsert_node(&Node {
@@ -1932,7 +2241,11 @@ mod tests {
             .unwrap();
 
         let active = service
-            .search("recalibrated widget", SearchScope::Active)
+            .search(
+                "recalibrated widget",
+                SearchScope::Active,
+                &ReachFilter::default(),
+            )
             .await
             .unwrap();
         assert_eq!(active.len(), 1);
@@ -1951,7 +2264,11 @@ mod tests {
             .unwrap();
 
         let active = service
-            .search("recalibrated widget", SearchScope::Active)
+            .search(
+                "recalibrated widget",
+                SearchScope::Active,
+                &ReachFilter::default(),
+            )
             .await
             .unwrap();
         assert_eq!(active.len(), 1);
@@ -1960,7 +2277,11 @@ mod tests {
         assert_eq!(active[0].excluded_resolved, 1);
 
         let all = service
-            .search("recalibrated widget", SearchScope::All)
+            .search(
+                "recalibrated widget",
+                SearchScope::All,
+                &ReachFilter::default(),
+            )
             .await
             .unwrap();
         assert_eq!(all[0].matches.len(), 1);
@@ -1968,10 +2289,679 @@ mod tests {
         assert_eq!(all[0].excluded_resolved, 0);
 
         let resolved = service
-            .search("recalibrated widget", SearchScope::Resolved)
+            .search(
+                "recalibrated widget",
+                SearchScope::Resolved,
+                &ReachFilter::default(),
+            )
             .await
             .unwrap();
         assert_eq!(resolved[0].matches.len(), 1);
         assert_eq!(resolved[0].matches[0].node.id, task.id);
+    }
+
+    async fn repo_goal_task_graph(service: &GraphService) -> (i64, i64, i64, i64, i64) {
+        let repo_kind = seeded_kind(service, "repo").await;
+        let goal_kind = seeded_kind(service, "goal").await;
+        let task_kind = seeded_kind(service, "task").await;
+        let belongs_to = seeded_edge_type(service, "belongs_to").await;
+        let part_of = seeded_edge_type(service, "part_of").await;
+
+        let repo = service
+            .upsert_node(&node(repo_kind, "acme/widget", ""))
+            .await
+            .unwrap();
+        let goal = service
+            .upsert_node(&node(goal_kind, "ship widget", ""))
+            .await
+            .unwrap();
+        let other_goal = service
+            .upsert_node(&node(goal_kind, "ship gadget", ""))
+            .await
+            .unwrap();
+        let task = service
+            .upsert_node(&node(task_kind, "build widget", ""))
+            .await
+            .unwrap();
+        let other_task = service
+            .upsert_node(&node(task_kind, "build gadget", ""))
+            .await
+            .unwrap();
+
+        service
+            .add_edge(&Edge {
+                source: goal.id,
+                destination: repo.id,
+                edge_type_id: belongs_to,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+        service
+            .add_edge(&Edge {
+                source: task.id,
+                destination: goal.id,
+                edge_type_id: part_of,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+        service
+            .add_edge(&Edge {
+                source: other_task.id,
+                destination: other_goal.id,
+                edge_type_id: part_of,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+
+        (repo.id, goal.id, other_goal.id, task.id, other_task.id)
+    }
+
+    #[tokio::test]
+    async fn enforces_declared_edge_kind_constraints() {
+        let service = service().await;
+        let repo_kind = seeded_kind(&service, "repo").await;
+        let file_kind = seeded_kind(&service, "file").await;
+        let goal_kind = seeded_kind(&service, "goal").await;
+        let belongs_to = seeded_edge_type(&service, "belongs_to").await;
+        let contains = seeded_edge_type(&service, "contains").await;
+
+        let repo = service
+            .upsert_node(&node(repo_kind, "acme/widget", ""))
+            .await
+            .unwrap();
+        let file = service
+            .upsert_node(&node(file_kind, "src/lib.rs", ""))
+            .await
+            .unwrap();
+        let goal = service
+            .upsert_node(&node(goal_kind, "ship", ""))
+            .await
+            .unwrap();
+
+        service
+            .add_edge(&Edge {
+                source: goal.id,
+                destination: repo.id,
+                edge_type_id: belongs_to,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .add_edge(&Edge {
+                    source: repo.id,
+                    destination: goal.id,
+                    edge_type_id: belongs_to,
+                    created_at: String::new(),
+                })
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+        assert!(matches!(
+            service
+                .add_edge(&Edge {
+                    source: goal.id,
+                    destination: file.id,
+                    edge_type_id: belongs_to,
+                    created_at: String::new(),
+                })
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+
+        service
+            .add_edge(&Edge {
+                source: repo.id,
+                destination: file.id,
+                edge_type_id: contains,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .add_edge(&Edge {
+                    source: file.id,
+                    destination: repo.id,
+                    edge_type_id: contains,
+                    created_at: String::new(),
+                })
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn filters_nodes_by_anchor_and_part_of_descendants() {
+        let service = service().await;
+        let (repo, goal, _other_goal, task, other_task) = repo_goal_task_graph(&service).await;
+
+        let scoped = service
+            .list_nodes(&NodeFilter {
+                kind: Some("task".to_string()),
+                scope: SearchScope::All,
+                reach: ReachFilter {
+                    within: Some(repo),
+                    via: Some("belongs_to".to_string()),
+                    descend: None,
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            scoped.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![task]
+        );
+        assert!(!scoped.iter().any(|node| node.id == other_task));
+
+        let anchored = service
+            .list_nodes(&NodeFilter {
+                kind: Some("goal".to_string()),
+                scope: SearchScope::All,
+                reach: ReachFilter {
+                    within: Some(repo),
+                    via: Some("belongs_to".to_string()),
+                    descend: Some("none".to_string()),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            anchored.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![goal]
+        );
+
+        let unfiltered = service.list_nodes(&NodeFilter::default()).await.unwrap();
+        assert_eq!(unfiltered.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_node_filters() {
+        let service = service().await;
+        let (repo, ..) = repo_goal_task_graph(&service).await;
+
+        assert!(matches!(
+            service
+                .list_nodes(&NodeFilter {
+                    kind: None,
+                    scope: SearchScope::All,
+                    reach: ReachFilter {
+                        within: None,
+                        via: Some("belongs_to".to_string()),
+                        descend: None,
+                    },
+                })
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+        assert!(matches!(
+            service
+                .list_nodes(&NodeFilter {
+                    kind: None,
+                    scope: SearchScope::All,
+                    reach: ReachFilter {
+                        within: Some(repo),
+                        via: Some("nope".to_string()),
+                        descend: None,
+                    },
+                })
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+        assert!(matches!(
+            service
+                .list_nodes(&NodeFilter {
+                    kind: None,
+                    scope: SearchScope::All,
+                    reach: ReachFilter {
+                        within: Some(repo),
+                        via: Some(DESCEND_NONE.to_string()),
+                        descend: None,
+                    },
+                })
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+        assert!(matches!(
+            service
+                .list_nodes(&NodeFilter {
+                    kind: None,
+                    scope: SearchScope::All,
+                    reach: ReachFilter {
+                        within: Some(9999),
+                        via: None,
+                        descend: None,
+                    },
+                })
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+        assert!(matches!(
+            service
+                .list_nodes(&NodeFilter {
+                    kind: Some("nope".to_string()),
+                    scope: SearchScope::All,
+                    reach: ReachFilter::default(),
+                })
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn filters_nodes_by_resolution_scope() {
+        let service = service().await;
+        let (repo, _goal, _other_goal, task, _other_task) = repo_goal_task_graph(&service).await;
+        let change_kind = seeded_kind(&service, "change").await;
+        let implements = seeded_edge_type(&service, "implements").await;
+        let change = service
+            .upsert_node(&node(change_kind, "commit", ""))
+            .await
+            .unwrap();
+
+        let filter = |scope| NodeFilter {
+            kind: Some("task".to_string()),
+            scope,
+            reach: ReachFilter {
+                within: Some(repo),
+                via: Some("belongs_to".to_string()),
+                descend: None,
+            },
+        };
+        assert_eq!(
+            service
+                .list_nodes(&filter(SearchScope::Active))
+                .await
+                .unwrap()
+                .iter()
+                .map(|node| node.id)
+                .collect::<Vec<_>>(),
+            vec![task]
+        );
+
+        service
+            .add_edge(&Edge {
+                source: change.id,
+                destination: task,
+                edge_type_id: implements,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            service
+                .list_nodes(&filter(SearchScope::Active))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            service
+                .list_nodes(&filter(SearchScope::Resolved))
+                .await
+                .unwrap()
+                .iter()
+                .map(|node| node.id)
+                .collect::<Vec<_>>(),
+            vec![task]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_respects_reach_filter() {
+        let service = service().await;
+        let repo_kind = seeded_kind(&service, "repo").await;
+        let goal_kind = seeded_kind(&service, "goal").await;
+        let task_kind = seeded_kind(&service, "task").await;
+        let belongs_to = seeded_edge_type(&service, "belongs_to").await;
+        let part_of = seeded_edge_type(&service, "part_of").await;
+
+        let repo = service
+            .upsert_node(&node(repo_kind, "acme/widget", ""))
+            .await
+            .unwrap();
+        let goal = service
+            .upsert_node(&node(goal_kind, "ship widget", ""))
+            .await
+            .unwrap();
+        let scoped = service
+            .upsert_node(&described_node(
+                task_kind,
+                "build widget",
+                "recalibrated widget",
+            ))
+            .await
+            .unwrap();
+        let loose = service
+            .upsert_node(&described_node(
+                task_kind,
+                "build gadget",
+                "recalibrated widget",
+            ))
+            .await
+            .unwrap();
+
+        service
+            .add_edge(&Edge {
+                source: goal.id,
+                destination: repo.id,
+                edge_type_id: belongs_to,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+        service
+            .add_edge(&Edge {
+                source: scoped.id,
+                destination: goal.id,
+                edge_type_id: part_of,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let all = service
+            .search(
+                "recalibrated widget",
+                SearchScope::All,
+                &ReachFilter::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(all[0].total_matches, 2);
+
+        let reach = ReachFilter {
+            within: Some(repo.id),
+            via: Some("belongs_to".to_string()),
+            descend: None,
+        };
+        let filtered = service
+            .search("recalibrated widget", SearchScope::All, &reach)
+            .await
+            .unwrap();
+        assert_eq!(filtered[0].total_matches, 1);
+        assert_eq!(filtered[0].matches[0].node.id, scoped.id);
+        assert_ne!(filtered[0].matches[0].node.id, loose.id);
+    }
+
+    #[tokio::test]
+    async fn plan_anchor_wires_the_goal_to_the_anchor_node() {
+        let service = service().await;
+        let repo_kind = seeded_kind(&service, "repo").await;
+        let belongs_to = seeded_edge_type(&service, "belongs_to").await;
+        let repo = service
+            .upsert_node(&node(repo_kind, "acme/widget", ""))
+            .await
+            .unwrap();
+
+        let draft = |anchor: PlanAnchorDraft| PlanDraft {
+            goal: Some(PlanGoalDraft {
+                id: 0,
+                name: "ship widget".to_string(),
+                description: String::new(),
+                content: String::new(),
+            }),
+            goal_id: None,
+            anchor: Some(anchor),
+            tasks: vec![plan_task("a", None, &[])],
+        };
+
+        let plan = service
+            .create_plan(&draft(PlanAnchorDraft {
+                node_id: repo.id,
+                edge_type: "belongs_to".to_string(),
+            }))
+            .await
+            .unwrap();
+        let goal = plan.goal.as_ref().expect("goal created");
+        let neighbors = service
+            .neighbors(goal.id, NeighborDirection::Outgoing, None)
+            .await
+            .unwrap();
+        assert!(neighbors.iter().any(
+            |neighbor| neighbor.edge.edge_type_id == belongs_to && neighbor.node.id == repo.id
+        ));
+
+        assert!(matches!(
+            service
+                .create_plan(&draft(PlanAnchorDraft {
+                    node_id: repo.id,
+                    edge_type: "contains".to_string(),
+                }))
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+        assert!(matches!(
+            service
+                .create_plan(&draft(PlanAnchorDraft {
+                    node_id: 9999,
+                    edge_type: "belongs_to".to_string(),
+                }))
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+        assert!(matches!(
+            service
+                .create_plan(&draft(PlanAnchorDraft {
+                    node_id: repo.id,
+                    edge_type: "nope".to_string(),
+                }))
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn requires_a_parent_for_standalone_tasks() {
+        let service = service().await;
+        let error = service.create_task(&new_task("orphan")).await.unwrap_err();
+        assert!(rejection(error).contains("requires a parent"));
+        assert!(
+            service
+                .list_nodes(&NodeFilter::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_unanchored_task_parents() {
+        let service = service().await;
+        let goal_kind = seeded_kind(&service, "goal").await;
+        let goal = service
+            .upsert_node(&node(goal_kind, "loose goal", ""))
+            .await
+            .unwrap();
+
+        let mut draft = new_task("a");
+        draft.parent = Some(goal.id);
+        let error = service.create_task(&draft).await.unwrap_err();
+        assert!(rejection(error).contains("is not attached to a repo"));
+        assert_eq!(
+            service
+                .list_nodes(&NodeFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn anchors_task_parents_transitively() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+
+        let mut parent = new_task("parent");
+        parent.parent = Some(goal);
+        let parent = service.create_task(&parent).await.unwrap();
+
+        let mut child = new_task("child");
+        child.parent = Some(parent.id);
+        let child = service.create_task(&child).await.unwrap();
+
+        let neighbors = service
+            .neighbors(child.id, NeighborDirection::Outgoing, None)
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].node.id, parent.id);
+    }
+
+    #[tokio::test]
+    async fn requires_an_anchor_for_new_plan_goals() {
+        let service = service().await;
+        let draft = PlanDraft {
+            goal: Some(PlanGoalDraft {
+                id: 0,
+                name: "ship feature".to_string(),
+                description: String::new(),
+                content: String::new(),
+            }),
+            goal_id: None,
+            anchor: None,
+            tasks: vec![plan_task("a", None, &[])],
+        };
+        let error = service.create_plan(&draft).await.unwrap_err();
+        assert!(rejection(error).contains("requires an anchor"));
+        assert!(
+            service
+                .list_nodes(&NodeFilter::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_unanchored_existing_goal_without_an_anchor() {
+        let service = service().await;
+        let goal_kind = seeded_kind(&service, "goal").await;
+        let goal = service
+            .upsert_node(&node(goal_kind, "loose goal", ""))
+            .await
+            .unwrap();
+
+        let draft = PlanDraft {
+            goal: None,
+            goal_id: Some(goal.id),
+            anchor: None,
+            tasks: vec![plan_task("a", None, &[])],
+        };
+        let error = service.create_plan(&draft).await.unwrap_err();
+        assert!(rejection(error).contains("is not attached to a repo"));
+
+        let repo = seeded_repo(&service).await;
+        let anchored = PlanDraft {
+            goal: None,
+            goal_id: Some(goal.id),
+            anchor: Some(PlanAnchorDraft {
+                node_id: repo,
+                edge_type: "belongs_to".to_string(),
+            }),
+            tasks: vec![plan_task("a", None, &[])],
+        };
+        assert!(service.create_plan(&anchored).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_re_anchoring_a_goal_to_a_second_repo() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+        let repo_kind = seeded_kind(&service, "repo").await;
+        let belongs_to = seeded_edge_type(&service, "belongs_to").await;
+        let other_repo = service
+            .upsert_node(&node(repo_kind, "acme/other", ""))
+            .await
+            .unwrap()
+            .id;
+
+        let draft = PlanDraft {
+            goal: None,
+            goal_id: Some(goal),
+            anchor: Some(PlanAnchorDraft {
+                node_id: other_repo,
+                edge_type: "belongs_to".to_string(),
+            }),
+            tasks: vec![plan_task("a", None, &[])],
+        };
+        let error = service.create_plan(&draft).await.unwrap_err();
+        assert!(rejection(error).contains("allows one outgoing edge"));
+
+        assert!(matches!(
+            service
+                .add_edge(&Edge {
+                    source: goal,
+                    destination: other_repo,
+                    edge_type_id: belongs_to,
+                    created_at: String::new(),
+                })
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+
+        let anchored_once = service
+            .list_nodes(&NodeFilter {
+                kind: Some("goal".to_string()),
+                scope: SearchScope::All,
+                reach: ReachFilter {
+                    within: Some(other_repo),
+                    via: Some("belongs_to".to_string()),
+                    descend: Some("none".to_string()),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(anchored_once.is_empty());
+
+        let same_repo = PlanDraft {
+            goal: None,
+            goal_id: Some(goal),
+            anchor: Some(PlanAnchorDraft {
+                node_id: repo,
+                edge_type: "belongs_to".to_string(),
+            }),
+            tasks: vec![plan_task("a", None, &[])],
+        };
+        assert!(service.create_plan(&same_repo).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn anchored_check_terminates_on_a_part_of_cycle() {
+        let service = service().await;
+        let task_kind = seeded_kind(&service, "task").await;
+        let part_of = seeded_edge_type(&service, "part_of").await;
+        let first = service
+            .upsert_node(&node(task_kind, "first", ""))
+            .await
+            .unwrap();
+        let second = service
+            .upsert_node(&node(task_kind, "second", ""))
+            .await
+            .unwrap();
+        for (source, destination) in [(first.id, second.id), (second.id, first.id)] {
+            service
+                .add_edge(&Edge {
+                    source,
+                    destination,
+                    edge_type_id: part_of,
+                    created_at: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let mut draft = new_task("child");
+        draft.parent = Some(first.id);
+        let error = service.create_task(&draft).await.unwrap_err();
+        assert!(rejection(error).contains("is not attached to a repo"));
     }
 }

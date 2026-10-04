@@ -30,6 +30,8 @@ impl HealthService {
         let duplicate_rows = self.repository.duplicate_node_rows().await?;
         let isolated_count = self.repository.isolated_node_count().await?;
         let isolated = self.repository.isolated_nodes(sample).await?;
+        let unanchored_count = self.repository.unanchored_work_count().await?;
+        let unanchored = self.repository.unanchored_work(sample).await?;
 
         let node_count = kinds.iter().map(|usage| usage.node_count).sum();
         let edge_count = edge_types.iter().map(|usage| usage.edge_count).sum();
@@ -42,6 +44,8 @@ impl HealthService {
             duplicates: group_duplicates(duplicate_rows),
             isolated_count,
             isolated,
+            unanchored_count,
+            unanchored,
         })
     }
 }
@@ -245,6 +249,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reports_unanchored_work_and_clears_it_once_anchored() {
+        let (service, repository) = service().await;
+        let kind_id = |name: &str, kinds: &Vec<crate::model::NodeKind>| {
+            kinds
+                .iter()
+                .find(|kind| kind.name == name)
+                .expect("seeded kind")
+                .id
+        };
+        let kinds = repository.list_node_kinds().await.unwrap();
+        let repo_kind = kind_id("repo", &kinds);
+        let goal_kind = kind_id("goal", &kinds);
+        let task_kind = kind_id("task", &kinds);
+        let edge_type_id = |name: &str, edge_types: &Vec<crate::model::EdgeType>| {
+            edge_types
+                .iter()
+                .find(|edge_type| edge_type.name == name)
+                .expect("seeded edge type")
+                .id
+        };
+        let edge_types = repository.list_edge_types().await.unwrap();
+        let belongs_to = edge_type_id("belongs_to", &edge_types);
+        let part_of = edge_type_id("part_of", &edge_types);
+
+        let repo = node(&repository, repo_kind, "acme/widget").await;
+        let goal = node(&repository, goal_kind, "ship report").await;
+        let task = node(&repository, task_kind, "write report").await;
+        repository
+            .add_edge(&Edge {
+                source: task,
+                destination: goal,
+                edge_type_id: part_of,
+                created_at: String::new(),
+            })
+            .await
+            .expect("add edge");
+
+        let report = service.report().await.expect("report");
+        assert_eq!(report.unanchored_count, 2);
+        assert_eq!(report.unanchored.len(), 2);
+        assert!(report.unanchored.iter().any(|node| node.id == goal));
+        assert!(report.unanchored.iter().any(|node| node.id == task));
+        assert!(!report.unanchored.iter().any(|node| node.id == repo));
+
+        repository
+            .add_edge(&Edge {
+                source: goal,
+                destination: repo,
+                edge_type_id: belongs_to,
+                created_at: String::new(),
+            })
+            .await
+            .expect("add edge");
+
+        let report = service.report().await.expect("report");
+        assert_eq!(report.unanchored_count, 0);
+        assert!(report.unanchored.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounds_unanchored_sample_while_reporting_true_total() {
+        let (service, repository) = service().await;
+        let goal_kind = repository
+            .list_node_kinds()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|kind| kind.name == "goal")
+            .expect("seeded goal kind");
+        for index in 0..5 {
+            node(&repository, goal_kind.id, &format!("loose-{index}")).await;
+        }
+
+        let report = service.report_with_sample(2).await.expect("report");
+        assert_eq!(report.unanchored_count, 5);
+        assert_eq!(report.unanchored.len(), 2);
+    }
+
+    #[tokio::test]
     async fn summary_line_reports_the_same_numbers_as_the_report() {
         let (service, _) = service().await;
         let report = service.report().await.expect("report");
@@ -252,5 +335,6 @@ mod tests {
         assert!(summary.contains(&format!("nodes={}", report.node_count)));
         assert!(summary.contains(&format!("duplicate_groups={}", report.duplicates.len())));
         assert!(summary.contains(&format!("isolated_nodes={}", report.isolated_count)));
+        assert!(summary.contains(&format!("unanchored_work={}", report.unanchored_count)));
     }
 }

@@ -12,14 +12,18 @@ use crate::{
         graph::{
             CreateEdgeParameters, CreateEdgeTypeParameters, CreateNodeKindParameters,
             CreateNodeParameters, CreatePlanParameters, CreateTaskParameters, DeleteEdgeParameters,
-            EdgeTypeResponse, NeighborParameters, NeighborResponse, NodeAccessFeedbackParameters,
-            NodeKindResponse, NodeResponse, PlanResponse, SearchHitResponse, SearchParameters,
-            SearchResponse, SearchSegmentParameters, SegmentResponse, UpdateTaskParameters,
+            EdgeTypeResponse, ListNodesParameters, NeighborParameters, NeighborResponse,
+            NodeAccessFeedbackParameters, NodeKindResponse, NodeResponse, PlanResponse,
+            SearchHitResponse, SearchParameters, SearchResponse, SearchSegmentParameters,
+            SegmentResponse, UpdateTaskParameters,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
     },
-    model::{AccessAction, Edge, EdgeType, Node, NodeKind, PlanDraft, TaskDraft, TaskPatch},
+    model::{
+        AccessAction, Edge, EdgeType, Node, NodeFilter, NodeKind, PlanDraft, ReachFilter,
+        TaskDraft, TaskPatch,
+    },
     state::AppState,
 };
 
@@ -167,6 +171,9 @@ pub async fn create_plan(
     if let Some(goal_id) = draft.goal_id {
         accessed.push(goal_id);
     }
+    if let Some(anchor) = &draft.anchor {
+        accessed.push(anchor.node_id);
+    }
     accessed.extend(
         draft
             .tasks
@@ -187,10 +194,15 @@ pub async fn create_plan(
     tag = "Graph",
     get,
     path = "/nodes",
+    params(ListNodesParameters),
     responses((status = 200, description = "List nodes", body = ApiList<NodeResponse>))
 )]
-pub async fn list_nodes(State(state): State<AppState>) -> Result<ApiList<NodeResponse>, ApiError> {
-    let nodes = state.graph_service.list_nodes().await?;
+pub async fn list_nodes(
+    State(state): State<AppState>,
+    Query(params): Query<ListNodesParameters>,
+) -> Result<ApiList<NodeResponse>, ApiError> {
+    let filter: NodeFilter = params.into();
+    let nodes = state.graph_service.list_nodes(&filter).await?;
     Ok(ApiList {
         status: StatusCode::OK,
         items: nodes.into_iter().map(Into::into).collect(),
@@ -366,7 +378,8 @@ pub async fn search(
 ) -> Result<ApiSuccess<SearchResponse>, ApiError> {
     let scope_value = params.scope.as_str();
     let scope = params.scope.into();
-    let segments = state.graph_service.search(&params.q, scope).await?;
+    let reach = params.reach();
+    let segments = state.graph_service.search(&params.q, scope, &reach).await?;
     let summary_chars = state.graph_service.summary_chars();
     let mut responses = Vec::with_capacity(segments.len());
     for segment in segments {
@@ -388,6 +401,7 @@ pub async fn search(
         let probe = segment_probe(
             &segment.segment,
             scope_value,
+            &reach,
             segment.total_matches,
             segment.matches.len(),
         );
@@ -433,7 +447,13 @@ pub async fn search_segment(
     let offset = params.offset.unwrap_or(0);
     let hits = state
         .graph_service
-        .search_segment(&params.segment, params.scope.into(), limit, offset)
+        .search_segment(
+            &params.segment,
+            params.scope.into(),
+            &params.reach(),
+            limit,
+            offset,
+        )
         .await?;
     let node_ids: Vec<i64> = hits.iter().map(|hit| hit.node.id).collect();
     let recorded = state
@@ -502,16 +522,31 @@ pub async fn graph_health(
     })
 }
 
-fn segment_probe(segment: &str, scope: &str, total_matches: usize, shown: usize) -> Option<String> {
+fn segment_probe(
+    segment: &str,
+    scope: &str,
+    reach: &ReachFilter,
+    total_matches: usize,
+    shown: usize,
+) -> Option<String> {
     let hidden = total_matches.saturating_sub(shown);
     (hidden > 0).then(|| {
-        format!(
-            "/api/search/segment?segment={}&scope={}&limit={}&offset={}",
+        let mut probe = format!(
+            "/api/search/segment?segment={}&scope={}",
             percent_encode(segment),
-            scope,
-            total_matches,
-            shown
-        )
+            scope
+        );
+        if let Some(within) = reach.within {
+            probe.push_str(&format!("&within={within}"));
+        }
+        if let Some(via) = &reach.via {
+            probe.push_str(&format!("&via={}", percent_encode(via)));
+        }
+        if let Some(descend) = &reach.descend {
+            probe.push_str(&format!("&descend={}", percent_encode(descend)));
+        }
+        probe.push_str(&format!("&limit={total_matches}&offset={shown}"));
+        probe
     })
 }
 
@@ -539,10 +574,25 @@ mod tests {
     #[test]
     fn probe_preserves_scope_and_counts() {
         assert_eq!(
-            segment_probe("a b", "all", 7, 5).as_deref(),
+            segment_probe("a b", "all", &ReachFilter::default(), 7, 5).as_deref(),
             Some("/api/search/segment?segment=a%20b&scope=all&limit=7&offset=5")
         );
-        assert!(segment_probe("a", "active", 5, 5).is_none());
+        assert!(segment_probe("a", "active", &ReachFilter::default(), 5, 5).is_none());
+    }
+
+    #[test]
+    fn probe_preserves_the_reach_filter() {
+        let reach = ReachFilter {
+            within: Some(18),
+            via: Some("belongs_to".to_string()),
+            descend: Some("part_of".to_string()),
+        };
+        assert_eq!(
+            segment_probe("a b", "active", &reach, 7, 5).as_deref(),
+            Some(
+                "/api/search/segment?segment=a%20b&scope=active&within=18&via=belongs_to&descend=part_of&limit=7&offset=5"
+            )
+        );
     }
 
     async fn test_state() -> AppState {
@@ -609,6 +659,9 @@ mod tests {
             Query(SearchParameters {
                 q: "rotated token. rotated token".to_string(),
                 scope: SearchScope::default(),
+                within: None,
+                via: None,
+                descend: None,
             }),
         )
         .await

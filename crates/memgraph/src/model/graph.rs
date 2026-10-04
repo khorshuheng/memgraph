@@ -14,7 +14,32 @@ pub struct EdgeType {
     pub name: String,
     pub description: String,
     pub resolves: bool,
+    pub single_outgoing: bool,
+    pub source_kinds: Option<String>,
+    pub destination_kinds: Option<String>,
     pub updated_at: String,
+}
+
+impl EdgeType {
+    pub fn source_kind_list(&self) -> Vec<&str> {
+        split_kind_list(self.source_kinds.as_deref())
+    }
+
+    pub fn destination_kind_list(&self) -> Vec<&str> {
+        split_kind_list(self.destination_kinds.as_deref())
+    }
+}
+
+fn split_kind_list(kinds: Option<&str>) -> Vec<&str> {
+    kinds
+        .map(|kinds| {
+            kinds
+                .split(',')
+                .map(str::trim)
+                .filter(|kind| !kind.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -53,6 +78,30 @@ pub enum SearchScope {
     Active,
     All,
     Resolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReachFilter {
+    pub within: Option<i64>,
+    pub via: Option<String>,
+    pub descend: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeFilter {
+    pub kind: Option<String>,
+    pub scope: SearchScope,
+    pub reach: ReachFilter,
+}
+
+impl Default for NodeFilter {
+    fn default() -> Self {
+        Self {
+            kind: None,
+            scope: SearchScope::All,
+            reach: ReachFilter::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +166,8 @@ pub struct GraphHealth {
     pub duplicates: Vec<DuplicateGroup>,
     pub isolated_count: i64,
     pub isolated: Vec<IsolatedNode>,
+    pub unanchored_count: i64,
+    pub unanchored: Vec<IsolatedNode>,
 }
 
 impl GraphHealth {
@@ -130,7 +181,7 @@ impl GraphHealth {
 
     pub fn summary_line(&self) -> String {
         format!(
-            "nodes={} edges={} kinds={} (dead={}) edge_types={} (underused={}) duplicate_groups={} isolated_nodes={}",
+            "nodes={} edges={} kinds={} (dead={}) edge_types={} (underused={}) duplicate_groups={} isolated_nodes={} unanchored_work={}",
             self.node_count,
             self.edge_count,
             self.kinds.len(),
@@ -139,6 +190,7 @@ impl GraphHealth {
             self.underused_edge_types().count(),
             self.duplicates.len(),
             self.isolated_count,
+            self.unanchored_count,
         )
     }
 }
@@ -227,7 +279,14 @@ pub struct PlanTaskDraft {
 pub struct PlanDraft {
     pub goal: Option<PlanGoalDraft>,
     pub goal_id: Option<i64>,
+    pub anchor: Option<PlanAnchorDraft>,
     pub tasks: Vec<PlanTaskDraft>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanAnchorDraft {
+    pub node_id: i64,
+    pub edge_type: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

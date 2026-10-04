@@ -104,6 +104,8 @@ pub struct GraphHealthResponse {
     pub duplicate_groups: Vec<DuplicateGroupResponse>,
     pub isolated_node_count: i64,
     pub isolated_nodes: Vec<IsolatedNodeResponse>,
+    pub unanchored_work_count: i64,
+    pub unanchored_work: Vec<IsolatedNodeResponse>,
 }
 
 impl From<GraphHealthModel> for GraphHealthResponse {
@@ -118,6 +120,8 @@ impl From<GraphHealthModel> for GraphHealthResponse {
             duplicate_groups: health.duplicates.into_iter().map(Into::into).collect(),
             isolated_node_count: health.isolated_count,
             isolated_nodes: health.isolated.into_iter().map(Into::into).collect(),
+            unanchored_work_count: health.unanchored_count,
+            unanchored_work: health.unanchored.into_iter().map(Into::into).collect(),
         }
     }
 }

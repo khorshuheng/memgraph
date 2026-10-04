@@ -3,8 +3,9 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::model::{
     Edge as EdgeModel, EdgeType as EdgeTypeModel, Neighbor as NeighborModel,
-    NeighborDirection as NeighborDirectionModel, Node as NodeModel, NodeKind as NodeKindModel,
-    Plan as PlanModel, PlanDraft, PlanGoalDraft, PlanTask as PlanTaskModel, PlanTaskDraft,
+    NeighborDirection as NeighborDirectionModel, Node as NodeModel, NodeFilter,
+    NodeKind as NodeKindModel, Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft,
+    PlanTask as PlanTaskModel, PlanTaskDraft, ReachFilter,
     RelationDirection as RelationDirectionModel, RelationSummary as RelationSummaryModel,
     SearchHit as SearchHitModel, SearchScope as SearchScopeModel, TaskDraft, TaskPatch,
 };
@@ -51,6 +52,12 @@ pub struct CreateEdgeTypeParameters {
     pub description: String,
     #[serde(default)]
     pub resolves: bool,
+    #[serde(default)]
+    pub single_outgoing: bool,
+    #[serde(default)]
+    pub source_kinds: Vec<String>,
+    #[serde(default)]
+    pub destination_kinds: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -59,7 +66,31 @@ pub struct EdgeTypeResponse {
     pub name: String,
     pub description: String,
     pub resolves: bool,
+    pub single_outgoing: bool,
+    pub source_kinds: Vec<String>,
+    pub destination_kinds: Vec<String>,
     pub updated_at: String,
+}
+
+fn join_kinds(kinds: Vec<String>) -> Option<String> {
+    let kinds: Vec<String> = kinds
+        .into_iter()
+        .map(|kind| kind.trim().to_string())
+        .filter(|kind| !kind.is_empty())
+        .collect();
+    (!kinds.is_empty()).then(|| kinds.join(","))
+}
+
+fn split_kinds(kinds: Option<&str>) -> Vec<String> {
+    kinds
+        .map(|kinds| {
+            kinds
+                .split(',')
+                .map(|kind| kind.trim().to_string())
+                .filter(|kind| !kind.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl From<CreateEdgeTypeParameters> for EdgeTypeModel {
@@ -69,6 +100,9 @@ impl From<CreateEdgeTypeParameters> for EdgeTypeModel {
             name: params.name,
             description: params.description,
             resolves: params.resolves,
+            single_outgoing: params.single_outgoing,
+            source_kinds: join_kinds(params.source_kinds),
+            destination_kinds: join_kinds(params.destination_kinds),
             updated_at: String::new(),
         }
     }
@@ -77,10 +111,13 @@ impl From<CreateEdgeTypeParameters> for EdgeTypeModel {
 impl From<EdgeTypeModel> for EdgeTypeResponse {
     fn from(edge_type: EdgeTypeModel) -> Self {
         EdgeTypeResponse {
+            source_kinds: split_kinds(edge_type.source_kinds.as_deref()),
+            destination_kinds: split_kinds(edge_type.destination_kinds.as_deref()),
             id: edge_type.id,
             name: edge_type.name,
             description: edge_type.description,
             resolves: edge_type.resolves,
+            single_outgoing: edge_type.single_outgoing,
             updated_at: edge_type.updated_at,
         }
     }
@@ -344,6 +381,19 @@ pub struct SearchParameters {
     pub q: String,
     #[serde(default)]
     pub scope: SearchScope,
+    pub within: Option<i64>,
+    pub via: Option<String>,
+    pub descend: Option<String>,
+}
+
+impl SearchParameters {
+    pub fn reach(&self) -> ReachFilter {
+        ReachFilter {
+            within: self.within,
+            via: self.via.clone(),
+            descend: self.descend.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -352,8 +402,45 @@ pub struct SearchSegmentParameters {
     pub segment: String,
     #[serde(default)]
     pub scope: SearchScope,
+    pub within: Option<i64>,
+    pub via: Option<String>,
+    pub descend: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+}
+
+impl SearchSegmentParameters {
+    pub fn reach(&self) -> ReachFilter {
+        ReachFilter {
+            within: self.within,
+            via: self.via.clone(),
+            descend: self.descend.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ListNodesParameters {
+    pub kind: Option<String>,
+    pub scope: Option<SearchScope>,
+    pub within: Option<i64>,
+    pub via: Option<String>,
+    pub descend: Option<String>,
+}
+
+impl From<ListNodesParameters> for NodeFilter {
+    fn from(params: ListNodesParameters) -> Self {
+        NodeFilter {
+            kind: params.kind,
+            scope: params.scope.unwrap_or(SearchScope::All).into(),
+            reach: ReachFilter {
+                within: params.within,
+                via: params.via,
+                descend: params.descend,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -392,8 +479,24 @@ impl From<CreateTaskParameters> for TaskDraft {
 pub struct CreatePlanParameters {
     pub goal: Option<CreatePlanGoalParameters>,
     pub goal_id: Option<i64>,
+    pub anchor: Option<PlanAnchorParameters>,
     #[serde(default)]
     pub tasks: Vec<CreatePlanTaskParameters>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PlanAnchorParameters {
+    pub node_id: i64,
+    pub edge_type: String,
+}
+
+impl From<PlanAnchorParameters> for PlanAnchorDraft {
+    fn from(params: PlanAnchorParameters) -> Self {
+        PlanAnchorDraft {
+            node_id: params.node_id,
+            edge_type: params.edge_type,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -423,6 +526,7 @@ impl From<CreatePlanParameters> for PlanDraft {
         PlanDraft {
             goal: params.goal.map(Into::into),
             goal_id: params.goal_id,
+            anchor: params.anchor.map(Into::into),
             tasks: params.tasks.into_iter().map(Into::into).collect(),
         }
     }

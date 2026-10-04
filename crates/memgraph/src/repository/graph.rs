@@ -5,13 +5,15 @@ use sqlx::{FromRow, Row, SqlitePool};
 
 use crate::model::{
     AccessAction, Edge, EdgeType, EdgeTypeUsage, IsolatedNode, KindUsage, Neighbor,
-    NeighborDirection, Node, NodeKind, NodeRef, PendingEdge, RelationDirection, RelationSummary,
+    NeighborDirection, Node, NodeFilter, NodeKind, NodeRef, PendingEdge, ReachFilter,
+    RelationDirection, RelationSummary, SearchScope,
 };
 
 use super::error::RepositoryError;
 
 const NODE_KIND_COLUMNS: &str = "id, name, description, updated_at";
-const EDGE_TYPE_COLUMNS: &str = "id, name, description, resolves, updated_at";
+const EDGE_TYPE_COLUMNS: &str =
+    "id, name, description, resolves, single_outgoing, source_kinds, destination_kinds, updated_at";
 const NODE_COLUMNS: &str = "id, kind_id, name, description, content, updated_at";
 const OUTGOING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
     n.id, n.kind_id, n.name, n.description, n.content, n.updated_at \
@@ -25,6 +27,43 @@ const INCOMING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id
     WHERE e.destination = ? \
       AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
     ORDER BY e.edge_type_id, e.source";
+const REACH_CTE: &str = "WITH RECURSIVE reach(id) AS ( \
+    SELECT e.source FROM edge e WHERE e.destination = ? \
+      AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
+    UNION \
+    SELECT e.destination FROM edge e WHERE e.source = ? \
+      AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
+    UNION \
+    SELECT e.source FROM edge e JOIN reach r ON e.destination = r.id \
+      WHERE e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?) \
+  ) ";
+const ANCHORED_CTE: &str = "WITH RECURSIVE anchored(id) AS ( \
+    SELECT e.source FROM edge e \
+      WHERE e.edge_type_id = (SELECT id FROM edge_type WHERE name = 'belongs_to') \
+    UNION \
+    SELECT e.source FROM edge e JOIN anchored a ON e.destination = a.id \
+      WHERE e.edge_type_id = (SELECT id FROM edge_type WHERE name = 'part_of') \
+  ) ";
+const ANCESTRY_CTE: &str = "WITH RECURSIVE ancestry(id) AS ( \
+    SELECT ? \
+    UNION \
+    SELECT e.destination FROM edge e JOIN ancestry a ON e.source = a.id \
+      WHERE e.edge_type_id = (SELECT id FROM edge_type WHERE name = 'part_of') \
+  ) ";
+
+fn scope_clause(scope: SearchScope) -> &'static str {
+    match scope {
+        SearchScope::All => "",
+        SearchScope::Active => {
+            " AND NOT EXISTS(SELECT 1 FROM edge e JOIN edge_type t ON t.id = e.edge_type_id \
+             WHERE e.destination = n.id AND t.resolves = 1)"
+        }
+        SearchScope::Resolved => {
+            " AND EXISTS(SELECT 1 FROM edge e JOIN edge_type t ON t.id = e.edge_type_id \
+             WHERE e.destination = n.id AND t.resolves = 1)"
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromRow)]
 pub struct NodeAccessRecord {
@@ -48,7 +87,7 @@ pub trait GraphRepository: Send + Sync {
     ) -> Result<Vec<Node>, RepositoryError>;
     async fn get_node(&self, id: i64) -> Result<Option<Node>, RepositoryError>;
     async fn delete_node(&self, id: i64) -> Result<bool, RepositoryError>;
-    async fn list_nodes(&self) -> Result<Vec<Node>, RepositoryError>;
+    async fn list_nodes(&self, filter: &NodeFilter) -> Result<Vec<Node>, RepositoryError>;
     async fn node_kinds_for_ids(&self, ids: &[i64]) -> Result<Vec<(i64, String)>, RepositoryError>;
 
     async fn add_edge(&self, edge: &Edge) -> Result<(), RepositoryError>;
@@ -67,6 +106,7 @@ pub trait GraphRepository: Send + Sync {
     async fn search_descriptions(
         &self,
         fts_query: &str,
+        reach: &ReachFilter,
     ) -> Result<Vec<(Node, bool)>, RepositoryError>;
     async fn relation_summaries(
         &self,
@@ -79,6 +119,14 @@ pub trait GraphRepository: Send + Sync {
     -> Result<Vec<(i64, String, String, i64)>, RepositoryError>;
     async fn isolated_node_count(&self) -> Result<i64, RepositoryError>;
     async fn isolated_nodes(&self, limit: i64) -> Result<Vec<IsolatedNode>, RepositoryError>;
+    async fn is_anchored(&self, node_id: i64) -> Result<bool, RepositoryError>;
+    async fn outgoing_edge_targets(
+        &self,
+        source: i64,
+        edge_type_id: i64,
+    ) -> Result<Vec<i64>, RepositoryError>;
+    async fn unanchored_work_count(&self) -> Result<i64, RepositoryError>;
+    async fn unanchored_work(&self, limit: i64) -> Result<Vec<IsolatedNode>, RepositoryError>;
     async fn record_node_accesses(
         &self,
         session_id: &str,
@@ -130,12 +178,15 @@ impl GraphRepository for SqliteGraphRepository {
 
     async fn create_edge_type(&self, edge_type: &EdgeType) -> Result<EdgeType, RepositoryError> {
         let row = sqlx::query_as::<_, EdgeType>(&format!(
-            "INSERT INTO edge_type (name, description, resolves) VALUES (?, ?, ?) \
-             RETURNING {EDGE_TYPE_COLUMNS}"
+            "INSERT INTO edge_type (name, description, resolves, single_outgoing, source_kinds, \
+             destination_kinds) VALUES (?, ?, ?, ?, ?, ?) RETURNING {EDGE_TYPE_COLUMNS}"
         ))
         .bind(&edge_type.name)
         .bind(&edge_type.description)
         .bind(edge_type.resolves)
+        .bind(edge_type.single_outgoing)
+        .bind(&edge_type.source_kinds)
+        .bind(&edge_type.destination_kinds)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -261,11 +312,39 @@ impl GraphRepository for SqliteGraphRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn list_nodes(&self) -> Result<Vec<Node>, RepositoryError> {
-        let rows =
-            sqlx::query_as::<_, Node>(&format!("SELECT {NODE_COLUMNS} FROM node ORDER BY id"))
+    async fn list_nodes(&self, filter: &NodeFilter) -> Result<Vec<Node>, RepositoryError> {
+        let scope = scope_clause(filter.scope);
+        let rows = if filter.reach.within.is_some() {
+            let sql = format!(
+                "{REACH_CTE}SELECT {NODE_COLUMNS} FROM node n \
+                 WHERE n.id IN (SELECT id FROM reach) \
+                   AND (? IS NULL OR n.kind_id = (SELECT id FROM node_kind WHERE name = ?)){scope} \
+                 ORDER BY n.id"
+            );
+            sqlx::query_as::<_, Node>(&sql)
+                .bind(filter.reach.within)
+                .bind(filter.reach.via.clone())
+                .bind(filter.reach.via.clone())
+                .bind(filter.reach.within)
+                .bind(filter.reach.via.clone())
+                .bind(filter.reach.via.clone())
+                .bind(filter.reach.descend.clone())
+                .bind(filter.kind.clone())
+                .bind(filter.kind.clone())
                 .fetch_all(&self.pool)
-                .await?;
+                .await?
+        } else {
+            let sql = format!(
+                "SELECT {NODE_COLUMNS} FROM node n \
+                 WHERE (? IS NULL OR n.kind_id = (SELECT id FROM node_kind WHERE name = ?)){scope} \
+                 ORDER BY n.id"
+            );
+            sqlx::query_as::<_, Node>(&sql)
+                .bind(filter.kind.clone())
+                .bind(filter.kind.clone())
+                .fetch_all(&self.pool)
+                .await?
+        };
         Ok(rows)
     }
 
@@ -402,17 +481,36 @@ impl GraphRepository for SqliteGraphRepository {
     async fn search_descriptions(
         &self,
         fts_query: &str,
+        reach: &ReachFilter,
     ) -> Result<Vec<(Node, bool)>, RepositoryError> {
-        let rows = sqlx::query(
-            "SELECT n.id, n.kind_id, n.name, n.description, n.content, n.updated_at, \
+        let select = "SELECT n.id, n.kind_id, n.name, n.description, n.content, n.updated_at, \
              EXISTS(SELECT 1 FROM edge e JOIN edge_type t ON t.id = e.edge_type_id \
                     WHERE e.destination = n.id AND t.resolves = 1) AS resolved \
-             FROM node_fts JOIN node n ON n.id = node_fts.rowid \
-             WHERE node_fts MATCH ? ORDER BY bm25(node_fts), n.id",
-        )
-        .bind(fts_query)
-        .fetch_all(&self.pool)
-        .await?;
+             FROM node_fts JOIN node n ON n.id = node_fts.rowid";
+        let rows = if reach.within.is_some() {
+            let sql = format!(
+                "{REACH_CTE}{select} WHERE node_fts MATCH ? \
+                   AND n.id IN (SELECT id FROM reach) \
+                 ORDER BY bm25(node_fts), n.id"
+            );
+            sqlx::query(&sql)
+                .bind(reach.within)
+                .bind(reach.via.clone())
+                .bind(reach.via.clone())
+                .bind(reach.within)
+                .bind(reach.via.clone())
+                .bind(reach.via.clone())
+                .bind(reach.descend.clone())
+                .bind(fts_query)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            let sql = format!("{select} WHERE node_fts MATCH ? ORDER BY bm25(node_fts), n.id");
+            sqlx::query(&sql)
+                .bind(fts_query)
+                .fetch_all(&self.pool)
+                .await?
+        };
         rows.iter()
             .map(|row| Ok((Node::from_row(row)?, row.try_get::<bool, _>("resolved")?)))
             .collect::<Result<_, sqlx::Error>>()
@@ -515,6 +613,58 @@ impl GraphRepository for SqliteGraphRepository {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
+        Ok(rows)
+    }
+
+    async fn is_anchored(&self, node_id: i64) -> Result<bool, RepositoryError> {
+        let sql = format!(
+            "{ANCESTRY_CTE}SELECT EXISTS(SELECT 1 FROM ancestry a JOIN edge b ON b.source = a.id \
+             WHERE b.edge_type_id = (SELECT id FROM edge_type WHERE name = 'belongs_to'))"
+        );
+        let anchored = sqlx::query_scalar::<_, bool>(&sql)
+            .bind(node_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(anchored)
+    }
+
+    async fn outgoing_edge_targets(
+        &self,
+        source: i64,
+        edge_type_id: i64,
+    ) -> Result<Vec<i64>, RepositoryError> {
+        let rows = sqlx::query_scalar::<_, i64>(
+            "SELECT destination FROM edge WHERE source = ? AND edge_type_id = ?",
+        )
+        .bind(source)
+        .bind(edge_type_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn unanchored_work_count(&self) -> Result<i64, RepositoryError> {
+        let sql = format!(
+            "{ANCHORED_CTE}SELECT count(*) FROM node n JOIN node_kind k ON k.id = n.kind_id \
+             WHERE k.name IN ('task', 'goal') AND n.id NOT IN (SELECT id FROM anchored)"
+        );
+        let count = sqlx::query_scalar::<_, i64>(&sql)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    async fn unanchored_work(&self, limit: i64) -> Result<Vec<IsolatedNode>, RepositoryError> {
+        let sql = format!(
+            "{ANCHORED_CTE}SELECT n.id, k.name AS kind, n.name FROM node n \
+             JOIN node_kind k ON k.id = n.kind_id \
+             WHERE k.name IN ('task', 'goal') AND n.id NOT IN (SELECT id FROM anchored) \
+             ORDER BY n.id LIMIT ?"
+        );
+        let rows = sqlx::query_as::<_, IsolatedNode>(&sql)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 
