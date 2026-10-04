@@ -18,6 +18,7 @@ pub struct NodeKindResponse {
     pub id: i64,
     pub name: String,
     pub description: String,
+    pub updated_at: String,
 }
 
 impl From<CreateNodeKindParameters> for NodeKindModel {
@@ -26,6 +27,7 @@ impl From<CreateNodeKindParameters> for NodeKindModel {
             id: 0,
             name: params.name,
             description: params.description,
+            updated_at: String::new(),
         }
     }
 }
@@ -36,6 +38,7 @@ impl From<NodeKindModel> for NodeKindResponse {
             id: node_kind.id,
             name: node_kind.name,
             description: node_kind.description,
+            updated_at: node_kind.updated_at,
         }
     }
 }
@@ -51,6 +54,7 @@ pub struct EdgeTypeResponse {
     pub id: i64,
     pub name: String,
     pub description: String,
+    pub updated_at: String,
 }
 
 impl From<CreateEdgeTypeParameters> for EdgeTypeModel {
@@ -59,6 +63,7 @@ impl From<CreateEdgeTypeParameters> for EdgeTypeModel {
             id: 0,
             name: params.name,
             description: params.description,
+            updated_at: String::new(),
         }
     }
 }
@@ -69,6 +74,7 @@ impl From<EdgeTypeModel> for EdgeTypeResponse {
             id: edge_type.id,
             name: edge_type.name,
             description: edge_type.description,
+            updated_at: edge_type.updated_at,
         }
     }
 }
@@ -88,6 +94,7 @@ pub struct NodeResponse {
     pub name: String,
     pub description: String,
     pub content: String,
+    pub updated_at: String,
 }
 
 impl From<CreateNodeParameters> for NodeModel {
@@ -98,6 +105,7 @@ impl From<CreateNodeParameters> for NodeModel {
             name: params.name,
             description: params.description,
             content: params.content,
+            updated_at: String::new(),
         }
     }
 }
@@ -110,6 +118,7 @@ impl From<NodeModel> for NodeResponse {
             name: node.name,
             description: node.description,
             content: node.content,
+            updated_at: node.updated_at,
         }
     }
 }
@@ -126,6 +135,7 @@ pub struct EdgeResponse {
     pub source: i64,
     pub destination: i64,
     pub edge_type_id: i64,
+    pub created_at: String,
 }
 
 impl From<CreateEdgeParameters> for EdgeModel {
@@ -134,6 +144,7 @@ impl From<CreateEdgeParameters> for EdgeModel {
             source: params.source,
             destination: params.destination,
             edge_type_id: params.edge_type_id,
+            created_at: String::new(),
         }
     }
 }
@@ -144,6 +155,7 @@ impl From<EdgeModel> for EdgeResponse {
             source: edge.source,
             destination: edge.destination,
             edge_type_id: edge.edge_type_id,
+            created_at: edge.created_at,
         }
     }
 }
@@ -162,6 +174,7 @@ impl From<DeleteEdgeParameters> for EdgeModel {
             source: params.source,
             destination: params.destination,
             edge_type_id: params.edge_type_id,
+            created_at: String::new(),
         }
     }
 }

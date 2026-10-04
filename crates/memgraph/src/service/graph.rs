@@ -317,6 +317,7 @@ mod tests {
             id: 0,
             name: name.to_string(),
             description: String::new(),
+            updated_at: String::new(),
         }
     }
 
@@ -325,6 +326,7 @@ mod tests {
             id: 0,
             name: name.to_string(),
             description: description.to_string(),
+            updated_at: String::new(),
         }
     }
 
@@ -335,6 +337,7 @@ mod tests {
             name: name.to_string(),
             description: String::new(),
             content: content.to_string(),
+            updated_at: String::new(),
         }
     }
 
@@ -345,6 +348,7 @@ mod tests {
             name: name.to_string(),
             description: description.to_string(),
             content: String::new(),
+            updated_at: String::new(),
         }
     }
 
@@ -429,6 +433,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preserves_updated_at_when_node_is_unchanged() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let created = service
+            .upsert_node(&node(kind_id, "Ada", "a"))
+            .await
+            .unwrap();
+        assert!(!created.updated_at.is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let updated = service.upsert_node(&created).await.unwrap();
+        assert_eq!(updated.updated_at, created.updated_at);
+    }
+
+    #[tokio::test]
+    async fn bumps_updated_at_when_node_changes() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let created = service
+            .upsert_node(&node(kind_id, "Ada", "a"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let mut changed = created.clone();
+        changed.content = "b".to_string();
+        let updated = service.upsert_node(&changed).await.unwrap();
+        assert_ne!(updated.updated_at, created.updated_at);
+    }
+
+    #[tokio::test]
     async fn deletes_node_and_fts_row() {
         let service = service().await;
         let kind_id = seed_person(&service).await;
@@ -461,14 +494,19 @@ mod tests {
             .create_edge_type(&edge_type("knows", ""))
             .await
             .unwrap();
-        let edge = Edge {
+        let mut edge = Edge {
             source: ada.id,
             destination: bob.id,
             edge_type_id: knows.id,
+            created_at: String::new(),
         };
         service.add_edge(&edge).await.unwrap();
         service.add_edge(&edge).await.unwrap();
         let neighbors = service.neighbors(ada.id).await.unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].1, bob);
+        edge.created_at = neighbors[0].0.created_at.clone();
+        assert!(!edge.created_at.is_empty());
         assert_eq!(neighbors, vec![(edge.clone(), bob.clone())]);
         assert!(service.neighbors(bob.id).await.unwrap().is_empty());
         service.remove_edge(&edge).await.unwrap();
@@ -565,6 +603,7 @@ mod tests {
                 source: ada.id,
                 destination: bob.id,
                 edge_type_id: knows.id,
+                created_at: String::new(),
             })
             .await
             .unwrap();

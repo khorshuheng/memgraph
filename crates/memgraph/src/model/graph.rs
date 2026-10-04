@@ -5,6 +5,7 @@ pub struct NodeKind {
     pub id: i64,
     pub name: String,
     pub description: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -12,6 +13,7 @@ pub struct EdgeType {
     pub id: i64,
     pub name: String,
     pub description: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -21,6 +23,7 @@ pub struct Node {
     pub name: String,
     pub description: String,
     pub content: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -28,6 +31,7 @@ pub struct Edge {
     pub source: i64,
     pub destination: i64,
     pub edge_type_id: i64,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

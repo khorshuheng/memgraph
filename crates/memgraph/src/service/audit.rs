@@ -78,6 +78,7 @@ mod tests {
                 id: 0,
                 name: "widget".to_string(),
                 description: String::new(),
+                updated_at: String::new(),
             })
             .await
             .expect("create node kind");
@@ -88,6 +89,7 @@ mod tests {
                 name: "a.widget".to_string(),
                 description: String::new(),
                 content: String::new(),
+                updated_at: String::new(),
             })
             .await
             .expect("create node")
@@ -164,6 +166,7 @@ mod tests {
                 id: 0,
                 name: "widget".to_string(),
                 description: String::new(),
+                updated_at: String::new(),
             })
             .await
             .expect("create node kind");
@@ -177,6 +180,7 @@ mod tests {
                         name: format!("n{index}"),
                         description: String::new(),
                         content: String::new(),
+                        updated_at: String::new(),
                     })
                     .await
                     .expect("create node")

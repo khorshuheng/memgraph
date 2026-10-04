@@ -8,9 +8,9 @@ use crate::model::{
 
 use super::error::RepositoryError;
 
-const NODE_KIND_COLUMNS: &str = "id, name, description";
-const EDGE_TYPE_COLUMNS: &str = "id, name, description";
-const NODE_COLUMNS: &str = "id, kind_id, name, description, content";
+const NODE_KIND_COLUMNS: &str = "id, name, description, updated_at";
+const EDGE_TYPE_COLUMNS: &str = "id, name, description, updated_at";
+const NODE_COLUMNS: &str = "id, kind_id, name, description, content, updated_at";
 
 #[async_trait]
 pub trait GraphRepository: Send + Sync {
@@ -124,7 +124,10 @@ impl GraphRepository for SqliteGraphRepository {
             let row = sqlx::query_as::<_, Node>(&format!(
                 "INSERT INTO node (id, kind_id, name, description, content) VALUES (?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET kind_id = excluded.kind_id, name = excluded.name, \
-                 description = excluded.description, content = excluded.content \
+                 description = excluded.description, content = excluded.content, \
+                 updated_at = CASE WHEN node.kind_id = excluded.kind_id \
+                   AND node.name = excluded.name AND node.description = excluded.description \
+                   AND node.content = excluded.content THEN node.updated_at ELSE excluded.updated_at END \
                  RETURNING {NODE_COLUMNS}"
             ))
             .bind(node.id)
@@ -190,8 +193,8 @@ impl GraphRepository for SqliteGraphRepository {
 
     async fn neighbors(&self, source: i64) -> Result<Vec<(Edge, Node)>, RepositoryError> {
         let rows = sqlx::query(
-            "SELECT e.source, e.destination, e.edge_type_id, \
-             n.id, n.kind_id, n.name, n.description, n.content \
+            "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
+             n.id, n.kind_id, n.name, n.description, n.content, n.updated_at \
              FROM edge e JOIN node n ON n.id = e.destination \
              WHERE e.source = ? ORDER BY e.edge_type_id, e.destination",
         )
@@ -243,7 +246,7 @@ impl GraphRepository for SqliteGraphRepository {
 
     async fn search_descriptions(&self, fts_query: &str) -> Result<Vec<Node>, RepositoryError> {
         let rows = sqlx::query_as::<_, Node>(
-            "SELECT n.id, n.kind_id, n.name, n.description, n.content \
+            "SELECT n.id, n.kind_id, n.name, n.description, n.content, n.updated_at \
              FROM node_fts JOIN node n ON n.id = node_fts.rowid \
              WHERE node_fts MATCH ? ORDER BY bm25(node_fts), n.id",
         )

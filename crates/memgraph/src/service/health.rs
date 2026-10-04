@@ -102,6 +102,7 @@ mod tests {
                 name: name.to_string(),
                 description: format!("{name} description"),
                 content: String::new(),
+                updated_at: String::new(),
             })
             .await
             .expect("insert node")
@@ -209,6 +210,7 @@ mod tests {
                 source: task,
                 destination: goal,
                 edge_type_id: part_of.id,
+                created_at: String::new(),
             })
             .await
             .expect("add edge");

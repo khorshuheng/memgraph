@@ -1,13 +1,15 @@
 CREATE TABLE node_kind (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
-  description TEXT NOT NULL
+  description TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE TABLE edge_type (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
-  description TEXT NOT NULL
+  description TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE TABLE node (
@@ -15,13 +17,15 @@ CREATE TABLE node (
   kind_id INTEGER NOT NULL REFERENCES node_kind(id),
   name TEXT NOT NULL,
   description TEXT NOT NULL,
-  content TEXT NOT NULL
+  content TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE TABLE edge (
   source INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
   destination INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
   edge_type_id INTEGER NOT NULL REFERENCES edge_type(id),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   PRIMARY KEY (source, edge_type_id, destination)
 );
 
