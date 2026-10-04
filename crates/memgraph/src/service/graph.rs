@@ -532,12 +532,18 @@ impl GraphService {
         if considered.is_empty() {
             return Ok(SegmentScore::default());
         }
-        let denominator: f64 = considered.iter().map(|(_, weight)| weight).sum();
-        let weights: HashMap<&str, f64> = considered
+        let mut seen_tokens: Vec<&str> = Vec::new();
+        let mut denominator = 0.0;
+        for considered_term in &considered {
+            if !seen_tokens.contains(&considered_term.token.as_str()) {
+                seen_tokens.push(considered_term.token.as_str());
+                denominator += considered_term.weight;
+            }
+        }
+        let terms: Vec<&str> = considered
             .iter()
-            .map(|(term, weight)| (term.as_str(), *weight))
+            .map(|considered_term| considered_term.term.as_str())
             .collect();
-        let terms: Vec<String> = considered.iter().map(|(term, _)| term.clone()).collect();
         let fts_query = build_fts_query(&terms);
         let candidates = self.repository.search_descriptions(&fts_query).await?;
 
@@ -545,21 +551,25 @@ impl GraphService {
         let mut excluded_resolved = 0;
         for (node, resolved) in candidates {
             let tokens: HashSet<String> = tokenize(&node.description).into_iter().collect();
-            let matched: Vec<String> = terms
-                .iter()
-                .filter(|term| tokens.contains(*term))
-                .cloned()
-                .collect();
-            let mass: f64 = matched
-                .iter()
-                .map(|term| weights.get(term.as_str()).copied().unwrap_or(0.0))
-                .sum();
+            let mut matched: Vec<String> = Vec::new();
+            let mut matched_tokens: Vec<&str> = Vec::new();
+            let mut mass = 0.0;
+            for considered_term in &considered {
+                if !tokens.contains(&considered_term.term) {
+                    continue;
+                }
+                matched.push(considered_term.term.clone());
+                if !matched_tokens.contains(&considered_term.token.as_str()) {
+                    matched_tokens.push(considered_term.token.as_str());
+                    mass += considered_term.weight;
+                }
+            }
             let confidence = if denominator > 0.0 {
                 mass / denominator
             } else {
                 0.0
             };
-            if matched.len() < self.search_config.min_matched_terms {
+            if matched_tokens.len() < self.search_config.min_matched_terms {
                 continue;
             }
             if mass < self.search_config.min_matched_idf {
@@ -596,32 +606,45 @@ impl GraphService {
         })
     }
 
-    async fn considered_terms(&self, segment: &str) -> Result<Vec<(String, f64)>, ServiceError> {
-        let mut resolved: BTreeSet<String> = BTreeSet::new();
+    async fn considered_terms(&self, segment: &str) -> Result<Vec<ConsideredTerm>, ServiceError> {
+        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        let mut assigned: HashSet<String> = HashSet::new();
         for token in tokenize(segment) {
             if !seen.insert(token.clone()) {
                 continue;
             }
-            for term in self.resolve_token(&token).await? {
-                resolved.insert(term);
+            let terms: Vec<String> = self
+                .resolve_token(&token)
+                .await?
+                .into_iter()
+                .filter(|term| assigned.insert(term.clone()))
+                .collect();
+            if !terms.is_empty() {
+                groups.push((token, terms));
             }
         }
-        if resolved.is_empty() {
+        if groups.is_empty() {
             return Ok(Vec::new());
         }
         let node_count = self.repository.count_nodes().await? as f64;
         let mut weighted = Vec::new();
-        for term in resolved {
-            let frequency = self.repository.term_document_frequency(&term).await? as f64;
-            weighted.push((term, inverse_document_frequency(node_count, frequency)));
+        for (token, terms) in groups {
+            for term in terms {
+                let frequency = self.repository.term_document_frequency(&term).await? as f64;
+                weighted.push(ConsideredTerm {
+                    token: token.clone(),
+                    term,
+                    weight: inverse_document_frequency(node_count, frequency),
+                });
+            }
         }
         weighted.sort_by(|left, right| {
             right
-                .1
-                .partial_cmp(&left.1)
+                .weight
+                .partial_cmp(&left.weight)
                 .unwrap_or(Ordering::Equal)
-                .then(left.0.cmp(&right.0))
+                .then(left.term.cmp(&right.term))
         });
         weighted.truncate(self.search_config.max_terms);
         Ok(weighted)
@@ -767,6 +790,12 @@ fn visit_dependencies<'a>(
     Ok(())
 }
 
+struct ConsideredTerm {
+    token: String,
+    term: String,
+    weight: f64,
+}
+
 #[derive(Default)]
 struct SegmentScore {
     hits: Vec<SearchHit>,
@@ -792,7 +821,7 @@ fn split_segments(text: &str, separators: &[char]) -> Vec<String> {
         .collect()
 }
 
-fn build_fts_query(terms: &[String]) -> String {
+fn build_fts_query(terms: &[&str]) -> String {
     terms
         .iter()
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
@@ -1117,6 +1146,50 @@ mod tests {
         assert!(
             service
                 .search("debt repayment", SearchScope::All)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_variants_do_not_deflate_confidence() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        for (name, description) in [
+            ("schema", "add refresh token table with rotation"),
+            ("endpoint", "post auth refresh issues rotated token pairs"),
+            ("client", "cli retries once after refreshing"),
+            ("session", "users stay signed in across access token expiry"),
+        ] {
+            service
+                .upsert_node(&described_node(kind_id, name, description))
+                .await
+                .unwrap();
+        }
+        let segments = service
+            .search("refresh rotation", SearchScope::All)
+            .await
+            .unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].matches.len(), 1);
+        assert_eq!(segments[0].matches[0].node.name, "schema");
+        let confidence = segments[0].matches[0].confidence;
+        assert!(confidence > 0.8);
+        assert!(confidence < 0.9);
+    }
+
+    #[tokio::test]
+    async fn prefix_variants_of_one_token_count_as_one_match() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        service
+            .upsert_node(&described_node(kind_id, "Ledger", "refresh refreshing"))
+            .await
+            .unwrap();
+        assert!(
+            service
+                .search("refresh", SearchScope::All)
                 .await
                 .unwrap()
                 .is_empty()
