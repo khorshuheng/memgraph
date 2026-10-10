@@ -254,16 +254,7 @@ impl GraphService {
             ));
         }
         let node = self.get_node(task_id).await?;
-        let task_kind = self
-            .repository
-            .list_node_kinds()
-            .await?
-            .into_iter()
-            .find(|kind| kind.name == "task")
-            .ok_or_else(|| {
-                ServiceError::UnprocessableEntity("node kind 'task' is not defined".to_string())
-            })?
-            .id;
+        let task_kind = self.kind_id("task").await?;
         if node.kind_id != task_kind {
             return Err(ServiceError::UnprocessableEntity(format!(
                 "node {task_id} is not a task"
@@ -295,20 +286,13 @@ impl GraphService {
                 "a task requires a parent: provide the goal or task it belongs to".to_string(),
             ));
         };
-        let task_kind = self
-            .repository
-            .list_node_kinds()
-            .await?
-            .into_iter()
-            .find(|kind| kind.name == "task")
-            .ok_or_else(|| {
-                ServiceError::UnprocessableEntity("node kind 'task' is not defined".to_string())
-            })?
-            .id;
+        let task_kind = self.kind_id("task").await?;
         let edge_types = self.repository.list_edge_types().await?;
-        let part_of = edge_type_ref(&edge_types, "part_of")?;
-        let depends_on = edge_type_ref(&edge_types, "depends_on")?;
-        let affects = edge_type_ref(&edge_types, "affects")?;
+        let PlanEdgeTypes {
+            part_of,
+            depends_on,
+            affects,
+        } = plan_edge_types(&edge_types)?;
 
         let mut referenced = Vec::new();
         if let Some(parent) = draft.parent {
@@ -323,22 +307,18 @@ impl GraphService {
             &part_of.destination_kind_list(),
             "part_of parent",
         )?;
-        for dependency in &draft.depends_on {
-            require_kind(
-                &kinds,
-                *dependency,
-                &depends_on.destination_kind_list(),
-                "depends_on target",
-            )?;
-        }
-        for target in &draft.affects {
-            require_kind(
-                &kinds,
-                *target,
-                &affects.destination_kind_list(),
-                "affects target",
-            )?;
-        }
+        require_kinds_for(
+            &kinds,
+            &draft.depends_on,
+            &depends_on.destination_kind_list(),
+            "depends_on target",
+        )?;
+        require_kinds_for(
+            &kinds,
+            &draft.affects,
+            &affects.destination_kind_list(),
+            "affects target",
+        )?;
         if !self.repository.is_anchored(parent).await? {
             return Err(ServiceError::UnprocessableEntity(format!(
                 "part_of parent references node {parent}, which is not attached to a repo via belongs_to"
@@ -417,32 +397,18 @@ impl GraphService {
         }
 
         let node_kinds = self.repository.list_node_kinds().await?;
-        let task_kind = node_kinds
-            .iter()
-            .find(|kind| kind.name == "task")
-            .map(|kind| kind.id)
-            .ok_or_else(|| {
-                ServiceError::UnprocessableEntity("node kind 'task' is not defined".to_string())
-            })?;
+        let task_kind = kind_id_of(&node_kinds, "task")?;
         let goal_kind = if draft.goal.is_some() {
-            Some(
-                node_kinds
-                    .iter()
-                    .find(|kind| kind.name == "goal")
-                    .map(|kind| kind.id)
-                    .ok_or_else(|| {
-                        ServiceError::UnprocessableEntity(
-                            "node kind 'goal' is not defined".to_string(),
-                        )
-                    })?,
-            )
+            Some(kind_id_of(&node_kinds, "goal")?)
         } else {
             None
         };
         let edge_types = self.repository.list_edge_types().await?;
-        let part_of = edge_type_ref(&edge_types, "part_of")?;
-        let depends_on = edge_type_ref(&edge_types, "depends_on")?;
-        let affects = edge_type_ref(&edge_types, "affects")?;
+        let PlanEdgeTypes {
+            part_of,
+            depends_on,
+            affects,
+        } = plan_edge_types(&edge_types)?;
 
         let mut referenced = Vec::new();
         if let Some(goal_id) = draft.goal_id {
@@ -464,14 +430,12 @@ impl GraphService {
             }
         }
         for task in &draft.tasks {
-            for target in &task.affects {
-                require_kind(
-                    &kinds,
-                    *target,
-                    &affects.destination_kind_list(),
-                    &format!("plan task '{}' affects", task.key),
-                )?;
-            }
+            require_kinds_for(
+                &kinds,
+                &task.affects,
+                &affects.destination_kind_list(),
+                &format!("plan task '{}' affects", task.key),
+            )?;
         }
 
         let anchor_edge = match &draft.anchor {
@@ -642,6 +606,10 @@ impl GraphService {
         }
         let rows = self.repository.node_kinds_for_ids(&unique).await?;
         Ok(rows.into_iter().collect())
+    }
+
+    async fn kind_id(&self, name: &str) -> Result<i64, ServiceError> {
+        kind_id_of(&self.repository.list_node_kinds().await?, name)
     }
 
     pub async fn search(
@@ -863,6 +831,42 @@ fn edge_type_ref<'a>(edge_types: &'a [EdgeType], name: &str) -> Result<&'a EdgeT
         .ok_or_else(|| {
             ServiceError::UnprocessableEntity(format!("edge type '{name}' is not defined"))
         })
+}
+
+fn kind_id_of(kinds: &[NodeKind], name: &str) -> Result<i64, ServiceError> {
+    kinds
+        .iter()
+        .find(|kind| kind.name == name)
+        .map(|kind| kind.id)
+        .ok_or_else(|| {
+            ServiceError::UnprocessableEntity(format!("node kind '{name}' is not defined"))
+        })
+}
+
+struct PlanEdgeTypes<'a> {
+    part_of: &'a EdgeType,
+    depends_on: &'a EdgeType,
+    affects: &'a EdgeType,
+}
+
+fn plan_edge_types(edge_types: &[EdgeType]) -> Result<PlanEdgeTypes<'_>, ServiceError> {
+    Ok(PlanEdgeTypes {
+        part_of: edge_type_ref(edge_types, "part_of")?,
+        depends_on: edge_type_ref(edge_types, "depends_on")?,
+        affects: edge_type_ref(edge_types, "affects")?,
+    })
+}
+
+fn require_kinds_for(
+    kinds: &HashMap<i64, String>,
+    ids: &[i64],
+    allowed: &[&str],
+    context: &str,
+) -> Result<(), ServiceError> {
+    for id in ids {
+        require_kind(kinds, *id, allowed, context)?;
+    }
+    Ok(())
 }
 
 fn require_kind(
