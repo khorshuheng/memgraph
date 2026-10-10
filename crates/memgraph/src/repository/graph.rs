@@ -403,29 +403,22 @@ impl GraphRepository for SqliteGraphRepository {
         edge_type: Option<&str>,
     ) -> Result<Vec<Neighbor>, RepositoryError> {
         let mut neighbors = Vec::new();
-        if matches!(
-            direction,
-            NeighborDirection::Outgoing | NeighborDirection::Both
-        ) {
-            let rows = sqlx::query(OUTGOING_NEIGHBORS)
-                .bind(node_id)
-                .bind(edge_type)
-                .bind(edge_type)
-                .fetch_all(&self.pool)
-                .await?;
-            for row in &rows {
-                neighbors.push(Neighbor {
-                    direction: RelationDirection::Outgoing,
-                    edge: Edge::from_row(row)?,
-                    node: Node::from_row(row)?,
-                });
+        for (query, row_direction, wanted) in [
+            (
+                OUTGOING_NEIGHBORS,
+                RelationDirection::Outgoing,
+                NeighborDirection::Outgoing,
+            ),
+            (
+                INCOMING_NEIGHBORS,
+                RelationDirection::Ingoing,
+                NeighborDirection::Incoming,
+            ),
+        ] {
+            if direction != NeighborDirection::Both && direction != wanted {
+                continue;
             }
-        }
-        if matches!(
-            direction,
-            NeighborDirection::Incoming | NeighborDirection::Both
-        ) {
-            let rows = sqlx::query(INCOMING_NEIGHBORS)
+            let rows = sqlx::query(query)
                 .bind(node_id)
                 .bind(edge_type)
                 .bind(edge_type)
@@ -433,7 +426,7 @@ impl GraphRepository for SqliteGraphRepository {
                 .await?;
             for row in &rows {
                 neighbors.push(Neighbor {
-                    direction: RelationDirection::Ingoing,
+                    direction: row_direction,
                     edge: Edge::from_row(row)?,
                     node: Node::from_row(row)?,
                 });
