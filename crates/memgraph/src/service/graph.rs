@@ -495,12 +495,13 @@ impl GraphService {
                 continue;
             }
             let total_matches = score.hits.len();
-            let matches = score
+            let mut matches: Vec<SearchHit> = score
                 .hits
                 .into_iter()
                 .filter(|hit| !exclude.contains(&hit.node.id))
                 .take(self.search_config.per_segment_limit)
                 .collect();
+            self.attach_relations(&mut matches).await?;
             segments.push(SegmentMatches {
                 segment,
                 matches,
@@ -522,13 +523,15 @@ impl GraphService {
     ) -> Result<Vec<SearchHit>, ServiceError> {
         let reach = self.normalize_reach(reach).await?;
         let score = self.score_segment(segment, scope, &reach).await?;
-        Ok(score
+        let mut hits: Vec<SearchHit> = score
             .hits
             .into_iter()
             .filter(|hit| !exclude.contains(&hit.node.id))
             .skip(offset)
             .take(limit)
-            .collect())
+            .collect();
+        self.attach_relations(&mut hits).await?;
+        Ok(hits)
     }
 
     pub fn summary_chars(&self) -> usize {
@@ -549,14 +552,7 @@ impl GraphService {
         if considered.is_empty() {
             return Ok(SegmentScore::default());
         }
-        let mut seen_tokens: Vec<&str> = Vec::new();
-        let mut denominator = 0.0;
-        for considered_term in &considered {
-            if !seen_tokens.contains(&considered_term.token.as_str()) {
-                seen_tokens.push(considered_term.token.as_str());
-                denominator += considered_term.weight;
-            }
-        }
+        let denominator = token_denominator(&considered);
         let terms: Vec<&str> = considered
             .iter()
             .map(|considered_term| considered_term.term.as_str())
@@ -570,46 +566,23 @@ impl GraphService {
         let mut hits = Vec::new();
         let mut excluded_resolved = 0;
         for (node, resolved) in candidates {
-            let tokens: HashSet<String> = tokenize(&node.description).into_iter().collect();
-            let mut matched: Vec<String> = Vec::new();
-            let mut matched_tokens: Vec<&str> = Vec::new();
-            let mut mass = 0.0;
-            for considered_term in &considered {
-                if !tokens.contains(&considered_term.term) {
+            let score = score_candidate(&considered, &node.description, denominator);
+            if !self.clears_thresholds(&score) {
+                continue;
+            }
+            match scope {
+                SearchScope::Active if resolved => {
+                    excluded_resolved += 1;
                     continue;
                 }
-                matched.push(considered_term.term.clone());
-                if !matched_tokens.contains(&considered_term.token.as_str()) {
-                    matched_tokens.push(considered_term.token.as_str());
-                    mass += considered_term.weight;
-                }
-            }
-            let confidence = if denominator > 0.0 {
-                mass / denominator
-            } else {
-                0.0
-            };
-            if matched_tokens.len() < self.search_config.min_matched_terms {
-                continue;
-            }
-            if mass < self.search_config.min_matched_idf {
-                continue;
-            }
-            if confidence < self.search_config.confidence_threshold {
-                continue;
-            }
-            if scope == SearchScope::Active && resolved {
-                excluded_resolved += 1;
-                continue;
-            }
-            if scope == SearchScope::Resolved && !resolved {
-                continue;
+                SearchScope::Resolved if !resolved => continue,
+                _ => {}
             }
             hits.push(SearchHit {
-                relations: self.repository.relation_summaries(node.id).await?,
+                relations: Vec::new(),
                 node,
-                confidence,
-                matched_terms: matched,
+                confidence: score.confidence,
+                matched_terms: score.matched_terms,
                 resolved,
             });
         }
@@ -624,6 +597,19 @@ impl GraphService {
             hits,
             excluded_resolved,
         })
+    }
+
+    fn clears_thresholds(&self, score: &CandidateScore) -> bool {
+        score.matched_token_count >= self.search_config.min_matched_terms
+            && score.mass >= self.search_config.min_matched_idf
+            && score.confidence >= self.search_config.confidence_threshold
+    }
+
+    async fn attach_relations(&self, hits: &mut [SearchHit]) -> Result<(), ServiceError> {
+        for hit in hits.iter_mut() {
+            hit.relations = self.repository.relation_summaries(hit.node.id).await?;
+        }
+        Ok(())
     }
 
     async fn considered_terms(&self, segment: &str) -> Result<Vec<ConsideredTerm>, ServiceError> {
@@ -1042,6 +1028,56 @@ struct ConsideredTerm {
 struct SegmentScore {
     hits: Vec<SearchHit>,
     excluded_resolved: usize,
+}
+
+struct CandidateScore {
+    confidence: f64,
+    mass: f64,
+    matched_terms: Vec<String>,
+    matched_token_count: usize,
+}
+
+fn token_denominator(considered: &[ConsideredTerm]) -> f64 {
+    let mut seen_tokens: Vec<&str> = Vec::new();
+    let mut denominator = 0.0;
+    for considered_term in considered {
+        if !seen_tokens.contains(&considered_term.token.as_str()) {
+            seen_tokens.push(considered_term.token.as_str());
+            denominator += considered_term.weight;
+        }
+    }
+    denominator
+}
+
+fn score_candidate(
+    considered: &[ConsideredTerm],
+    description: &str,
+    denominator: f64,
+) -> CandidateScore {
+    let tokens: HashSet<String> = tokenize(description).into_iter().collect();
+    let mut matched_terms: Vec<String> = Vec::new();
+    let mut matched_tokens: Vec<&str> = Vec::new();
+    let mut mass = 0.0;
+    for considered_term in considered {
+        if !tokens.contains(&considered_term.term) {
+            continue;
+        }
+        matched_terms.push(considered_term.term.clone());
+        if !matched_tokens.contains(&considered_term.token.as_str()) {
+            matched_tokens.push(considered_term.token.as_str());
+            mass += considered_term.weight;
+        }
+    }
+    CandidateScore {
+        confidence: if denominator > 0.0 {
+            mass / denominator
+        } else {
+            0.0
+        },
+        mass,
+        matched_terms,
+        matched_token_count: matched_tokens.len(),
+    }
 }
 
 fn tokenize(text: &str) -> Vec<String> {
