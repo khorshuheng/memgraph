@@ -385,6 +385,7 @@ pub async fn search(
         .search(&params.q, scope, &reach, &exclude)
         .await?;
     let summary_chars = state.graph_service.summary_chars();
+    let page_limit = state.graph_service.default_segment_limit();
     let mut responses = Vec::with_capacity(segments.len());
     for segment in segments {
         let node_ids: Vec<i64> = segment.matches.iter().map(|hit| hit.node.id).collect();
@@ -402,13 +403,8 @@ pub async fn search(
             .map(|record| (record.node_id, record.access_id))
             .collect();
         let hidden = segment.total_matches.saturating_sub(segment.matches.len());
-        let probe = segment_probe(
-            &segment.segment,
-            scope_value,
-            &reach,
-            segment.total_matches,
-            segment.matches.len(),
-        );
+        let remaining = segment.available.saturating_sub(segment.matches.len());
+        let probe = segment_probe(&segment.segment, scope_value, &reach, remaining, page_limit);
         responses.push(SegmentResponse {
             segment: segment.segment,
             matches: segment
@@ -532,11 +528,10 @@ fn segment_probe(
     segment: &str,
     scope: &str,
     reach: &ReachFilter,
-    total_matches: usize,
-    shown: usize,
+    remaining: usize,
+    limit: usize,
 ) -> Option<String> {
-    let hidden = total_matches.saturating_sub(shown);
-    (hidden > 0).then(|| {
+    (remaining > 0).then(|| {
         let mut probe = format!(
             "/api/search/segment?segment={}&scope={}",
             percent_encode(segment),
@@ -551,7 +546,7 @@ fn segment_probe(
         if let Some(descend) = &reach.descend {
             probe.push_str(&format!("&descend={}", percent_encode(descend)));
         }
-        probe.push_str(&format!("&limit={total_matches}&offset={shown}"));
+        probe.push_str(&format!("&limit={limit}&offset=0"));
         probe
     })
 }
@@ -581,9 +576,9 @@ mod tests {
     fn probe_preserves_scope_and_counts() {
         assert_eq!(
             segment_probe("a b", "all", &ReachFilter::default(), 7, 5).as_deref(),
-            Some("/api/search/segment?segment=a%20b&scope=all&limit=7&offset=5")
+            Some("/api/search/segment?segment=a%20b&scope=all&limit=5&offset=0")
         );
-        assert!(segment_probe("a", "active", &ReachFilter::default(), 5, 5).is_none());
+        assert!(segment_probe("a", "active", &ReachFilter::default(), 0, 5).is_none());
     }
 
     #[test]
@@ -596,12 +591,118 @@ mod tests {
         assert_eq!(
             segment_probe("a b", "active", &reach, 7, 5).as_deref(),
             Some(
-                "/api/search/segment?segment=a%20b&scope=active&within=18&via=belongs_to&descend=part_of&limit=7&offset=5"
+                "/api/search/segment?segment=a%20b&scope=active&within=18&via=belongs_to&descend=part_of&limit=5&offset=0"
             )
         );
     }
 
+    fn probe_parameter(probe: &str, name: &str) -> usize {
+        probe
+            .split_once('?')
+            .expect("probe carries a query string")
+            .1
+            .split('&')
+            .find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                (key == name).then(|| value.parse().expect("probe parameter is a number"))
+            })
+            .unwrap_or_else(|| panic!("probe carries {name}"))
+    }
+
+    #[tokio::test]
+    async fn search_probe_returns_the_matches_beyond_the_first_page() {
+        let state = test_state_with_search(SearchConfig {
+            min_matched_idf: 0.0,
+            per_segment_limit: 2,
+            ..SearchConfig::default()
+        })
+        .await;
+        let kind = state
+            .graph_service
+            .create_node_kind(&NodeKind {
+                id: 0,
+                name: "widget".to_string(),
+                description: String::new(),
+                updated_at: String::new(),
+            })
+            .await
+            .expect("create node kind");
+        for index in 0..4 {
+            state
+                .graph_service
+                .upsert_node(&Node {
+                    id: 0,
+                    kind_id: kind.id,
+                    name: format!("node-{index}"),
+                    description: "rotated token filler".to_string(),
+                    content: String::new(),
+                    updated_at: String::new(),
+                })
+                .await
+                .expect("create node");
+        }
+        let params = || SearchParameters {
+            q: "rotated token".to_string(),
+            scope: SearchScope::All,
+            within: None,
+            via: None,
+            descend: None,
+        };
+
+        let first = search(
+            State(state.clone()),
+            SessionId("session-1".to_string()),
+            Query(params()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("first search failed: {}", error.message));
+        let segment = &first.data.segments[0];
+        assert_eq!(segment.matches.len(), 2);
+        assert_eq!(segment.total_matches, 4);
+        assert_eq!(segment.hidden, 2);
+        let probe = segment.probe.clone().expect("probe offered for page two");
+
+        let page = search_segment(
+            State(state.clone()),
+            SessionId("session-1".to_string()),
+            Query(SearchSegmentParameters {
+                segment: "rotated token".to_string(),
+                scope: SearchScope::All,
+                within: None,
+                via: None,
+                descend: None,
+                limit: Some(probe_parameter(&probe, "limit")),
+                offset: Some(probe_parameter(&probe, "offset")),
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("probe follow failed: {}", error.message));
+        assert_eq!(
+            page.items.len(),
+            2,
+            "the probe must return the remaining matches"
+        );
+
+        let exhausted = search(
+            State(state.clone()),
+            SessionId("session-1".to_string()),
+            Query(params()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("third search failed: {}", error.message));
+        assert!(exhausted.data.segments[0].matches.is_empty());
+        assert_eq!(exhausted.data.segments[0].total_matches, 4);
+        assert!(
+            exhausted.data.segments[0].probe.is_none(),
+            "no probe once every match is suppressed"
+        );
+    }
+
     async fn test_state() -> AppState {
+        test_state_with_search(SearchConfig::default()).await
+    }
+
+    async fn test_state_with_search(search: SearchConfig) -> AppState {
         AppState::new(&AppConfig {
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
@@ -611,7 +712,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 max_connections: 1,
             },
-            search: SearchConfig::default(),
+            search,
             audit: AuditConfig { retention_days: 0 },
         })
         .await

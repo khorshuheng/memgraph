@@ -200,6 +200,7 @@ pub struct SegmentMatches {
     pub segment: String,
     pub matches: Vec<SearchHit>,
     pub total_matches: usize,
+    pub available: usize,
     pub excluded_resolved: usize,
 }
 

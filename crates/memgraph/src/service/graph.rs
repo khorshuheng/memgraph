@@ -495,6 +495,11 @@ impl GraphService {
                 continue;
             }
             let total_matches = score.hits.len();
+            let available = score
+                .hits
+                .iter()
+                .filter(|hit| !exclude.contains(&hit.node.id))
+                .count();
             let mut matches: Vec<SearchHit> = score
                 .hits
                 .into_iter()
@@ -506,6 +511,7 @@ impl GraphService {
                 segment,
                 matches,
                 total_matches,
+                available,
                 excluded_resolved: score.excluded_resolved,
             });
         }
