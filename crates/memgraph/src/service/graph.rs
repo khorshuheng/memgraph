@@ -364,37 +364,8 @@ impl GraphService {
     }
 
     pub async fn create_plan(&self, draft: &PlanDraft) -> Result<Plan, ServiceError> {
-        match (&draft.goal, draft.goal_id) {
-            (Some(_), Some(_)) => {
-                return Err(ServiceError::UnprocessableEntity(
-                    "provide either goal or goal_id, not both".to_string(),
-                ));
-            }
-            (None, None) => {
-                return Err(ServiceError::UnprocessableEntity(
-                    "a plan requires a root: provide goal or goal_id".to_string(),
-                ));
-            }
-            _ => {}
-        }
-        if draft.goal.is_some() && draft.anchor.is_none() {
-            return Err(ServiceError::UnprocessableEntity(
-                "a plan requires an anchor: provide anchor to attach the goal to a repo"
-                    .to_string(),
-            ));
-        }
-
-        let mut supplied_ids: HashSet<i64> = HashSet::new();
-        if let Some(goal) = &draft.goal {
-            validate_supplied_id(goal.id, "plan goal", &mut supplied_ids)?;
-        }
-        for task in &draft.tasks {
-            validate_supplied_id(
-                task.id,
-                &format!("plan task '{}'", task.key),
-                &mut supplied_ids,
-            )?;
-        }
+        validate_plan_root(draft)?;
+        validate_supplied_ids(draft)?;
 
         let node_kinds = self.repository.list_node_kinds().await?;
         let task_kind = kind_id_of(&node_kinds, "task")?;
@@ -404,12 +375,34 @@ impl GraphService {
             None
         };
         let edge_types = self.repository.list_edge_types().await?;
-        let PlanEdgeTypes {
-            part_of,
-            depends_on,
-            affects,
-        } = plan_edge_types(&edge_types)?;
+        let types = plan_edge_types(&edge_types)?;
 
+        let kinds = self.validate_plan_references(draft, types.affects).await?;
+        let anchor_edge = self.resolve_anchor_edge(draft, &edge_types, &kinds).await?;
+        let (key_index, offset) = build_key_index(draft)?;
+        validate_key_references(draft, &key_index)?;
+        assert_acyclic_parents(&draft.tasks)?;
+        assert_acyclic_dependencies(&draft.tasks)?;
+
+        let nodes = build_plan_nodes(draft, task_kind, goal_kind, offset);
+        let root = match draft.goal_id {
+            Some(goal_id) => NodeRef::Existing(goal_id),
+            None => NodeRef::New(0),
+        };
+        let edges = build_plan_edges(draft, &key_index, root, anchor_edge, &types, offset);
+
+        let created = self
+            .repository
+            .insert_nodes_with_edges(&nodes, &edges)
+            .await?;
+        Ok(assemble_plan(draft, created))
+    }
+
+    async fn validate_plan_references(
+        &self,
+        draft: &PlanDraft,
+        affects: &EdgeType,
+    ) -> Result<HashMap<i64, String>, ServiceError> {
         let mut referenced = Vec::new();
         if let Some(goal_id) = draft.goal_id {
             referenced.push(goal_id);
@@ -429,171 +422,46 @@ impl GraphService {
                 )));
             }
         }
+        let allowed = affects.destination_kind_list();
         for task in &draft.tasks {
             require_kinds_for(
                 &kinds,
                 &task.affects,
-                &affects.destination_kind_list(),
+                &allowed,
                 &format!("plan task '{}' affects", task.key),
             )?;
         }
+        Ok(kinds)
+    }
 
-        let anchor_edge = match &draft.anchor {
-            Some(anchor) => {
-                let edge_type = edge_type_ref(&edge_types, &anchor.edge_type)?;
-                let source_kinds = edge_type.source_kind_list();
-                if !source_kinds.is_empty() && !source_kinds.contains(&"goal") {
-                    return Err(ServiceError::UnprocessableEntity(format!(
-                        "edge type '{}' does not accept a goal source",
-                        edge_type.name
-                    )));
-                }
-                require_kind(
-                    &kinds,
-                    anchor.node_id,
-                    &edge_type.destination_kind_list(),
-                    &format!("plan anchor edge '{}' destination", edge_type.name),
-                )?;
-                if let Some(goal_id) = draft.goal_id {
-                    self.require_single_outgoing(goal_id, anchor.node_id, edge_type)
-                        .await?;
-                }
-                Some((edge_type.id, anchor.node_id))
-            }
-            None => None,
+    async fn resolve_anchor_edge(
+        &self,
+        draft: &PlanDraft,
+        edge_types: &[EdgeType],
+        kinds: &HashMap<i64, String>,
+    ) -> Result<Option<(i64, i64)>, ServiceError> {
+        let Some(anchor) = &draft.anchor else {
+            return Ok(None);
         };
-
-        let mut key_index: HashMap<&str, usize> = HashMap::new();
-        let offset = if draft.goal.is_some() { 1 } else { 0 };
-        for (position, task) in draft.tasks.iter().enumerate() {
-            if task.key.trim().is_empty() {
-                return Err(ServiceError::UnprocessableEntity(
-                    "every plan task needs a non-empty key".to_string(),
-                ));
-            }
-            if key_index
-                .insert(task.key.as_str(), offset + position)
-                .is_some()
-            {
-                return Err(ServiceError::UnprocessableEntity(format!(
-                    "duplicate plan task key '{}'",
-                    task.key
-                )));
-            }
+        let edge_type = edge_type_ref(edge_types, &anchor.edge_type)?;
+        let source_kinds = edge_type.source_kind_list();
+        if !source_kinds.is_empty() && !source_kinds.contains(&"goal") {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "edge type '{}' does not accept a goal source",
+                edge_type.name
+            )));
         }
-
-        for task in &draft.tasks {
-            if let Some(parent) = &task.parent {
-                if parent == &task.key {
-                    return Err(ServiceError::UnprocessableEntity(format!(
-                        "plan task '{}' cannot be its own parent",
-                        task.key
-                    )));
-                }
-                if !key_index.contains_key(parent.as_str()) {
-                    return Err(ServiceError::UnprocessableEntity(format!(
-                        "plan task '{}' references unknown parent '{}'",
-                        task.key, parent
-                    )));
-                }
-            }
-            for dependency in &task.depends_on {
-                if dependency == &task.key {
-                    return Err(ServiceError::UnprocessableEntity(format!(
-                        "plan task '{}' cannot depend on itself",
-                        task.key
-                    )));
-                }
-                if !key_index.contains_key(dependency.as_str()) {
-                    return Err(ServiceError::UnprocessableEntity(format!(
-                        "plan task '{}' references unknown dependency '{}'",
-                        task.key, dependency
-                    )));
-                }
-            }
+        require_kind(
+            kinds,
+            anchor.node_id,
+            &edge_type.destination_kind_list(),
+            &format!("plan anchor edge '{}' destination", edge_type.name),
+        )?;
+        if let Some(goal_id) = draft.goal_id {
+            self.require_single_outgoing(goal_id, anchor.node_id, edge_type)
+                .await?;
         }
-
-        assert_acyclic_parents(&draft.tasks)?;
-        assert_acyclic_dependencies(&draft.tasks)?;
-
-        let mut nodes = Vec::with_capacity(offset + draft.tasks.len());
-        if let (Some(goal), Some(goal_kind)) = (&draft.goal, goal_kind) {
-            nodes.push(Node {
-                id: goal.id,
-                kind_id: goal_kind,
-                name: goal.name.clone(),
-                description: goal.description.clone(),
-                content: goal.content.clone(),
-                updated_at: String::new(),
-            });
-        }
-        for task in &draft.tasks {
-            nodes.push(Node {
-                id: task.id,
-                kind_id: task_kind,
-                name: task.name.clone(),
-                description: task.description.clone(),
-                content: task.content.clone(),
-                updated_at: String::new(),
-            });
-        }
-
-        let root = match draft.goal_id {
-            Some(goal_id) => NodeRef::Existing(goal_id),
-            None => NodeRef::New(0),
-        };
-
-        let mut edges = Vec::new();
-        if let Some((edge_type_id, node_id)) = anchor_edge {
-            edges.push(PendingEdge {
-                source: root,
-                destination: NodeRef::Existing(node_id),
-                edge_type_id,
-            });
-        }
-        for (position, task) in draft.tasks.iter().enumerate() {
-            let task_ref = NodeRef::New(offset + position);
-            let parent = match &task.parent {
-                Some(parent) => NodeRef::New(key_index[parent.as_str()]),
-                None => root,
-            };
-            edges.push(PendingEdge {
-                source: task_ref,
-                destination: parent,
-                edge_type_id: part_of.id,
-            });
-            for dependency in &task.depends_on {
-                edges.push(PendingEdge {
-                    source: task_ref,
-                    destination: NodeRef::New(key_index[dependency.as_str()]),
-                    edge_type_id: depends_on.id,
-                });
-            }
-            for target in &task.affects {
-                edges.push(PendingEdge {
-                    source: task_ref,
-                    destination: NodeRef::Existing(*target),
-                    edge_type_id: affects.id,
-                });
-            }
-        }
-
-        let created = self
-            .repository
-            .insert_nodes_with_edges(&nodes, &edges)
-            .await?;
-        let mut created = created.into_iter();
-        let goal = draft.goal.as_ref().and_then(|_| created.next());
-        let tasks = draft
-            .tasks
-            .iter()
-            .zip(created)
-            .map(|(draft_task, node)| PlanTask {
-                key: draft_task.key.clone(),
-                node,
-            })
-            .collect();
-        Ok(Plan { goal, tasks })
+        Ok(Some((edge_type.id, anchor.node_id)))
     }
 
     async fn node_kind_names(&self, ids: &[i64]) -> Result<HashMap<i64, String>, ServiceError> {
@@ -831,6 +699,192 @@ fn edge_type_ref<'a>(edge_types: &'a [EdgeType], name: &str) -> Result<&'a EdgeT
         .ok_or_else(|| {
             ServiceError::UnprocessableEntity(format!("edge type '{name}' is not defined"))
         })
+}
+
+fn validate_plan_root(draft: &PlanDraft) -> Result<(), ServiceError> {
+    match (&draft.goal, draft.goal_id) {
+        (Some(_), Some(_)) => {
+            return Err(ServiceError::UnprocessableEntity(
+                "provide either goal or goal_id, not both".to_string(),
+            ));
+        }
+        (None, None) => {
+            return Err(ServiceError::UnprocessableEntity(
+                "a plan requires a root: provide goal or goal_id".to_string(),
+            ));
+        }
+        _ => {}
+    }
+    if draft.goal.is_some() && draft.anchor.is_none() {
+        return Err(ServiceError::UnprocessableEntity(
+            "a plan requires an anchor: provide anchor to attach the goal to a repo".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_supplied_ids(draft: &PlanDraft) -> Result<(), ServiceError> {
+    let mut supplied_ids: HashSet<i64> = HashSet::new();
+    if let Some(goal) = &draft.goal {
+        validate_supplied_id(goal.id, "plan goal", &mut supplied_ids)?;
+    }
+    for task in &draft.tasks {
+        validate_supplied_id(
+            task.id,
+            &format!("plan task '{}'", task.key),
+            &mut supplied_ids,
+        )?;
+    }
+    Ok(())
+}
+
+fn build_key_index(draft: &PlanDraft) -> Result<(HashMap<&str, usize>, usize), ServiceError> {
+    let offset = if draft.goal.is_some() { 1 } else { 0 };
+    let mut key_index: HashMap<&str, usize> = HashMap::new();
+    for (position, task) in draft.tasks.iter().enumerate() {
+        if task.key.trim().is_empty() {
+            return Err(ServiceError::UnprocessableEntity(
+                "every plan task needs a non-empty key".to_string(),
+            ));
+        }
+        if key_index
+            .insert(task.key.as_str(), offset + position)
+            .is_some()
+        {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "duplicate plan task key '{}'",
+                task.key
+            )));
+        }
+    }
+    Ok((key_index, offset))
+}
+
+fn validate_key_references(
+    draft: &PlanDraft,
+    key_index: &HashMap<&str, usize>,
+) -> Result<(), ServiceError> {
+    for task in &draft.tasks {
+        if let Some(parent) = &task.parent {
+            if parent == &task.key {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "plan task '{}' cannot be its own parent",
+                    task.key
+                )));
+            }
+            if !key_index.contains_key(parent.as_str()) {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "plan task '{}' references unknown parent '{}'",
+                    task.key, parent
+                )));
+            }
+        }
+        for dependency in &task.depends_on {
+            if dependency == &task.key {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "plan task '{}' cannot depend on itself",
+                    task.key
+                )));
+            }
+            if !key_index.contains_key(dependency.as_str()) {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "plan task '{}' references unknown dependency '{}'",
+                    task.key, dependency
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_plan_nodes(
+    draft: &PlanDraft,
+    task_kind: i64,
+    goal_kind: Option<i64>,
+    offset: usize,
+) -> Vec<Node> {
+    let mut nodes = Vec::with_capacity(offset + draft.tasks.len());
+    if let (Some(goal), Some(goal_kind)) = (&draft.goal, goal_kind) {
+        nodes.push(Node {
+            id: goal.id,
+            kind_id: goal_kind,
+            name: goal.name.clone(),
+            description: goal.description.clone(),
+            content: goal.content.clone(),
+            updated_at: String::new(),
+        });
+    }
+    for task in &draft.tasks {
+        nodes.push(Node {
+            id: task.id,
+            kind_id: task_kind,
+            name: task.name.clone(),
+            description: task.description.clone(),
+            content: task.content.clone(),
+            updated_at: String::new(),
+        });
+    }
+    nodes
+}
+
+fn build_plan_edges<'a>(
+    draft: &'a PlanDraft,
+    key_index: &HashMap<&'a str, usize>,
+    root: NodeRef,
+    anchor_edge: Option<(i64, i64)>,
+    types: &PlanEdgeTypes<'_>,
+    offset: usize,
+) -> Vec<PendingEdge> {
+    let mut edges = Vec::new();
+    if let Some((edge_type_id, node_id)) = anchor_edge {
+        edges.push(PendingEdge {
+            source: root,
+            destination: NodeRef::Existing(node_id),
+            edge_type_id,
+        });
+    }
+    for (position, task) in draft.tasks.iter().enumerate() {
+        let task_ref = NodeRef::New(offset + position);
+        let parent = match &task.parent {
+            Some(parent) => NodeRef::New(key_index[parent.as_str()]),
+            None => root,
+        };
+        edges.push(PendingEdge {
+            source: task_ref,
+            destination: parent,
+            edge_type_id: types.part_of.id,
+        });
+        for dependency in &task.depends_on {
+            edges.push(PendingEdge {
+                source: task_ref,
+                destination: NodeRef::New(key_index[dependency.as_str()]),
+                edge_type_id: types.depends_on.id,
+            });
+        }
+        for target in &task.affects {
+            edges.push(PendingEdge {
+                source: task_ref,
+                destination: NodeRef::Existing(*target),
+                edge_type_id: types.affects.id,
+            });
+        }
+    }
+    edges
+}
+
+fn assemble_plan(draft: &PlanDraft, created: Vec<Node>) -> Plan {
+    let mut created = created.into_iter();
+    let goal = draft.goal.as_ref().and_then(|_| created.next());
+    let tasks = draft
+        .tasks
+        .iter()
+        .zip(created)
+        .map(|(draft_task, node)| PlanTask {
+            key: draft_task.key.clone(),
+            node,
+        })
+        .collect();
+    Plan { goal, tasks }
 }
 
 fn kind_id_of(kinds: &[NodeKind], name: &str) -> Result<i64, ServiceError> {
