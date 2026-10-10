@@ -389,7 +389,7 @@ impl GraphService {
             Some(goal_id) => NodeRef::Existing(goal_id),
             None => NodeRef::New(0),
         };
-        let edges = build_plan_edges(draft, &key_index, root, anchor_edge, &types, offset);
+        let edges = build_plan_edges(draft, &key_index, root, anchor_edge, &types, offset)?;
 
         let created = self
             .repository
@@ -826,7 +826,7 @@ fn build_plan_edges<'a>(
     anchor_edge: Option<(i64, i64)>,
     types: &PlanEdgeTypes<'_>,
     offset: usize,
-) -> Vec<PendingEdge> {
+) -> Result<Vec<PendingEdge>, ServiceError> {
     let mut edges = Vec::new();
     if let Some((edge_type_id, node_id)) = anchor_edge {
         edges.push(PendingEdge {
@@ -838,7 +838,12 @@ fn build_plan_edges<'a>(
     for (position, task) in draft.tasks.iter().enumerate() {
         let task_ref = NodeRef::New(offset + position);
         let parent = match &task.parent {
-            Some(parent) => NodeRef::New(key_index[parent.as_str()]),
+            Some(parent) => NodeRef::New(*key_index.get(parent.as_str()).ok_or_else(|| {
+                ServiceError::UnprocessableEntity(format!(
+                    "plan task '{}' references unknown parent '{}'",
+                    task.key, parent
+                ))
+            })?),
             None => root,
         };
         edges.push(PendingEdge {
@@ -847,9 +852,15 @@ fn build_plan_edges<'a>(
             edge_type_id: types.part_of.id,
         });
         for dependency in &task.depends_on {
+            let position = *key_index.get(dependency.as_str()).ok_or_else(|| {
+                ServiceError::UnprocessableEntity(format!(
+                    "plan task '{}' references unknown dependency '{}'",
+                    task.key, dependency
+                ))
+            })?;
             edges.push(PendingEdge {
                 source: task_ref,
-                destination: NodeRef::New(key_index[dependency.as_str()]),
+                destination: NodeRef::New(position),
                 edge_type_id: types.depends_on.id,
             });
         }
@@ -861,7 +872,7 @@ fn build_plan_edges<'a>(
             });
         }
     }
-    edges
+    Ok(edges)
 }
 
 fn assemble_plan(draft: &PlanDraft, created: Vec<Node>) -> Plan {
