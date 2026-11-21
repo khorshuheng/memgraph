@@ -122,6 +122,11 @@ pub trait GraphRepository: Send + Sync {
         edge: &Edge,
         properties: Option<&str>,
     ) -> Result<(), RepositoryError>;
+    async fn set_edge_properties(
+        &self,
+        edge: &Edge,
+        properties: &str,
+    ) -> Result<bool, RepositoryError>;
     async fn remove_edge(&self, edge: &Edge) -> Result<bool, RepositoryError>;
     async fn neighbors(
         &self,
@@ -520,6 +525,24 @@ impl GraphRepository for SqliteGraphRepository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn set_edge_properties(
+        &self,
+        edge: &Edge,
+        properties: &str,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            "UPDATE edge SET properties = ? \
+             WHERE source = ? AND destination = ? AND edge_type_id = ?",
+        )
+        .bind(properties)
+        .bind(edge.source)
+        .bind(edge.destination)
+        .bind(edge.edge_type_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn remove_edge(&self, edge: &Edge) -> Result<bool, RepositoryError> {

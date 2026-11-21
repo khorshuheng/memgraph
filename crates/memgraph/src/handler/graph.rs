@@ -13,7 +13,7 @@ use crate::{
             ImportReportResponse, ListNodesParameters, NeighborParameters, NeighborResponse,
             NodeKindResponse, NodeResponse, PackReportResponse, PlanResponse,
             ReplaceTagsParameters, SearchHitResponse, SearchParameters, SearchResponse,
-            TagUsageResponse, UpdateNodeParameters, UpdateTaskParameters,
+            TagUsageResponse, UpdateEdgeParameters, UpdateNodeParameters, UpdateTaskParameters,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
@@ -432,6 +432,34 @@ pub async fn add_edge(
     state
         .graph_service
         .add_edge_with_properties(&edge, properties.as_ref())
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    patch,
+    path = "/edges",
+    request_body = UpdateEdgeParameters,
+    responses(
+        (status = 204, description = "Edge properties updated"),
+        (status = 404, description = "Edge not found"),
+        (status = 422, description = "Properties must be a JSON object")
+    )
+)]
+pub async fn update_edge(
+    State(state): State<AppState>,
+    Json(params): Json<UpdateEdgeParameters>,
+) -> Result<StatusCode, ApiError> {
+    let edge = Edge {
+        source: params.source,
+        destination: params.destination,
+        edge_type_id: params.edge_type_id,
+        created_at: String::new(),
+    };
+    state
+        .graph_service
+        .set_edge_properties(&edge, &params.properties)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1164,5 +1192,105 @@ mod tests {
             neighbors.items[0].edge.properties,
             serde_json::json!({"weight": 2})
         );
+    }
+
+    #[tokio::test]
+    async fn updates_edge_properties_over_http() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "decision").await;
+        let first = new_node(&state, kind, "first", "", "", &[]).await;
+        let second = new_node(&state, kind, "second", "", "", &[]).await;
+        let edge_type = state
+            .graph_service
+            .create_edge_type(&EdgeType {
+                id: 0,
+                name: "relates".to_string(),
+                description: "decision -> decision".to_string(),
+                resolves: false,
+                single_outgoing: false,
+                acyclic: false,
+                source_kinds: Some("decision".to_string()),
+                destination_kinds: Some("decision".to_string()),
+                updated_at: String::new(),
+            })
+            .await
+            .expect("edge type");
+        add_edge(
+            State(state.clone()),
+            Json(CreateEdgeParameters {
+                source: first.id,
+                destination: second.id,
+                edge_type_id: edge_type.id,
+                properties: None,
+            }),
+        )
+        .await
+        .expect("add edge");
+
+        let status = update_edge(
+            State(state.clone()),
+            Json(UpdateEdgeParameters {
+                source: first.id,
+                destination: second.id,
+                edge_type_id: edge_type.id,
+                properties: serde_json::json!({"weight": 3}),
+            }),
+        )
+        .await
+        .expect("update edge");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let neighbors = list_neighbors(
+            State(state.clone()),
+            Path(first.id),
+            Query(NeighborParameters {
+                direction: NeighborDirection::Outgoing,
+                edge_type: Some("relates".to_string()),
+            }),
+        )
+        .await
+        .expect("neighbors");
+        assert_eq!(
+            neighbors.items[0].edge.properties,
+            serde_json::json!({"weight": 3})
+        );
+
+        update_edge(
+            State(state.clone()),
+            Json(UpdateEdgeParameters {
+                source: first.id,
+                destination: second.id,
+                edge_type_id: edge_type.id,
+                properties: serde_json::json!({}),
+            }),
+        )
+        .await
+        .expect("clear edge");
+
+        let missing = update_edge(
+            State(state.clone()),
+            Json(UpdateEdgeParameters {
+                source: second.id,
+                destination: first.id,
+                edge_type_id: edge_type.id,
+                properties: serde_json::json!({}),
+            }),
+        )
+        .await
+        .expect_err("missing edge");
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+
+        let invalid = update_edge(
+            State(state.clone()),
+            Json(UpdateEdgeParameters {
+                source: first.id,
+                destination: second.id,
+                edge_type_id: edge_type.id,
+                properties: serde_json::json!([1]),
+            }),
+        )
+        .await
+        .expect_err("invalid properties");
+        assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

@@ -395,6 +395,22 @@ impl GraphService {
             .map_err(ServiceError::from)
     }
 
+    pub async fn set_edge_properties(
+        &self,
+        edge: &Edge,
+        properties: &serde_json::Value,
+    ) -> Result<(), ServiceError> {
+        let encoded = encode_properties(Some(properties))?.ok_or_else(|| {
+            ServiceError::UnprocessableEntity("properties must be a JSON object".to_string())
+        })?;
+        let updated = self.repository.set_edge_properties(edge, &encoded).await?;
+        if updated {
+            Ok(())
+        } else {
+            Err(ServiceError::EntityNotFound)
+        }
+    }
+
     async fn require_single_outgoing(
         &self,
         source: i64,
@@ -5115,5 +5131,75 @@ mod tests {
             ))
             .await;
         assert!(matches!(report, Err(ServiceError::UnprocessableEntity(_))));
+    }
+
+    #[tokio::test]
+    async fn updates_and_clears_edge_properties() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let relates = relates_edge_type(&service, kind_id).await;
+        let first = service
+            .create_node(&node(kind_id, "first", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let second = service
+            .create_node(&node(kind_id, "second", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let edge = Edge {
+            source: first.id,
+            destination: second.id,
+            edge_type_id: relates,
+            created_at: String::new(),
+        };
+        service
+            .add_edge_with_properties(&edge, Some(&serde_json::json!({"weight": 1})))
+            .await
+            .unwrap();
+
+        service
+            .set_edge_properties(&edge, &serde_json::json!({"weight": 2, "tag": "a"}))
+            .await
+            .unwrap();
+        let neighbors = service
+            .neighbors(first.id, NeighborDirection::Outgoing, Some("relates"))
+            .await
+            .unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_str(&neighbors[0].edge_properties).unwrap();
+        assert_eq!(stored, serde_json::json!({"weight": 2, "tag": "a"}));
+
+        service
+            .set_edge_properties(&edge, &serde_json::json!({}))
+            .await
+            .unwrap();
+        let neighbors = service
+            .neighbors(first.id, NeighborDirection::Outgoing, Some("relates"))
+            .await
+            .unwrap();
+        assert_eq!(neighbors[0].edge_properties, "{}");
+
+        assert!(matches!(
+            service
+                .set_edge_properties(
+                    &Edge {
+                        source: second.id,
+                        destination: first.id,
+                        edge_type_id: relates,
+                        created_at: String::new(),
+                    },
+                    &serde_json::json!({"weight": 3}),
+                )
+                .await,
+            Err(ServiceError::EntityNotFound)
+        ));
+        assert!(matches!(
+            service
+                .set_edge_properties(&edge, &serde_json::json!([1]))
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
     }
 }

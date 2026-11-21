@@ -263,6 +263,14 @@ impl From<DeleteEdgeParameters> for EdgeModel {
     }
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateEdgeParameters {
+    pub source: i64,
+    pub destination: i64,
+    pub edge_type_id: i64,
+    pub properties: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum NeighborDirection {
