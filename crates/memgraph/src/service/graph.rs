@@ -79,6 +79,7 @@ impl GraphService {
                 description: edge_type.description.clone(),
                 resolves: edge_type.resolves,
                 single_outgoing: edge_type.single_outgoing,
+                acyclic: edge_type.acyclic,
                 source_kinds: edge_type
                     .source_kinds
                     .as_deref()
@@ -1311,6 +1312,7 @@ mod tests {
             description: description.to_string(),
             resolves: false,
             single_outgoing: false,
+            acyclic: false,
             source_kinds: None,
             destination_kinds: None,
             updated_at: String::new(),
@@ -2856,7 +2858,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anchored_check_terminates_on_a_part_of_cycle() {
+    async fn trigger_rejects_part_of_cycles_and_loops() {
         let service = service().await;
         let task_kind = seeded_kind(&service, "task").await;
         let part_of = seeded_edge_type(&service, "part_of").await;
@@ -2868,22 +2870,189 @@ mod tests {
             .upsert_node(&node(task_kind, "second", ""))
             .await
             .unwrap();
+        service
+            .add_edge(&Edge {
+                source: first.id,
+                destination: second.id,
+                edge_type_id: part_of,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let cycle = service
+            .add_edge(&Edge {
+                source: second.id,
+                destination: first.id,
+                edge_type_id: part_of,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap_err();
+        assert!(rejection(cycle).contains("cycle"));
+
+        let self_loop = service
+            .add_edge(&Edge {
+                source: first.id,
+                destination: first.id,
+                edge_type_id: part_of,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap_err();
+        assert!(rejection(self_loop).contains("cycle"));
+    }
+
+    #[tokio::test]
+    async fn a_non_acyclic_edge_type_allows_a_cycle() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let knows = service
+            .create_edge_type(&EdgeType {
+                id: 0,
+                name: "knows".to_string(),
+                description: "person -> person".to_string(),
+                resolves: false,
+                single_outgoing: false,
+                acyclic: false,
+                source_kinds: Some("person".to_string()),
+                destination_kinds: Some("person".to_string()),
+                updated_at: String::new(),
+            })
+            .await
+            .unwrap()
+            .id;
+        let first = service
+            .create_node(&node(kind_id, "first", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let second = service
+            .create_node(&node(kind_id, "second", ""), &[])
+            .await
+            .unwrap()
+            .0;
         for (source, destination) in [(first.id, second.id), (second.id, first.id)] {
             service
                 .add_edge(&Edge {
                     source,
                     destination,
-                    edge_type_id: part_of,
+                    edge_type_id: knows,
                     created_at: String::new(),
                 })
                 .await
                 .unwrap();
         }
+    }
 
-        let mut draft = new_task("child");
-        draft.parent = Some(first.id);
-        let error = service.create_task(&draft).await.unwrap_err();
-        assert!(rejection(error).contains("is not attached to a repo"));
+    #[tokio::test]
+    async fn pack_can_declare_an_acyclic_edge_type() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![],
+                edge_types: vec![PackEdgeType {
+                    name: "supervises".to_string(),
+                    description: Some("person -> person".to_string()),
+                    resolves: None,
+                    single_outgoing: None,
+                    acyclic: Some(true),
+                    source_kinds: Some(vec!["person".to_string()]),
+                    destination_kinds: Some(vec!["person".to_string()]),
+                }],
+            })
+            .await
+            .unwrap();
+        let supervises = seeded_edge_type(&service, "supervises").await;
+        let first = service
+            .create_node(&node(kind_id, "first", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let second = service
+            .create_node(&node(kind_id, "second", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        service
+            .add_edge(&Edge {
+                source: first.id,
+                destination: second.id,
+                edge_type_id: supervises,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+        let cycle = service
+            .add_edge(&Edge {
+                source: second.id,
+                destination: first.id,
+                edge_type_id: supervises,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap_err();
+        assert!(rejection(cycle).contains("cycle"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn trigger_serializes_concurrent_single_outgoing_edges() {
+        let path = temp_sqlite("memgraph-single-outgoing");
+        let service = file_service(&path).await;
+        let goal_kind = seeded_kind(&service, "goal").await;
+        let repo_kind = seeded_kind(&service, "repo").await;
+        let belongs_to = seeded_edge_type(&service, "belongs_to").await;
+        let goal = service
+            .create_node(&node(goal_kind, "race goal", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let mut repos = Vec::new();
+        for index in 0..8 {
+            repos.push(
+                service
+                    .create_node(&node(repo_kind, &format!("acme/{index}"), ""), &[])
+                    .await
+                    .unwrap()
+                    .0
+                    .id,
+            );
+        }
+
+        let mut handles = Vec::new();
+        for repo in repos {
+            let service = service.clone();
+            handles.push(tokio::spawn(async move {
+                service
+                    .add_edge(&Edge {
+                        source: goal.id,
+                        destination: repo,
+                        edge_type_id: belongs_to,
+                        created_at: String::new(),
+                    })
+                    .await
+            }));
+        }
+        let mut accepted = 0;
+        let mut rejected = 0;
+        for handle in handles {
+            match handle.await.unwrap() {
+                Ok(()) => accepted += 1,
+                Err(ServiceError::UnprocessableEntity(_)) => rejected += 1,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert_eq!(accepted, 1);
+        assert_eq!(rejected, 7);
+        let edges = service
+            .neighbors(goal.id, NeighborDirection::Outgoing, Some("belongs_to"))
+            .await
+            .unwrap();
+        assert_eq!(edges.len(), 1);
+
+        drop(service);
+        remove_sqlite(&path);
     }
 
     #[tokio::test]
@@ -3081,6 +3250,7 @@ mod tests {
             description: Some(format!("{source} -> {destination}")),
             resolves: None,
             single_outgoing: None,
+            acyclic: None,
             source_kinds: Some(vec![source.to_string()]),
             destination_kinds: Some(vec![destination.to_string()]),
         }
@@ -3172,6 +3342,7 @@ mod tests {
                 description: "original".to_string(),
                 resolves: true,
                 single_outgoing: true,
+                acyclic: false,
                 source_kinds: Some("task".to_string()),
                 destination_kinds: Some("goal".to_string()),
                 updated_at: String::new(),
@@ -3187,6 +3358,7 @@ mod tests {
                     description: Some("changed".to_string()),
                     resolves: None,
                     single_outgoing: None,
+                    acyclic: None,
                     source_kinds: None,
                     destination_kinds: None,
                 }],
@@ -3216,6 +3388,7 @@ mod tests {
                     description: None,
                     resolves: None,
                     single_outgoing: None,
+                    acyclic: None,
                     source_kinds: Some(vec![]),
                     destination_kinds: None,
                 }],
@@ -3279,6 +3452,7 @@ mod tests {
                     description: None,
                     resolves: None,
                     single_outgoing: None,
+                    acyclic: None,
                     source_kinds: Some(vec!["beta".to_string()]),
                     destination_kinds: Some(vec!["beta".to_string()]),
                 }],
@@ -3345,6 +3519,7 @@ mod tests {
                     description: None,
                     resolves: None,
                     single_outgoing: Some(true),
+                    acyclic: None,
                     source_kinds: None,
                     destination_kinds: None,
                 }],
@@ -3447,6 +3622,24 @@ mod tests {
         );
     }
 
+    fn temp_sqlite(prefix: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{unique}.sqlite", std::process::id()))
+    }
+
+    fn remove_sqlite(path: &std::path::Path) {
+        std::fs::remove_file(path).ok();
+        let file = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        std::fs::remove_file(path.with_file_name(format!("{file}-wal"))).ok();
+        std::fs::remove_file(path.with_file_name(format!("{file}-shm"))).ok();
+    }
+
     async fn file_service(path: &std::path::Path) -> GraphService {
         let config = crate::config::DatabaseConfig {
             path: path.to_string_lossy().into_owned(),
@@ -3494,7 +3687,7 @@ mod tests {
         assert_eq!(unchanged, 14);
 
         drop(service);
-        std::fs::remove_file(&path).ok();
+        remove_sqlite(&path);
     }
 
     fn import_node(reference: Option<&str>, kind: &str, name: &str) -> ImportNode {
@@ -3793,7 +3986,7 @@ mod tests {
         assert_eq!(unchanged, 7);
 
         drop(service);
-        std::fs::remove_file(&path).ok();
+        remove_sqlite(&path);
     }
 
     #[tokio::test]
@@ -4254,7 +4447,7 @@ mod tests {
         }
 
         drop(service);
-        std::fs::remove_file(&path).ok();
+        remove_sqlite(&path);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4325,6 +4518,6 @@ mod tests {
         assert_eq!(named.len(), 2);
 
         drop(service);
-        std::fs::remove_file(&path).ok();
+        remove_sqlite(&path);
     }
 }

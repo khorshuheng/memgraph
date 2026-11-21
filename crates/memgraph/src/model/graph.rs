@@ -16,6 +16,7 @@ pub struct EdgeType {
     pub description: String,
     pub resolves: bool,
     pub single_outgoing: bool,
+    pub acyclic: bool,
     pub source_kinds: Option<String>,
     pub destination_kinds: Option<String>,
     pub updated_at: String,
@@ -171,6 +172,7 @@ pub struct PackEdgeType {
     pub description: Option<String>,
     pub resolves: Option<bool>,
     pub single_outgoing: Option<bool>,
+    pub acyclic: Option<bool>,
     pub source_kinds: Option<Vec<String>>,
     pub destination_kinds: Option<Vec<String>>,
 }

@@ -785,6 +785,7 @@ mod tests {
                 description: Some("widget -> widget".to_string()),
                 resolves: None,
                 single_outgoing: None,
+                acyclic: None,
                 source_kinds: Some(vec!["widget".to_string()]),
                 destination_kinds: Some(vec!["widget".to_string()]),
             }],

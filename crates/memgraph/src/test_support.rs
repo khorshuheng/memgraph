@@ -37,11 +37,20 @@ const KINDS: [(&str, &str); 10] = [
     ),
 ];
 
-const EDGE_TYPES: [(&str, &str, bool, bool, &str, &str); 17] = [
-    ("contains", "repo -> file.", false, false, "repo", "file"),
+const EDGE_TYPES: [(&str, &str, bool, bool, bool, &str, &str); 17] = [
+    (
+        "contains",
+        "repo -> file.",
+        false,
+        false,
+        false,
+        "repo",
+        "file",
+    ),
     (
         "defines",
         "file -> db_table | db_view.",
+        false,
         false,
         false,
         "file",
@@ -52,12 +61,14 @@ const EDGE_TYPES: [(&str, &str, bool, bool, &str, &str); 17] = [
         "db_table -> db_table.",
         false,
         false,
+        false,
         "db_table",
         "db_table",
     ),
     (
         "derived_from",
         "db_view -> db_table | db_view.",
+        false,
         false,
         false,
         "db_view",
@@ -68,12 +79,14 @@ const EDGE_TYPES: [(&str, &str, bool, bool, &str, &str); 17] = [
         "file -> db_table.",
         false,
         false,
+        false,
         "file",
         "db_table",
     ),
     (
         "writes",
         "file -> db_table.",
+        false,
         false,
         false,
         "file",
@@ -84,13 +97,23 @@ const EDGE_TYPES: [(&str, &str, bool, bool, &str, &str); 17] = [
         "task -> task | goal.",
         false,
         false,
+        true,
         "task",
         "task,goal",
     ),
-    ("depends_on", "task -> task.", false, false, "task", "task"),
+    (
+        "depends_on",
+        "task -> task.",
+        false,
+        false,
+        true,
+        "task",
+        "task",
+    ),
     (
         "affects",
         "task -> file | db_table.",
+        false,
         false,
         false,
         "task",
@@ -101,12 +124,14 @@ const EDGE_TYPES: [(&str, &str, bool, bool, &str, &str); 17] = [
         "change -> task.",
         true,
         false,
+        false,
         "change",
         "task",
     ),
     (
         "modifies",
         "change -> file | db_table.",
+        false,
         false,
         false,
         "change",
@@ -117,21 +142,55 @@ const EDGE_TYPES: [(&str, &str, bool, bool, &str, &str); 17] = [
         "change -> decision.",
         false,
         false,
+        false,
         "change",
         "decision",
     ),
-    ("tested_by", "file -> test.", false, false, "file", "test"),
+    (
+        "tested_by",
+        "file -> test.",
+        false,
+        false,
+        false,
+        "file",
+        "test",
+    ),
     (
         "verifies",
         "test -> goal | task.",
         false,
         false,
+        false,
         "test",
         "goal,task",
     ),
-    ("reveals", "test -> bug.", false, false, "test", "bug"),
-    ("fixes", "change -> bug.", true, false, "change", "bug"),
-    ("belongs_to", "goal -> repo.", false, true, "goal", "repo"),
+    (
+        "reveals",
+        "test -> bug.",
+        false,
+        false,
+        false,
+        "test",
+        "bug",
+    ),
+    (
+        "fixes",
+        "change -> bug.",
+        true,
+        false,
+        false,
+        "change",
+        "bug",
+    ),
+    (
+        "belongs_to",
+        "goal -> repo.",
+        false,
+        true,
+        false,
+        "goal",
+        "repo",
+    ),
 ];
 
 pub async fn seed_vocabulary(repository: &Arc<dyn GraphRepository>) {
@@ -149,7 +208,7 @@ pub async fn seed_vocabulary(repository: &Arc<dyn GraphRepository>) {
             panic!("failed to seed node kind {name}: {error}");
         }
     }
-    for (name, description, resolves, single_outgoing, source_kinds, destination_kinds) in
+    for (name, description, resolves, single_outgoing, acyclic, source_kinds, destination_kinds) in
         EDGE_TYPES
     {
         if let Err(error) = repository
@@ -159,6 +218,7 @@ pub async fn seed_vocabulary(repository: &Arc<dyn GraphRepository>) {
                 description: description.to_string(),
                 resolves,
                 single_outgoing,
+                acyclic,
                 source_kinds: Some(source_kinds.to_string()),
                 destination_kinds: Some(destination_kinds.to_string()),
                 updated_at: String::new(),

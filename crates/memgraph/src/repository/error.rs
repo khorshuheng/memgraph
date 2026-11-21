@@ -40,6 +40,9 @@ impl From<sqlx::Error> for RepositoryError {
                 _ if matches!(err.code().as_deref(), Some("5") | Some("6")) => {
                     RepositoryError::Busy(err.to_string())
                 }
+                _ if matches!(err.code().as_deref(), Some("1811")) => {
+                    RepositoryError::ContractViolation(err.message().to_string())
+                }
                 _ => RepositoryError::SqlExecutionError(err.to_string()),
             },
             _ => RepositoryError::SqlExecutionError(error.to_string()),

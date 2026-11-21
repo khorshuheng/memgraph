@@ -59,6 +59,8 @@ pub struct CreateEdgeTypeParameters {
     #[serde(default)]
     pub single_outgoing: bool,
     #[serde(default)]
+    pub acyclic: bool,
+    #[serde(default)]
     pub source_kinds: Vec<String>,
     #[serde(default)]
     pub destination_kinds: Vec<String>,
@@ -71,6 +73,7 @@ pub struct EdgeTypeResponse {
     pub description: String,
     pub resolves: bool,
     pub single_outgoing: bool,
+    pub acyclic: bool,
     pub source_kinds: Vec<String>,
     pub destination_kinds: Vec<String>,
     pub updated_at: String,
@@ -105,6 +108,7 @@ impl From<CreateEdgeTypeParameters> for EdgeTypeModel {
             description: params.description,
             resolves: params.resolves,
             single_outgoing: params.single_outgoing,
+            acyclic: params.acyclic,
             source_kinds: join_kinds(params.source_kinds),
             destination_kinds: join_kinds(params.destination_kinds),
             updated_at: String::new(),
@@ -122,6 +126,7 @@ impl From<EdgeTypeModel> for EdgeTypeResponse {
             description: edge_type.description,
             resolves: edge_type.resolves,
             single_outgoing: edge_type.single_outgoing,
+            acyclic: edge_type.acyclic,
             updated_at: edge_type.updated_at,
         }
     }
@@ -367,6 +372,8 @@ pub struct PackEdgeTypeParameters {
     #[serde(default)]
     pub single_outgoing: Option<bool>,
     #[serde(default)]
+    pub acyclic: Option<bool>,
+    #[serde(default)]
     pub source_kinds: Option<Vec<String>>,
     #[serde(default)]
     pub destination_kinds: Option<Vec<String>>,
@@ -379,6 +386,7 @@ impl From<PackEdgeTypeParameters> for PackEdgeType {
             description: params.description,
             resolves: params.resolves,
             single_outgoing: params.single_outgoing,
+            acyclic: params.acyclic,
             source_kinds: params.source_kinds,
             destination_kinds: params.destination_kinds,
         }

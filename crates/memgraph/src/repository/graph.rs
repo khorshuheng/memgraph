@@ -15,8 +15,8 @@ use crate::model::{
 use super::error::RepositoryError;
 
 const NODE_KIND_COLUMNS: &str = "id, version, name, description, updated_at";
-const EDGE_TYPE_COLUMNS: &str =
-    "id, name, description, resolves, single_outgoing, source_kinds, destination_kinds, updated_at";
+const EDGE_TYPE_COLUMNS: &str = "id, name, description, resolves, single_outgoing, acyclic, source_kinds, destination_kinds, \
+     updated_at";
 const NODE_COLUMNS: &str = "id, kind_id, name, description, content, updated_at";
 const OUTGOING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
     n.id, n.kind_id, n.name, n.description, n.content, n.updated_at \
@@ -254,13 +254,15 @@ impl GraphRepository for SqliteGraphRepository {
 
     async fn create_edge_type(&self, edge_type: &EdgeType) -> Result<EdgeType, RepositoryError> {
         let row = sqlx::query_as::<_, EdgeType>(&format!(
-            "INSERT INTO edge_type (name, description, resolves, single_outgoing, source_kinds, \
-             destination_kinds) VALUES (?, ?, ?, ?, ?, ?) RETURNING {EDGE_TYPE_COLUMNS}"
+            "INSERT INTO edge_type (name, description, resolves, single_outgoing, acyclic, \
+             source_kinds, destination_kinds) VALUES (?, ?, ?, ?, ?, ?, ?) \
+             RETURNING {EDGE_TYPE_COLUMNS}"
         ))
         .bind(&edge_type.name)
         .bind(&edge_type.description)
         .bind(edge_type.resolves)
         .bind(edge_type.single_outgoing)
+        .bind(edge_type.acyclic)
         .bind(&edge_type.source_kinds)
         .bind(&edge_type.destination_kinds)
         .fetch_one(&self.pool)
@@ -928,19 +930,21 @@ async fn apply_edge_type(
             let description = edge_type.description.clone().unwrap_or_default();
             let resolves = edge_type.resolves.unwrap_or(false);
             let single_outgoing = edge_type.single_outgoing.unwrap_or(false);
+            let acyclic = edge_type.acyclic.unwrap_or(false);
             let source_kinds = edge_type.source_kinds.as_deref().and_then(encode_kind_list);
             let destination_kinds = edge_type
                 .destination_kinds
                 .as_deref()
                 .and_then(encode_kind_list);
             let id = sqlx::query_scalar::<_, i64>(
-                "INSERT INTO edge_type (name, description, resolves, single_outgoing, \
-                 source_kinds, destination_kinds) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+                "INSERT INTO edge_type (name, description, resolves, single_outgoing, acyclic, \
+                 source_kinds, destination_kinds) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
             )
             .bind(&edge_type.name)
             .bind(description)
             .bind(resolves)
             .bind(single_outgoing)
+            .bind(acyclic)
             .bind(source_kinds)
             .bind(destination_kinds)
             .fetch_one(&mut *connection)
@@ -959,6 +963,7 @@ async fn apply_edge_type(
                 .unwrap_or_else(|| row.description.clone());
             let resolves = edge_type.resolves.unwrap_or(row.resolves);
             let single_outgoing = edge_type.single_outgoing.unwrap_or(row.single_outgoing);
+            let acyclic = edge_type.acyclic.unwrap_or(row.acyclic);
             let source_kinds =
                 merge_kind_list(&row.source_kinds, edge_type.source_kinds.as_deref());
             let destination_kinds = merge_kind_list(
@@ -972,7 +977,8 @@ async fn apply_edge_type(
                         row.destination_kinds.as_deref(),
                         destination_kinds.as_deref(),
                     )
-                    || row.single_outgoing != single_outgoing;
+                    || row.single_outgoing != single_outgoing
+                    || row.acyclic != acyclic;
             if contract_changed {
                 let mut violations = Vec::new();
                 if single_outgoing && !row.single_outgoing {
@@ -999,6 +1005,7 @@ async fn apply_edge_type(
             if description == row.description
                 && resolves == row.resolves
                 && single_outgoing == row.single_outgoing
+                && acyclic == row.acyclic
                 && same_kind_set(row.source_kinds.as_deref(), source_kinds.as_deref())
                 && same_kind_set(
                     row.destination_kinds.as_deref(),
@@ -1015,13 +1022,14 @@ async fn apply_edge_type(
 
             let id = sqlx::query_scalar::<_, i64>(
                 "UPDATE edge_type SET description = ?, resolves = ?, single_outgoing = ?, \
-                 source_kinds = ?, destination_kinds = ?, \
+                 acyclic = ?, source_kinds = ?, destination_kinds = ?, \
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
                  WHERE id = ? RETURNING id",
             )
             .bind(description)
             .bind(resolves)
             .bind(single_outgoing)
+            .bind(acyclic)
             .bind(source_kinds)
             .bind(destination_kinds)
             .bind(row.id)
