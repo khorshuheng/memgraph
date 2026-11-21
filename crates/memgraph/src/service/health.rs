@@ -152,10 +152,11 @@ mod tests {
                 updated_at: String::new(),
             })
             .await;
-        assert!(matches!(
-            duplicate,
-            Err(crate::repository::error::RepositoryError::UniqueConstraintViolation(_))
-        ));
+        let error = duplicate.expect_err("duplicate rejected");
+        assert!(
+            error.to_string().contains("unique"),
+            "unexpected error: {error}"
+        );
 
         let report = service.report().await.expect("report");
         let usage = report

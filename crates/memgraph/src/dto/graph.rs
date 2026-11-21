@@ -16,6 +16,13 @@ use crate::model::{
 pub struct CreateNodeKindParameters {
     pub name: String,
     pub description: String,
+    #[serde(default = "default_unique_name")]
+    #[schema(default = true)]
+    pub unique_name: bool,
+}
+
+fn default_unique_name() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -24,6 +31,7 @@ pub struct NodeKindResponse {
     pub version: i64,
     pub name: String,
     pub description: String,
+    pub unique_name: bool,
     pub properties: Vec<NodeKindPropertyResponse>,
     pub updated_at: String,
 }
@@ -52,6 +60,7 @@ impl From<CreateNodeKindParameters> for NodeKindModel {
             version: 1,
             name: params.name,
             description: params.description,
+            unique_name: params.unique_name,
             updated_at: String::new(),
         }
     }
@@ -67,6 +76,7 @@ impl NodeKindResponse {
             version: node_kind.version,
             name: node_kind.name,
             description: node_kind.description,
+            unique_name: node_kind.unique_name,
             properties,
             updated_at: node_kind.updated_at,
         }
@@ -419,6 +429,8 @@ pub struct PackNodeKindParameters {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
+    pub unique_name: Option<bool>,
+    #[serde(default)]
     pub properties: Option<Vec<PackPropertyParameters>>,
 }
 
@@ -463,6 +475,7 @@ impl From<PackNodeKindParameters> for PackNodeKind {
         PackNodeKind {
             name: params.name,
             description: params.description,
+            unique_name: params.unique_name,
             properties: params.properties.map(|properties| {
                 properties
                     .into_iter()

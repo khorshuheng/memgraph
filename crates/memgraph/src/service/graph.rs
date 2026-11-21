@@ -70,6 +70,7 @@ impl GraphService {
             node_kinds.push(PackNodeKind {
                 name: vocabulary_name(&kind.name, "node kind")?,
                 description: kind.description.clone(),
+                unique_name: kind.unique_name,
                 properties: match &kind.properties {
                     None => None,
                     Some(properties) => Some(normalize_property_declarations(properties)?),
@@ -623,13 +624,15 @@ impl GraphService {
             None
         };
 
-        let mut task_names: HashSet<&str> = HashSet::new();
-        for task in &draft.tasks {
-            if !task_names.insert(task.name.as_str()) {
-                return Err(ServiceError::UnprocessableEntity(format!(
-                    "two tasks share the name '{}'; node names are unique per kind",
-                    task.name
-                )));
+        if self.repository.node_kind_unique_name(task_kind).await? {
+            let mut task_names: HashSet<&str> = HashSet::new();
+            for task in &draft.tasks {
+                if !task_names.insert(task.name.as_str()) {
+                    return Err(ServiceError::UnprocessableEntity(format!(
+                        "two tasks share the name '{}'; node names are unique per kind",
+                        task.name
+                    )));
+                }
             }
         }
         let edge_types = self.repository.list_edge_types().await?;
@@ -749,6 +752,9 @@ impl GraphService {
         name: &str,
         own_id: i64,
     ) -> Result<(), ServiceError> {
+        if !self.repository.node_kind_unique_name(kind_id).await? {
+            return Ok(());
+        }
         if let Some(existing) = self
             .repository
             .node_id_by_natural_key(kind_id, name)
@@ -1474,6 +1480,7 @@ mod tests {
             version: 0,
             name: name.to_string(),
             description: String::new(),
+            unique_name: true,
             updated_at: String::new(),
         }
     }
@@ -3461,6 +3468,7 @@ mod tests {
         PackNodeKind {
             name: name.to_string(),
             description: description.map(str::to_string),
+            unique_name: None,
             properties: None,
         }
     }
@@ -5299,6 +5307,7 @@ mod tests {
             node_kinds: vec![PackNodeKind {
                 name: "widget".to_string(),
                 description: Some("a widget".to_string()),
+                unique_name: None,
                 properties,
             }],
             edge_types: vec![],
@@ -5494,6 +5503,7 @@ mod tests {
                 node_kinds: vec![PackNodeKind {
                     name: "task".to_string(),
                     description: None,
+                    unique_name: None,
                     properties: Some(vec![property("owner", "string", true)]),
                 }],
                 edge_types: vec![],
@@ -5560,5 +5570,230 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.nodes_skipped(), 1);
+    }
+
+    async fn set_task_unique(service: &GraphService, unique: bool) {
+        service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![PackNodeKind {
+                    name: "task".to_string(),
+                    description: None,
+                    unique_name: Some(unique),
+                    properties: None,
+                }],
+                edge_types: vec![],
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn allows_duplicate_task_names_when_the_kind_opts_out() {
+        let service = service().await;
+        set_task_unique(&service, false).await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+
+        let mut first = new_task("write tests");
+        first.parent = Some(goal);
+        let mut second = new_task("write tests");
+        second.parent = Some(goal);
+        let left = service.create_task(&first).await.unwrap();
+        let right = service.create_task(&second).await.unwrap();
+        assert_eq!(left.name, right.name);
+
+        let mut first = plan_task("a", None, &[]);
+        let mut second = plan_task("b", None, &[]);
+        first.name = "write tests".to_string();
+        second.name = "write tests".to_string();
+        let plan = service
+            .create_plan(&plan_draft(repo, vec![first, second]))
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn pack_toggles_unique_name_and_bumps_version() {
+        let service = service().await;
+        let before = service
+            .list_node_kinds()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|kind| kind.name == "task")
+            .unwrap();
+        assert!(before.unique_name);
+
+        set_task_unique(&service, false).await;
+        let after = service
+            .list_node_kinds()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|kind| kind.name == "task")
+            .unwrap();
+        assert!(!after.unique_name);
+        assert_eq!(after.version, before.version + 1);
+
+        let report = service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![PackNodeKind {
+                    name: "task".to_string(),
+                    description: None,
+                    unique_name: Some(false),
+                    properties: None,
+                }],
+                edge_types: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.unchanged(), 1);
+
+        set_task_unique(&service, true).await;
+        let restored = service
+            .list_node_kinds()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|kind| kind.name == "task")
+            .unwrap();
+        assert!(restored.unique_name);
+        assert_eq!(restored.version, before.version + 2);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_an_ambiguous_natural_key() {
+        let service = service().await;
+        set_task_unique(&service, false).await;
+        let task_kind = seeded_kind(&service, "task").await;
+        service
+            .create_node(&node(task_kind, "dup", ""), &[])
+            .await
+            .unwrap();
+        service
+            .create_node(&node(task_kind, "dup", ""), &[])
+            .await
+            .unwrap();
+
+        let error = service
+            .import_graph(&import_draft(
+                vec![import_node(None, "task", "dup")],
+                vec![],
+            ))
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("not unique"));
+    }
+
+    #[tokio::test]
+    async fn rename_skips_conflict_for_non_unique_kinds() {
+        let service = service().await;
+        service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![PackNodeKind {
+                    name: "note".to_string(),
+                    description: Some("a note".to_string()),
+                    unique_name: Some(false),
+                    properties: None,
+                }],
+                edge_types: vec![],
+            })
+            .await
+            .unwrap();
+        let kind_id = seeded_kind(&service, "note").await;
+        let first = service
+            .create_node(&node(kind_id, "same", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let second = service
+            .create_node(&node(kind_id, "other", ""), &[])
+            .await
+            .unwrap()
+            .0;
+
+        let (renamed, _) = service
+            .update_node(
+                second.id,
+                &NodePatch {
+                    name: Some("same".to_string()),
+                    ..NodePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.name, first.name);
+        assert_eq!(service.get_node(second.id).await.unwrap().name, "same");
+    }
+
+    #[tokio::test]
+    async fn tightening_unique_name_rejects_existing_duplicates() {
+        let service = service().await;
+        set_task_unique(&service, false).await;
+        let task_kind = seeded_kind(&service, "task").await;
+        service
+            .create_node(&node(task_kind, "dup", ""), &[])
+            .await
+            .unwrap();
+        service
+            .create_node(&node(task_kind, "dup", ""), &[])
+            .await
+            .unwrap();
+
+        let error = service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![PackNodeKind {
+                    name: "task".to_string(),
+                    description: None,
+                    unique_name: Some(true),
+                    properties: None,
+                }],
+                edge_types: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("duplicates"));
+
+        let kind = service
+            .list_node_kinds()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|kind| kind.name == "task")
+            .unwrap();
+        assert!(!kind.unique_name);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_natural_key_endpoint_is_rejected() {
+        let service = service().await;
+        set_task_unique(&service, false).await;
+        let task_kind = seeded_kind(&service, "task").await;
+        service
+            .create_node(&node(task_kind, "dup", ""), &[])
+            .await
+            .unwrap();
+        service
+            .create_node(&node(task_kind, "dup", ""), &[])
+            .await
+            .unwrap();
+
+        let error = service
+            .import_graph(&import_draft(
+                vec![import_node(Some("s"), "task", "source")],
+                vec![ImportEdge {
+                    source: ImportRef::Ref("s".to_string()),
+                    destination: ImportRef::NaturalKey {
+                        kind: "task".to_string(),
+                        name: "dup".to_string(),
+                    },
+                    edge_type: "depends_on".to_string(),
+                    properties: None,
+                }],
+            ))
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("not unique"));
     }
 }

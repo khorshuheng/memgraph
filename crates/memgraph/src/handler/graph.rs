@@ -632,6 +632,7 @@ mod tests {
                 version: 0,
                 name: name.to_string(),
                 description: String::new(),
+                unique_name: true,
                 updated_at: String::new(),
             })
             .await
@@ -910,6 +911,7 @@ mod tests {
             node_kinds: vec![PackNodeKindParameters {
                 name: "widget".to_string(),
                 description: Some(description.to_string()),
+                unique_name: None,
                 properties: None,
             }],
             edge_types: vec![PackEdgeTypeParameters {
@@ -1351,6 +1353,7 @@ mod tests {
                 node_kinds: vec![PackNodeKind {
                     name: "widget".to_string(),
                     description: Some("a widget".to_string()),
+                    unique_name: None,
                     properties: Some(vec![PackProperty {
                         key: "status".to_string(),
                         value_type: Some("string".to_string()),
@@ -1458,5 +1461,55 @@ mod tests {
             plan.tasks[0].node.properties,
             serde_json::json!({"owner": "task"})
         );
+    }
+
+    #[tokio::test]
+    async fn node_kind_responses_include_unique_name() {
+        let state = test_state().await;
+        state
+            .graph_service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![PackNodeKind {
+                    name: "widget".to_string(),
+                    description: Some("a widget".to_string()),
+                    unique_name: Some(false),
+                    properties: None,
+                }],
+                edge_types: vec![],
+            })
+            .await
+            .expect("apply pack");
+
+        let kinds = list_node_kinds(State(state.clone()))
+            .await
+            .expect("list node kinds");
+        let widget = kinds
+            .items
+            .iter()
+            .find(|kind| kind.name == "widget")
+            .expect("widget kind");
+        assert!(!widget.unique_name);
+    }
+
+    #[tokio::test]
+    async fn direct_kind_creation_can_opt_out_of_unique_names() {
+        let state = test_state().await;
+        let created = create_node_kind(
+            State(state.clone()),
+            Json(CreateNodeKindParameters {
+                name: "note".to_string(),
+                description: "a note".to_string(),
+                unique_name: false,
+            }),
+        )
+        .await
+        .expect("create kind")
+        .data;
+        assert!(!created.unique_name);
+
+        let defaulted: CreateNodeKindParameters =
+            serde_json::from_str(r#"{"name":"person","description":"p"}"#)
+                .expect("default deserializes");
+        assert!(defaulted.unique_name);
     }
 }

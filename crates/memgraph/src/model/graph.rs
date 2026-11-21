@@ -6,6 +6,7 @@ pub struct NodeKind {
     pub version: i64,
     pub name: String,
     pub description: String,
+    pub unique_name: bool,
     pub updated_at: String,
 }
 
@@ -259,6 +260,7 @@ pub fn validate_declared_properties(
 pub struct PackNodeKind {
     pub name: String,
     pub description: Option<String>,
+    pub unique_name: Option<bool>,
     pub properties: Option<Vec<PackProperty>>,
 }
 

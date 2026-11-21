@@ -15,7 +15,7 @@ use crate::model::{
 
 use super::error::RepositoryError;
 
-const NODE_KIND_COLUMNS: &str = "id, version, name, description, updated_at";
+const NODE_KIND_COLUMNS: &str = "id, version, name, description, unique_name, updated_at";
 const EDGE_TYPE_COLUMNS: &str = "id, name, description, resolves, single_outgoing, acyclic, source_kinds, destination_kinds, \
      updated_at";
 const NODE_COLUMNS: &str = "id, kind_id, name, description, content, updated_at";
@@ -115,6 +115,7 @@ pub trait GraphRepository: Send + Sync {
         &self,
         ids: &[i64],
     ) -> Result<HashMap<i64, String>, RepositoryError>;
+    async fn node_kind_unique_name(&self, kind_id: i64) -> Result<bool, RepositoryError>;
     async fn node_kind_properties(
         &self,
         kind_id: i64,
@@ -252,10 +253,12 @@ impl SqliteGraphRepository {
 impl GraphRepository for SqliteGraphRepository {
     async fn create_node_kind(&self, node_kind: &NodeKind) -> Result<NodeKind, RepositoryError> {
         let row = sqlx::query_as::<_, NodeKind>(&format!(
-            "INSERT INTO node_kind (name, description) VALUES (?, ?) RETURNING {NODE_KIND_COLUMNS}"
+            "INSERT INTO node_kind (name, description, unique_name) VALUES (?, ?, ?) \
+             RETURNING {NODE_KIND_COLUMNS}"
         ))
         .bind(&node_kind.name)
         .bind(&node_kind.description)
+        .bind(node_kind.unique_name)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -712,6 +715,15 @@ impl GraphRepository for SqliteGraphRepository {
         Ok(by_node)
     }
 
+    async fn node_kind_unique_name(&self, kind_id: i64) -> Result<bool, RepositoryError> {
+        let unique =
+            sqlx::query_scalar::<_, bool>("SELECT unique_name FROM node_kind WHERE id = ?")
+                .bind(kind_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(unique.unwrap_or(true))
+    }
+
     async fn node_kind_properties(
         &self,
         kind_id: i64,
@@ -1025,11 +1037,14 @@ async fn apply_node_kind(
     match existing {
         None => {
             let description = kind.description.clone().unwrap_or_default();
+            let unique_name = kind.unique_name.unwrap_or(true);
             let (id, version) = sqlx::query_as::<_, (i64, i64)>(
-                "INSERT INTO node_kind (name, description) VALUES (?, ?) RETURNING id, version",
+                "INSERT INTO node_kind (name, description, unique_name) \
+                 VALUES (?, ?, ?) RETURNING id, version",
             )
             .bind(&kind.name)
             .bind(description)
+            .bind(unique_name)
             .fetch_one(&mut *connection)
             .await?;
             if let Some(declared) = &declared {
@@ -1048,13 +1063,29 @@ async fn apply_node_kind(
                 .clone()
                 .unwrap_or_else(|| row.description.clone());
             let description_changed = description != row.description;
+            let unique_name = kind.unique_name.unwrap_or(row.unique_name);
+            let unique_changed = unique_name != row.unique_name;
+            if unique_changed && unique_name {
+                let duplicates = duplicate_kind_names(&mut *connection, row.id).await?;
+                if !duplicates.is_empty() {
+                    let names = duplicates
+                        .iter()
+                        .map(|(name, count)| format!("'{name}' x{count}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(RepositoryError::ContractViolation(format!(
+                        "node kind '{}' cannot require unique names while duplicates exist: {names}",
+                        kind.name
+                    )));
+                }
+            }
             let declarations_changed = match &declared {
                 None => false,
                 Some(declared) => {
                     load_kind_properties(&mut *connection, row.id).await? != *declared
                 }
             };
-            if !description_changed && !declarations_changed {
+            if !description_changed && !unique_changed && !declarations_changed {
                 return Ok(PackItem {
                     id: row.id,
                     name: row.name,
@@ -1071,11 +1102,13 @@ async fn apply_node_kind(
                 .await?;
             }
             let (id, version) = sqlx::query_as::<_, (i64, i64)>(
-                "UPDATE node_kind SET description = ?, version = version + 1, \
+                "UPDATE node_kind SET description = ?, unique_name = ?, \
+                 version = version + 1, \
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
                  WHERE id = ? RETURNING id, version",
             )
             .bind(description)
+            .bind(unique_name)
             .bind(row.id)
             .fetch_one(&mut *connection)
             .await?;
@@ -1101,6 +1134,20 @@ fn declared_properties(properties: &[PackProperty]) -> Vec<NodeKindProperty> {
         .collect();
     declared.sort_by(|left, right| left.key.cmp(&right.key));
     declared
+}
+
+async fn duplicate_kind_names(
+    connection: &mut SqliteConnection,
+    kind_id: i64,
+) -> Result<Vec<(String, i64)>, RepositoryError> {
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT name, count(*) FROM node WHERE kind_id = ? \
+         GROUP BY name HAVING count(*) > 1 ORDER BY name LIMIT 10",
+    )
+    .bind(kind_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    Ok(rows)
 }
 
 async fn load_kind_properties(
@@ -1470,13 +1517,22 @@ async fn import_node(
     node: &crate::model::ImportNode,
 ) -> Result<ImportNodeResult, RepositoryError> {
     let declarations = load_kind_properties(&mut *connection, kind_id).await?;
-    let existing = sqlx::query_as::<_, (i64, String, String, String)>(
-        "SELECT id, description, content, properties FROM node WHERE kind_id = ? AND name = ?",
+    let matches = sqlx::query_as::<_, (i64, String, String, String)>(
+        "SELECT id, description, content, properties FROM node WHERE kind_id = ? AND name = ? \
+         ORDER BY id",
     )
     .bind(kind_id)
     .bind(&node.name)
-    .fetch_optional(&mut *connection)
+    .fetch_all(&mut *connection)
     .await?;
+    if matches.len() > 1 {
+        return Err(RepositoryError::ContractViolation(format!(
+            "node name '{}' is not unique for its kind; import cannot choose between {} nodes",
+            node.name,
+            matches.len()
+        )));
+    }
+    let existing = matches.into_iter().next();
 
     match existing {
         None => {
@@ -1597,19 +1653,24 @@ async fn resolve_import_ref(
             ))
         }),
         ImportRef::NaturalKey { kind, name } => {
-            let id = sqlx::query_scalar::<_, i64>(
+            let rows = sqlx::query_scalar::<_, i64>(
                 "SELECT n.id FROM node n JOIN node_kind k ON k.id = n.kind_id \
-                 WHERE k.name = ? AND n.name = ? LIMIT 1",
+                 WHERE k.name = ? AND n.name = ? ORDER BY n.id LIMIT 2",
             )
             .bind(kind)
             .bind(name)
-            .fetch_optional(&mut *connection)
+            .fetch_all(&mut *connection)
             .await?;
-            id.ok_or_else(|| {
-                RepositoryError::ContractViolation(format!(
+            match rows.as_slice() {
+                [] => Err(RepositoryError::ContractViolation(format!(
                     "no node with kind '{kind}' and name '{name}'"
-                ))
-            })
+                ))),
+                [id] => Ok(*id),
+                _ => Err(RepositoryError::ContractViolation(format!(
+                    "natural key for kind '{kind}' and name '{name}' is not unique; \
+                     import cannot choose between nodes"
+                ))),
+            }
         }
     }
 }
@@ -1702,13 +1763,23 @@ async fn update_node_items(
 
     let name_changed = name != existing.name;
     if name_changed {
-        let conflict = sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM node WHERE kind_id = ? AND name = ? LIMIT 1",
-        )
-        .bind(existing.kind_id)
-        .bind(&name)
-        .fetch_optional(&mut *connection)
-        .await?;
+        let unique_name =
+            sqlx::query_scalar::<_, bool>("SELECT unique_name FROM node_kind WHERE id = ?")
+                .bind(existing.kind_id)
+                .fetch_optional(&mut *connection)
+                .await?
+                .unwrap_or(true);
+        let conflict = if unique_name {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM node WHERE kind_id = ? AND name = ? LIMIT 1",
+            )
+            .bind(existing.kind_id)
+            .bind(&name)
+            .fetch_optional(&mut *connection)
+            .await?
+        } else {
+            None
+        };
         if let Some(other) = conflict
             && other != node_id
         {
