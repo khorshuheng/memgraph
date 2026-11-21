@@ -100,11 +100,12 @@ pub struct ReachFilter {
     pub descend: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeFilter {
     pub kind: Option<String>,
     pub scope: SearchScope,
     pub reach: ReachFilter,
+    pub properties: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for NodeFilter {
@@ -113,6 +114,7 @@ impl Default for NodeFilter {
             kind: None,
             scope: SearchScope::All,
             reach: ReachFilter::default(),
+            properties: serde_json::Map::new(),
         }
     }
 }

@@ -296,6 +296,7 @@ impl GraphService {
             kind: filter.kind.clone(),
             scope: filter.scope,
             reach: self.normalize_reach(&filter.reach).await?,
+            properties: filter.properties.clone(),
         })
     }
 
@@ -726,6 +727,7 @@ impl GraphService {
         &self,
         query: Option<&str>,
         tags: &[String],
+        properties: &serde_json::Map<String, serde_json::Value>,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<SearchPage, ServiceError> {
@@ -747,7 +749,7 @@ impl GraphService {
             .clamp(1, self.search_config.max_limit);
         let offset = offset.unwrap_or(0).max(0);
         self.repository
-            .search_nodes(fts_query.as_deref(), &tags, limit, offset)
+            .search_nodes(fts_query.as_deref(), &tags, properties, limit, offset)
             .await
             .map_err(ServiceError::from)
     }
@@ -1535,7 +1537,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             service
-                .search(Some("ada lovelace"), &[], None, None)
+                .search(Some("ada lovelace"), &[], &Default::default(), None, None)
                 .await
                 .unwrap()
                 .hits
@@ -1549,7 +1551,7 @@ mod tests {
         );
         assert!(
             service
-                .search(Some("ada lovelace"), &[], None, None)
+                .search(Some("ada lovelace"), &[], &Default::default(), None, None)
                 .await
                 .unwrap()
                 .hits
@@ -2249,7 +2251,13 @@ mod tests {
         assert_eq!(neighbors[0].node.id, goal);
 
         let page = service
-            .search(Some("recalibrated widget"), &[], None, None)
+            .search(
+                Some("recalibrated widget"),
+                &[],
+                &Default::default(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(page.hits[0].node.id, created.id);
@@ -2498,6 +2506,7 @@ mod tests {
 
         let scoped = service
             .list_nodes(&NodeFilter {
+                properties: Default::default(),
                 kind: Some("task".to_string()),
                 scope: SearchScope::All,
                 reach: ReachFilter {
@@ -2516,6 +2525,7 @@ mod tests {
 
         let anchored = service
             .list_nodes(&NodeFilter {
+                properties: Default::default(),
                 kind: Some("goal".to_string()),
                 scope: SearchScope::All,
                 reach: ReachFilter {
@@ -2543,6 +2553,7 @@ mod tests {
         assert!(matches!(
             service
                 .list_nodes(&NodeFilter {
+                    properties: Default::default(),
                     kind: None,
                     scope: SearchScope::All,
                     reach: ReachFilter {
@@ -2557,6 +2568,7 @@ mod tests {
         assert!(matches!(
             service
                 .list_nodes(&NodeFilter {
+                    properties: Default::default(),
                     kind: None,
                     scope: SearchScope::All,
                     reach: ReachFilter {
@@ -2571,6 +2583,7 @@ mod tests {
         assert!(matches!(
             service
                 .list_nodes(&NodeFilter {
+                    properties: Default::default(),
                     kind: None,
                     scope: SearchScope::All,
                     reach: ReachFilter {
@@ -2585,6 +2598,7 @@ mod tests {
         assert!(matches!(
             service
                 .list_nodes(&NodeFilter {
+                    properties: Default::default(),
                     kind: None,
                     scope: SearchScope::All,
                     reach: ReachFilter {
@@ -2599,6 +2613,7 @@ mod tests {
         assert!(matches!(
             service
                 .list_nodes(&NodeFilter {
+                    properties: Default::default(),
                     kind: Some("nope".to_string()),
                     scope: SearchScope::All,
                     reach: ReachFilter::default(),
@@ -2620,6 +2635,7 @@ mod tests {
             .unwrap();
 
         let filter = |scope| NodeFilter {
+            properties: Default::default(),
             kind: Some("task".to_string()),
             scope,
             reach: ReachFilter {
@@ -2901,6 +2917,7 @@ mod tests {
 
         let anchored_once = service
             .list_nodes(&NodeFilter {
+                properties: Default::default(),
                 kind: Some("goal".to_string()),
                 scope: SearchScope::All,
                 reach: ReachFilter {
@@ -3193,7 +3210,13 @@ mod tests {
             .0;
 
         let page = service
-            .search(Some("pioneer computing"), &[], None, None)
+            .search(
+                Some("pioneer computing"),
+                &[],
+                &Default::default(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let ids: Vec<i64> = page.hits.iter().map(|hit| hit.node.id).collect();
@@ -3224,7 +3247,13 @@ mod tests {
             .unwrap();
 
         let page = service
-            .search(None, &["alpha".to_string(), "beta".to_string()], None, None)
+            .search(
+                None,
+                &["alpha".to_string(), "beta".to_string()],
+                &Default::default(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(page.total, 1);
@@ -3232,7 +3261,13 @@ mod tests {
         assert_eq!(page.hits[0].tags, vec!["alpha", "beta"]);
 
         let combined = service
-            .search(Some("shared"), &["alpha".to_string()], Some(1), Some(0))
+            .search(
+                Some("shared"),
+                &["alpha".to_string()],
+                &Default::default(),
+                Some(1),
+                Some(0),
+            )
             .await
             .unwrap();
         assert_eq!(combined.total, 2);
@@ -3245,11 +3280,15 @@ mod tests {
     async fn search_rejects_an_empty_query_without_tags() {
         let service = service().await;
         assert!(matches!(
-            service.search(Some("   "), &[], None, None).await,
+            service
+                .search(Some("   "), &[], &Default::default(), None, None)
+                .await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
         assert!(matches!(
-            service.search(None, &[], None, None).await,
+            service
+                .search(None, &[], &Default::default(), None, None)
+                .await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
     }
@@ -3278,7 +3317,7 @@ mod tests {
             .0;
         assert_eq!(
             service
-                .search(Some("pioneer"), &[], None, None)
+                .search(Some("pioneer"), &[], &Default::default(), None, None)
                 .await
                 .unwrap()
                 .total,
@@ -3291,14 +3330,14 @@ mod tests {
 
         assert_eq!(
             service
-                .search(Some("pioneer"), &[], None, None)
+                .search(Some("pioneer"), &[], &Default::default(), None, None)
                 .await
                 .unwrap()
                 .total,
             0
         );
         let page = service
-            .search(Some("logician"), &[], None, None)
+            .search(Some("logician"), &[], &Default::default(), None, None)
             .await
             .unwrap();
         assert_eq!(page.total, 1);
@@ -4575,6 +4614,7 @@ mod tests {
 
         let named: Vec<String> = service
             .list_nodes(&NodeFilter {
+                properties: Default::default(),
                 kind: Some("person".to_string()),
                 ..NodeFilter::default()
             })
@@ -4723,5 +4763,118 @@ mod tests {
                 .await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
+    }
+
+    fn property_filter(value: serde_json::Value) -> NodeFilter {
+        let properties = match value {
+            serde_json::Value::Object(map) => map,
+            _ => panic!("property filter must be an object"),
+        };
+        NodeFilter {
+            properties,
+            ..NodeFilter::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn filters_nodes_by_property_values() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let verified = serde_json::json!({
+            "status": "verified",
+            "confidence": 0.9,
+            "retried": true,
+            "note": null,
+            "scopes": ["a", "b"]
+        });
+        let first = service
+            .create_node_with_properties(
+                &described_node(kind_id, "verified", "portable database"),
+                &[],
+                Some(&verified),
+            )
+            .await
+            .unwrap()
+            .0;
+        let second = service
+            .create_node_with_properties(
+                &described_node(kind_id, "draft", "portable notes"),
+                &[],
+                Some(&serde_json::json!({"status": "draft", "confidence": 0.4})),
+            )
+            .await
+            .unwrap()
+            .0;
+        service
+            .create_node(&described_node(kind_id, "plain", "portable"), &[])
+            .await
+            .unwrap();
+
+        let ids = |filter: NodeFilter| {
+            let service = service.clone();
+            async move {
+                service
+                    .list_nodes(&filter)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|node| node.id)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        assert_eq!(
+            ids(property_filter(serde_json::json!({"status": "verified"}))).await,
+            vec![first.id]
+        );
+        assert_eq!(
+            ids(property_filter(serde_json::json!({"confidence": 0.9}))).await,
+            vec![first.id]
+        );
+        assert_eq!(
+            ids(property_filter(serde_json::json!({"retried": true}))).await,
+            vec![first.id]
+        );
+        assert_eq!(
+            ids(property_filter(serde_json::json!({"note": null}))).await,
+            vec![first.id]
+        );
+        assert_eq!(
+            ids(property_filter(serde_json::json!({"scopes": ["a", "b"]}))).await,
+            vec![first.id]
+        );
+        assert!(
+            ids(property_filter(serde_json::json!({"missing": "x"})))
+                .await
+                .is_empty()
+        );
+        assert!(
+            ids(property_filter(
+                serde_json::json!({"status": "draft", "confidence": 0.9})
+            ))
+            .await
+            .is_empty()
+        );
+        assert_eq!(
+            ids(property_filter(serde_json::json!({"status": "draft"}))).await,
+            vec![second.id]
+        );
+
+        let mut with_kind = property_filter(serde_json::json!({"status": "verified"}));
+        with_kind.kind = Some("person".to_string());
+        assert_eq!(ids(with_kind).await, vec![first.id]);
+
+        let found = service
+            .search(
+                Some("portable"),
+                &[],
+                &property_filter(serde_json::json!({"status": "draft"})).properties,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.total, 1);
+        assert_eq!(found.hits[0].node.id, second.id);
     }
 }

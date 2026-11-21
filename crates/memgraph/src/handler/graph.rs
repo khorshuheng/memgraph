@@ -207,7 +207,12 @@ pub async fn list_nodes(
     State(state): State<AppState>,
     Query(params): Query<ListNodesParameters>,
 ) -> Result<ApiList<NodeResponse>, ApiError> {
-    let filter: NodeFilter = params.into();
+    let properties = params.property_filter().map_err(|message| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        message,
+    })?;
+    let mut filter: NodeFilter = params.into();
+    filter.properties = properties;
     let nodes = state.graph_service.list_nodes(&filter).await?;
     let ids: Vec<i64> = nodes.iter().map(|node| node.id).collect();
     let mut tags = state.graph_service.node_tags_for_ids(&ids).await?;
@@ -455,9 +460,19 @@ pub async fn search(
     Query(params): Query<SearchParameters>,
 ) -> Result<ApiSuccess<SearchResponse>, ApiError> {
     let tags = params.tag_list();
+    let properties = params.property_filter().map_err(|message| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        message,
+    })?;
     let page = state
         .graph_service
-        .search(params.q.as_deref(), &tags, params.limit, params.offset)
+        .search(
+            params.q.as_deref(),
+            &tags,
+            &properties,
+            params.limit,
+            params.offset,
+        )
         .await?;
     let hit_ids: Vec<i64> = page.hits.iter().map(|hit| hit.node.id).collect();
     let mut properties = state
@@ -615,6 +630,7 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                properties: None,
             }),
         )
         .await
@@ -672,6 +688,7 @@ mod tests {
             SearchParameters {
                 q: Some("refresh rotation".to_string()),
                 tags: None,
+                properties: None,
                 limit: None,
                 offset: None,
             },
@@ -696,6 +713,7 @@ mod tests {
             SearchParameters {
                 q: None,
                 tags: Some("alpha,beta".to_string()),
+                properties: None,
                 limit: None,
                 offset: None,
             },
@@ -710,6 +728,7 @@ mod tests {
             SearchParameters {
                 q: Some("shared".to_string()),
                 tags: Some("alpha".to_string()),
+                properties: None,
                 limit: None,
                 offset: None,
             },
@@ -732,6 +751,7 @@ mod tests {
             SearchParameters {
                 q: Some("paged".to_string()),
                 tags: None,
+                properties: None,
                 limit: Some(2),
                 offset: Some(1),
             },
@@ -748,6 +768,7 @@ mod tests {
             SearchParameters {
                 q: Some("paged".to_string()),
                 tags: None,
+                properties: None,
                 limit: Some(10_000),
                 offset: None,
             },
@@ -765,6 +786,7 @@ mod tests {
             SearchParameters {
                 q: Some("   ".to_string()),
                 tags: None,
+                properties: None,
                 limit: None,
                 offset: None,
             },
@@ -983,6 +1005,7 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                properties: None,
             }),
         )
         .await
@@ -997,6 +1020,7 @@ mod tests {
             Query(SearchParameters {
                 q: Some("portable".to_string()),
                 tags: None,
+                properties: None,
                 limit: None,
                 offset: None,
             }),
@@ -1007,5 +1031,83 @@ mod tests {
             found.data.items[0].node.properties,
             serde_json::json!({"status": "verified"})
         );
+    }
+
+    #[tokio::test]
+    async fn filters_list_and_search_by_properties_over_http() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "decision").await;
+        create_node(
+            State(state.clone()),
+            Json(CreateNodeParameters {
+                kind_id: kind,
+                name: "verified".to_string(),
+                description: "portable database".to_string(),
+                content: String::new(),
+                tags: vec![],
+                properties: Some(serde_json::json!({"status": "verified"})),
+            }),
+        )
+        .await
+        .expect("create verified");
+        create_node(
+            State(state.clone()),
+            Json(CreateNodeParameters {
+                kind_id: kind,
+                name: "draft".to_string(),
+                description: "portable notes".to_string(),
+                content: String::new(),
+                tags: vec![],
+                properties: Some(serde_json::json!({"status": "draft"})),
+            }),
+        )
+        .await
+        .expect("create draft");
+
+        let listed = list_nodes(
+            State(state.clone()),
+            Query(ListNodesParameters {
+                kind: None,
+                scope: None,
+                within: None,
+                via: None,
+                descend: None,
+                properties: Some(r#"{"status":"verified"}"#.to_string()),
+            }),
+        )
+        .await
+        .expect("filtered list");
+        assert_eq!(listed.items.len(), 1);
+        assert_eq!(listed.items[0].name, "verified");
+
+        let found = search(
+            State(state.clone()),
+            Query(SearchParameters {
+                q: Some("portable".to_string()),
+                tags: None,
+                properties: Some(r#"{"status":"draft"}"#.to_string()),
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("filtered search");
+        assert_eq!(found.data.items.len(), 1);
+        assert_eq!(found.data.items[0].node.name, "draft");
+
+        let error = list_nodes(
+            State(state.clone()),
+            Query(ListNodesParameters {
+                kind: None,
+                scope: None,
+                within: None,
+                via: None,
+                descend: None,
+                properties: Some("[1]".to_string()),
+            }),
+        )
+        .await
+        .expect_err("non-object filter");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

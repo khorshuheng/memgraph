@@ -343,6 +343,13 @@ pub struct ListNodesParameters {
     pub within: Option<i64>,
     pub via: Option<String>,
     pub descend: Option<String>,
+    pub properties: Option<String>,
+}
+
+impl ListNodesParameters {
+    pub fn property_filter(&self) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+        parse_property_filter(self.properties.as_deref())
+    }
 }
 
 impl From<ListNodesParameters> for NodeFilter {
@@ -355,6 +362,7 @@ impl From<ListNodesParameters> for NodeFilter {
                 via: params.via,
                 descend: params.descend,
             },
+            properties: serde_json::Map::new(),
         }
     }
 }
@@ -662,6 +670,7 @@ impl From<ImportReport> for ImportReportResponse {
 pub struct SearchParameters {
     pub q: Option<String>,
     pub tags: Option<String>,
+    pub properties: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -672,6 +681,24 @@ impl SearchParameters {
             .as_deref()
             .map(|tags| tags.split(',').map(str::to_string).collect())
             .unwrap_or_default()
+    }
+
+    pub fn property_filter(&self) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+        parse_property_filter(self.properties.as_deref())
+    }
+}
+
+fn parse_property_filter(
+    raw: Option<&str>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let Some(raw) = raw else {
+        return Ok(serde_json::Map::new());
+    };
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("properties must be a JSON object: {error}"))?;
+    match value {
+        serde_json::Value::Object(map) => Ok(map),
+        _ => Err("properties must be a JSON object".to_string()),
     }
 }
 

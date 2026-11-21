@@ -8,8 +8,8 @@ use crate::model::{
     Edge, EdgeType, EdgeTypeUsage, ImportConflict, ImportDraft, ImportEdgeResult, ImportNodeResult,
     ImportRef, ImportReport, ImportStatus, IsolatedNode, KindUsage, Neighbor, NeighborDirection,
     Node, NodeFilter, NodeKind, NodePatch, NodeRef, PackDraft, PackEdgeType, PackItem,
-    PackNodeKind, PackReport, PackStatus, PendingEdge, RelationDirection, SearchHit, SearchPage,
-    SearchScope, TagUsage, encode_kind_list, split_kind_list,
+    PackNodeKind, PackReport, PackStatus, PendingEdge, ReachFilter, RelationDirection, SearchHit,
+    SearchPage, SearchScope, TagUsage, encode_kind_list, split_kind_list,
 };
 
 use super::error::RepositoryError;
@@ -30,16 +30,6 @@ const INCOMING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id
     WHERE e.destination = ? \
       AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
     ORDER BY e.edge_type_id, e.source";
-const REACH_CTE: &str = "WITH RECURSIVE reach(id) AS ( \
-    SELECT e.source FROM edge e WHERE e.destination = ? \
-      AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
-    UNION \
-    SELECT e.destination FROM edge e WHERE e.source = ? \
-      AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
-    UNION \
-    SELECT e.source FROM edge e JOIN reach r ON e.destination = r.id \
-      WHERE e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?) \
-  ) ";
 const ANCHORED_CTE: &str = "WITH RECURSIVE anchored(id) AS ( \
     SELECT e.source FROM edge e \
       WHERE e.edge_type_id = (SELECT id FROM edge_type WHERE name = 'belongs_to') \
@@ -137,6 +127,7 @@ pub trait GraphRepository: Send + Sync {
         &self,
         query: Option<&str>,
         tags: &[String],
+        properties: &serde_json::Map<String, serde_json::Value>,
         limit: i64,
         offset: i64,
     ) -> Result<SearchPage, RepositoryError>;
@@ -442,37 +433,26 @@ impl GraphRepository for SqliteGraphRepository {
 
     async fn list_nodes(&self, filter: &NodeFilter) -> Result<Vec<Node>, RepositoryError> {
         let scope = scope_clause(filter.scope);
-        let rows = if filter.reach.within.is_some() {
-            let sql = format!(
-                "{REACH_CTE}SELECT {NODE_COLUMNS} FROM node n \
-                 WHERE n.id IN (SELECT id FROM reach) \
-                   AND (? IS NULL OR n.kind_id = (SELECT id FROM node_kind WHERE name = ?)){scope} \
-                 ORDER BY n.id"
-            );
-            sqlx::query_as::<_, Node>(&sql)
-                .bind(filter.reach.within)
-                .bind(filter.reach.via.clone())
-                .bind(filter.reach.via.clone())
-                .bind(filter.reach.within)
-                .bind(filter.reach.via.clone())
-                .bind(filter.reach.via.clone())
-                .bind(filter.reach.descend.clone())
-                .bind(filter.kind.clone())
-                .bind(filter.kind.clone())
-                .fetch_all(&self.pool)
-                .await?
-        } else {
-            let sql = format!(
-                "SELECT {NODE_COLUMNS} FROM node n \
-                 WHERE (? IS NULL OR n.kind_id = (SELECT id FROM node_kind WHERE name = ?)){scope} \
-                 ORDER BY n.id"
-            );
-            sqlx::query_as::<_, Node>(&sql)
-                .bind(filter.kind.clone())
-                .bind(filter.kind.clone())
-                .fetch_all(&self.pool)
-                .await?
-        };
+        let mut builder = QueryBuilder::new("");
+        if filter.reach.within.is_some() {
+            push_reach_cte(&mut builder, &filter.reach);
+        }
+        builder.push(format!("SELECT {NODE_COLUMNS} FROM node n WHERE "));
+        if filter.reach.within.is_some() {
+            builder.push("n.id IN (SELECT id FROM reach) AND ");
+        }
+        builder.push("(");
+        builder.push_bind(filter.kind.clone());
+        builder.push(" IS NULL OR n.kind_id = (SELECT id FROM node_kind WHERE name = ");
+        builder.push_bind(filter.kind.clone());
+        builder.push("))");
+        builder.push(scope);
+        push_property_filters(&mut builder, &filter.properties);
+        builder.push(" ORDER BY n.id");
+        let rows = builder
+            .build_query_as::<Node>()
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 
@@ -665,6 +645,7 @@ impl GraphRepository for SqliteGraphRepository {
         &self,
         query: Option<&str>,
         tags: &[String],
+        properties: &serde_json::Map<String, serde_json::Value>,
         limit: i64,
         offset: i64,
     ) -> Result<SearchPage, RepositoryError> {
@@ -675,6 +656,7 @@ impl GraphRepository for SqliteGraphRepository {
             );
             builder.push_bind(fts_query);
             push_tag_filter(&mut builder, tags);
+            push_property_filters(&mut builder, properties);
             builder
                 .build_query_scalar::<i64>()
                 .fetch_one(&self.pool)
@@ -682,6 +664,7 @@ impl GraphRepository for SqliteGraphRepository {
         } else {
             let mut builder = QueryBuilder::new("SELECT count(*) FROM node n WHERE 1 = 1");
             push_tag_filter(&mut builder, tags);
+            push_property_filters(&mut builder, properties);
             builder
                 .build_query_scalar::<i64>()
                 .fetch_one(&self.pool)
@@ -696,6 +679,7 @@ impl GraphRepository for SqliteGraphRepository {
             );
             builder.push_bind(fts_query);
             push_tag_filter(&mut builder, tags);
+            push_property_filters(&mut builder, properties);
             builder.push(" ORDER BY score, n.id LIMIT ");
             builder.push_bind(limit);
             builder.push(" OFFSET ");
@@ -710,6 +694,7 @@ impl GraphRepository for SqliteGraphRepository {
                  0.0 AS score FROM node n WHERE 1 = 1",
             );
             push_tag_filter(&mut builder, tags);
+            push_property_filters(&mut builder, properties);
             builder.push(" ORDER BY n.updated_at DESC, n.id DESC LIMIT ");
             builder.push_bind(limit);
             builder.push(" OFFSET ");
@@ -1563,6 +1548,80 @@ fn tags_equal(current: &[String], proposed: &[String]) -> bool {
     current.sort();
     proposed.sort();
     current == proposed
+}
+
+fn push_property_filters(
+    builder: &mut QueryBuilder<Sqlite>,
+    properties: &serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, value) in properties {
+        let path = property_path(key);
+        match value {
+            serde_json::Value::Null => {
+                builder.push(" AND json_type(n.properties, ");
+                builder.push_bind(path);
+                builder.push(") = 'null'");
+            }
+            serde_json::Value::Bool(value) => {
+                builder.push(" AND json_extract(n.properties, ");
+                builder.push_bind(path);
+                builder.push(") = ");
+                builder.push_bind(if *value { 1i64 } else { 0i64 });
+            }
+            serde_json::Value::Number(number) => {
+                builder.push(" AND json_extract(n.properties, ");
+                builder.push_bind(path);
+                builder.push(") = ");
+                if let Some(integer) = number.as_i64() {
+                    builder.push_bind(integer);
+                } else {
+                    builder.push_bind(number.as_f64().unwrap_or_default());
+                }
+            }
+            serde_json::Value::String(value) => {
+                builder.push(" AND json_extract(n.properties, ");
+                builder.push_bind(path);
+                builder.push(") = ");
+                builder.push_bind(value.clone());
+            }
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                builder.push(" AND json_extract(n.properties, ");
+                builder.push_bind(path);
+                builder.push(") = json(");
+                builder.push_bind(serde_json::to_string(value).unwrap_or_default());
+                builder.push(")");
+            }
+        }
+    }
+}
+
+fn property_path(key: &str) -> String {
+    let escaped = key.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("$.\"{escaped}\"")
+}
+
+fn push_reach_cte(builder: &mut QueryBuilder<Sqlite>, reach: &ReachFilter) {
+    builder.push(
+        "WITH RECURSIVE reach(id) AS ( \
+         SELECT e.source FROM edge e WHERE e.destination = ",
+    );
+    builder.push_bind(reach.within);
+    builder.push(" AND (");
+    builder.push_bind(reach.via.clone());
+    builder.push(" IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ");
+    builder.push_bind(reach.via.clone());
+    builder.push(")) UNION SELECT e.destination FROM edge e WHERE e.source = ");
+    builder.push_bind(reach.within);
+    builder.push(" AND (");
+    builder.push_bind(reach.via.clone());
+    builder.push(" IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ");
+    builder.push_bind(reach.via.clone());
+    builder.push(
+        ")) UNION SELECT e.source FROM edge e JOIN reach r ON e.destination = r.id \
+         WHERE e.edge_type_id = (SELECT id FROM edge_type WHERE name = ",
+    );
+    builder.push_bind(reach.descend.clone());
+    builder.push(")) ");
 }
 
 fn push_tag_filter(builder: &mut QueryBuilder<Sqlite>, tags: &[String]) {
