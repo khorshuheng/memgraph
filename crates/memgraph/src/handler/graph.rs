@@ -13,14 +13,14 @@ use crate::{
             ImportReportResponse, ListNodesParameters, NeighborParameters, NeighborResponse,
             NodeKindResponse, NodeResponse, PackReportResponse, PlanResponse,
             ReplaceTagsParameters, SearchHitResponse, SearchParameters, SearchResponse,
-            TagUsageResponse, UpdateTaskParameters,
+            TagUsageResponse, UpdateNodeParameters, UpdateTaskParameters,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
     },
     model::{
-        Edge, EdgeType, ImportDraft, Node, NodeFilter, NodeKind, PackDraft, PlanDraft, TaskDraft,
-        TaskPatch,
+        Edge, EdgeType, ImportDraft, Node, NodeFilter, NodeKind, NodePatch, PackDraft, PlanDraft,
+        TaskDraft, TaskPatch,
     },
     state::AppState,
 };
@@ -252,6 +252,32 @@ pub async fn get_node(
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let node = state.graph_service.get_node(node_id).await?;
     let tags = state.graph_service.node_tags(node_id).await?;
+    Ok(ApiSuccess {
+        status: StatusCode::OK,
+        data: NodeResponse::with_tags(node, tags),
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    patch,
+    path = "/nodes/{node_id}",
+    request_body = UpdateNodeParameters,
+    params(("node_id" = i64, Path, description = "Node id")),
+    responses(
+        (status = 200, description = "Node updated", body = NodeResponse),
+        (status = 404, description = "Node not found"),
+        (status = 409, description = "Another node already uses that name"),
+        (status = 422, description = "Empty or invalid patch")
+    )
+)]
+pub async fn update_node(
+    State(state): State<AppState>,
+    Path(node_id): Path<i64>,
+    Json(params): Json<UpdateNodeParameters>,
+) -> Result<ApiSuccess<NodeResponse>, ApiError> {
+    let patch: NodePatch = params.into();
+    let (node, tags) = state.graph_service.update_node(node_id, &patch).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
         data: NodeResponse::with_tags(node, tags),
@@ -823,5 +849,42 @@ mod tests {
         assert_eq!(second.nodes_created, 0);
         assert_eq!(second.nodes_unchanged, 1);
         assert_eq!(second.nodes[0].id, first.nodes[0].id);
+    }
+
+    #[test]
+    fn update_node_rejects_unknown_fields() {
+        assert!(serde_json::from_str::<UpdateNodeParameters>(r#"{"kind_id":1}"#).is_err());
+        assert!(serde_json::from_str::<UpdateNodeParameters>(r#"{"description":"x"}"#).is_ok());
+    }
+
+    #[tokio::test]
+    async fn updates_a_node_over_http() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "decision").await;
+        let node = new_node(&state, kind, "first", "original", "body", &["one"]).await;
+
+        let updated = update_node(
+            State(state.clone()),
+            Path(node.id),
+            Json(UpdateNodeParameters {
+                name: Some("second".to_string()),
+                description: Some("changed".to_string()),
+                content: None,
+                tags: Some(vec!["Two".to_string()]),
+            }),
+        )
+        .await
+        .expect("update")
+        .data;
+        assert_eq!(updated.name, "second");
+        assert_eq!(updated.description, "changed");
+        assert_eq!(updated.content, "body");
+        assert_eq!(updated.tags, vec!["two"]);
+
+        let fetched = get_node(State(state.clone()), Path(node.id))
+            .await
+            .expect("get node")
+            .data;
+        assert_eq!(fetched.name, "second");
     }
 }

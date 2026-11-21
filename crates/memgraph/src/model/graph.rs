@@ -404,6 +404,23 @@ pub struct TaskDraft {
     pub affects: Vec<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NodePatch {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub content: Option<String>,
+    pub tags: Option<Vec<String>>,
+}
+
+impl NodePatch {
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.description.is_none()
+            && self.content.is_none()
+            && self.tags.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPatch {
     pub name: Option<String>,

@@ -5,7 +5,7 @@ use crate::{
     config::SearchConfig,
     model::{
         Edge, EdgeType, ImportDraft, ImportEdge, ImportNode, ImportRef, ImportReport, Neighbor,
-        NeighborDirection, Node, NodeFilter, NodeKind, NodeRef, PackDraft, PackEdgeType,
+        NeighborDirection, Node, NodeFilter, NodeKind, NodePatch, NodeRef, PackDraft, PackEdgeType,
         PackNodeKind, PackReport, PendingEdge, Plan, PlanDraft, PlanTask, PlanTaskDraft,
         ReachFilter, SearchPage, TagUsage, TaskDraft, TaskPatch,
     },
@@ -217,6 +217,34 @@ impl GraphService {
         }
     }
 
+    pub async fn update_node(
+        &self,
+        node_id: i64,
+        patch: &NodePatch,
+    ) -> Result<(Node, Vec<String>), ServiceError> {
+        let node = self.get_node(node_id).await?;
+        if patch.is_empty() {
+            return Err(ServiceError::UnprocessableEntity(
+                "provide at least one of name, description, content or tags".to_string(),
+            ));
+        }
+        let mut normalized = patch.clone();
+        if let Some(name) = &normalized.name {
+            normalized.name = Some(node_name(name)?);
+        }
+        if let Some(tags) = &normalized.tags {
+            normalized.tags = Some(normalize_tags(tags)?);
+        }
+        if let Some(name) = &normalized.name {
+            self.require_available_name(node.kind_id, name, node_id)
+                .await?;
+        }
+        self.repository
+            .update_node(node_id, &normalized)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn delete_node(&self, id: i64) -> Result<(), ServiceError> {
         match self.repository.delete_node(id).await {
             Ok(true) => Ok(()),
@@ -403,24 +431,18 @@ impl GraphService {
                 "node {task_id} is not a task"
             )));
         }
-        let name = match &patch.name {
-            Some(name) => node_name(name)?,
-            None => node.name.clone(),
-        };
-        self.require_available_name(task_kind, &name, node.id)
+        let (updated, _) = self
+            .update_node(
+                task_id,
+                &NodePatch {
+                    name: patch.name.clone(),
+                    description: patch.description.clone(),
+                    content: patch.content.clone(),
+                    tags: None,
+                },
+            )
             .await?;
-        let updated = Node {
-            id: node.id,
-            kind_id: node.kind_id,
-            name,
-            description: patch.description.clone().unwrap_or(node.description),
-            content: patch.content.clone().unwrap_or(node.content),
-            updated_at: String::new(),
-        };
-        self.repository
-            .upsert_node(&updated)
-            .await
-            .map_err(ServiceError::from)
+        Ok(updated)
     }
 
     pub async fn create_task(&self, draft: &TaskDraft) -> Result<Node, ServiceError> {
@@ -3435,6 +3457,7 @@ mod tests {
             .expect("failed to create database connection pool");
         migrate(&pool).await.expect("failed to migrate database");
         let repository: Arc<dyn GraphRepository> = Arc::new(SqliteGraphRepository::new(pool));
+        crate::test_support::seed_vocabulary(&repository).await;
         GraphService::new(repository, crate::config::SearchConfig::default())
     }
 
@@ -3747,10 +3770,6 @@ mod tests {
             std::process::id()
         ));
         let service = file_service(&path).await;
-        service
-            .create_node_kind(&node_kind("decision"))
-            .await
-            .unwrap();
         let mut decision = import_node(Some("d"), "decision", "shared");
         decision.description = Some("shared context".to_string());
         let draft = import_draft(vec![decision], vec![]);
@@ -3950,5 +3969,362 @@ mod tests {
                 .await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn updates_a_non_task_node_and_keeps_tags() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let (node, _) = service
+            .create_node(
+                &described_node(kind_id, "Ada", "first"),
+                &["Math".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let (updated, tags) = service
+            .update_node(
+                node.id,
+                &NodePatch {
+                    description: Some("second".to_string()),
+                    content: Some("body".to_string()),
+                    ..NodePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.id, node.id);
+        assert_eq!(updated.kind_id, kind_id);
+        assert_eq!(updated.name, "Ada");
+        assert_eq!(updated.description, "second");
+        assert_eq!(updated.content, "body");
+        assert_eq!(tags, vec!["math"]);
+        assert_ne!(updated.updated_at, node.updated_at);
+    }
+
+    #[tokio::test]
+    async fn renames_a_node_and_keeps_its_edges() {
+        let service = service().await;
+        let goal_kind = seeded_kind(&service, "goal").await;
+        let task_kind = seeded_kind(&service, "task").await;
+        let goal = service
+            .create_node(&node(goal_kind, "goal", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let task = service
+            .create_node(&node(task_kind, "task", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let part_of = seeded_edge_type(&service, "part_of").await;
+        service
+            .add_edge(&Edge {
+                source: task.id,
+                destination: goal.id,
+                edge_type_id: part_of,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let (renamed, _) = service
+            .update_node(
+                task.id,
+                &NodePatch {
+                    name: Some("renamed task".to_string()),
+                    ..NodePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.name, "renamed task");
+
+        let neighbors = service
+            .neighbors(task.id, NeighborDirection::Outgoing, None)
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].node.id, goal.id);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_rename_to_an_existing_name() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let first = service
+            .create_node(&node(kind_id, "Ada", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let second = service
+            .create_node(&node(kind_id, "Bob", ""), &[])
+            .await
+            .unwrap()
+            .0;
+
+        let error = service
+            .update_node(
+                second.id,
+                &NodePatch {
+                    name: Some("Ada".to_string()),
+                    ..NodePatch::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Conflict(_)));
+        assert_eq!(service.get_node(second.id).await.unwrap().name, "Bob");
+        assert_eq!(service.get_node(first.id).await.unwrap().name, "Ada");
+    }
+
+    #[tokio::test]
+    async fn replaces_and_clears_tags_through_update() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let (node, _) = service
+            .create_node(&node(kind_id, "Ada", ""), &["one".to_string()])
+            .await
+            .unwrap();
+
+        let (_, tags) = service
+            .update_node(
+                node.id,
+                &NodePatch {
+                    tags: Some(vec!["Two".to_string()]),
+                    ..NodePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(tags, vec!["two"]);
+
+        let (_, tags) = service
+            .update_node(
+                node.id,
+                &NodePatch {
+                    tags: Some(vec![]),
+                    ..NodePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(tags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_or_missing_node_updates() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let existing = service
+            .create_node(&node(kind_id, "Ada", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        assert!(matches!(
+            service
+                .update_node(existing.id, &NodePatch::default())
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+        assert!(matches!(
+            service
+                .update_node(
+                    9999,
+                    &NodePatch {
+                        description: Some("x".to_string()),
+                        ..NodePatch::default()
+                    }
+                )
+                .await,
+            Err(ServiceError::EntityNotFound)
+        ));
+        assert!(matches!(
+            service.update_node(9999, &NodePatch::default()).await,
+            Err(ServiceError::EntityNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tag_only_update_bumps_updated_at() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let (node, _) = service
+            .create_node(&node(kind_id, "Ada", ""), &["one".to_string()])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let (updated, tags) = service
+            .update_node(
+                node.id,
+                &NodePatch {
+                    tags: Some(vec!["two".to_string()]),
+                    ..NodePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(tags, vec!["two"]);
+        assert_ne!(updated.updated_at, node.updated_at);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_task_rename_and_patch_preserve_both_fields() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "memgraph-task-update-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let service = file_service(&path).await;
+        let repo_kind = seeded_kind(&service, "repo").await;
+        let goal_kind = seeded_kind(&service, "goal").await;
+        let task_kind = seeded_kind(&service, "task").await;
+        let part_of = seeded_edge_type(&service, "part_of").await;
+        let repo = service
+            .create_node(&node(repo_kind, "acme/widget", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let goal = service
+            .create_node(&node(goal_kind, "race goal", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let task = service
+            .create_node(&node(task_kind, "race task 0", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        service
+            .add_edge(&Edge {
+                source: task.id,
+                destination: goal.id,
+                edge_type_id: part_of,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+        let _ = repo;
+
+        for index in 0..20 {
+            let name = format!("race task {index}");
+            let description = format!("version-{index}");
+            let left = {
+                let service = service.clone();
+                let name = name.clone();
+                tokio::spawn(async move {
+                    service
+                        .update_task(
+                            task.id,
+                            &TaskPatch {
+                                name: Some(name),
+                                description: None,
+                                content: None,
+                            },
+                        )
+                        .await
+                })
+            };
+            let right = {
+                let service = service.clone();
+                let description = description.clone();
+                tokio::spawn(async move {
+                    service
+                        .update_node(
+                            task.id,
+                            &NodePatch {
+                                description: Some(description),
+                                ..NodePatch::default()
+                            },
+                        )
+                        .await
+                })
+            };
+            left.await.unwrap().expect("task rename");
+            right.await.unwrap().expect("node patch");
+
+            let current = service.get_node(task.id).await.unwrap();
+            assert_eq!(current.name, name);
+            assert_eq!(current.description, description);
+        }
+
+        drop(service);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_renames_to_the_same_name_conflict() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "memgraph-update-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let service = file_service(&path).await;
+        service
+            .create_node_kind(&node_kind("person"))
+            .await
+            .unwrap();
+        let kind_id = seeded_kind(&service, "person").await;
+        let first = service
+            .create_node(&node(kind_id, "first", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let second = service
+            .create_node(&node(kind_id, "second", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let patch = NodePatch {
+            name: Some("winner".to_string()),
+            ..NodePatch::default()
+        };
+
+        let left = {
+            let service = service.clone();
+            let patch = patch.clone();
+            tokio::spawn(async move { service.update_node(first.id, &patch).await })
+        };
+        let right = {
+            let service = service.clone();
+            let patch = patch.clone();
+            tokio::spawn(async move { service.update_node(second.id, &patch).await })
+        };
+        let left = left.await.unwrap();
+        let right = right.await.unwrap();
+        let wins = [left.is_ok(), right.is_ok()]
+            .iter()
+            .filter(|ok| **ok)
+            .count();
+        assert_eq!(wins, 1);
+        let conflicts = [&left, &right]
+            .iter()
+            .filter(|result| matches!(result, Err(ServiceError::Conflict(_))))
+            .count();
+        assert_eq!(conflicts, 1);
+
+        let named: Vec<String> = service
+            .list_nodes(&NodeFilter {
+                kind: Some("person".to_string()),
+                ..NodeFilter::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|node| node.name)
+            .collect();
+        assert!(named.contains(&"winner".to_string()));
+        assert_eq!(named.len(), 2);
+
+        drop(service);
+        std::fs::remove_file(&path).ok();
     }
 }

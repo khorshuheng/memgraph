@@ -5,7 +5,7 @@ use crate::model::{
     Edge as EdgeModel, EdgeType as EdgeTypeModel, ImportConflict, ImportDraft, ImportEdge,
     ImportNode, ImportRef, ImportReport, ImportStatus, Neighbor as NeighborModel,
     NeighborDirection as NeighborDirectionModel, Node as NodeModel, NodeFilter,
-    NodeKind as NodeKindModel, PackDraft, PackEdgeType, PackNodeKind, PackReport,
+    NodeKind as NodeKindModel, NodePatch, PackDraft, PackEdgeType, PackNodeKind, PackReport,
     Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft, PlanTask as PlanTaskModel,
     PlanTaskDraft, ReachFilter, RelationDirection as RelationDirectionModel,
     SearchScope as SearchScopeModel, TaskDraft, TaskPatch,
@@ -678,6 +678,10 @@ pub struct ReplaceTagsParameters {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    description = "A task created under a parent. Supplying id upserts that node and \
+                   replaces its name, description and content."
+)]
 pub struct CreateTaskParameters {
     pub id: Option<i64>,
     pub name: String,
@@ -737,6 +741,10 @@ pub struct CreatePlanGoalParameters {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    description = "A plan task. Supplying id upserts that node and replaces its name, \
+                   description and content; concurrent edits to that node may be overwritten."
+)]
 pub struct CreatePlanTaskParameters {
     pub id: Option<i64>,
     pub key: String,
@@ -814,6 +822,31 @@ impl From<PlanModel> for PlanResponse {
         PlanResponse {
             goal: plan.goal.map(Into::into),
             tasks: plan.tasks.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(
+    description = "Partial node update. Only name, description, content and tags are \
+                   patchable; kind is immutable and unknown fields are rejected. Omitted \
+                   fields are left unchanged, and an empty tag list clears tags."
+)]
+pub struct UpdateNodeParameters {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub content: Option<String>,
+    pub tags: Option<Vec<String>>,
+}
+
+impl From<UpdateNodeParameters> for NodePatch {
+    fn from(params: UpdateNodeParameters) -> Self {
+        NodePatch {
+            name: params.name,
+            description: params.description,
+            content: params.content,
+            tags: params.tags,
         }
     }
 }

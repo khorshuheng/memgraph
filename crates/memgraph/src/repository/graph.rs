@@ -7,9 +7,9 @@ use sqlx::{FromRow, QueryBuilder, SqliteConnection, SqlitePool};
 use crate::model::{
     Edge, EdgeType, EdgeTypeUsage, ImportConflict, ImportDraft, ImportEdgeResult, ImportNodeResult,
     ImportRef, ImportReport, ImportStatus, IsolatedNode, KindUsage, Neighbor, NeighborDirection,
-    Node, NodeFilter, NodeKind, NodeRef, PackDraft, PackEdgeType, PackItem, PackNodeKind,
-    PackReport, PackStatus, PendingEdge, RelationDirection, SearchHit, SearchPage, SearchScope,
-    TagUsage, encode_kind_list, split_kind_list,
+    Node, NodeFilter, NodeKind, NodePatch, NodeRef, PackDraft, PackEdgeType, PackItem,
+    PackNodeKind, PackReport, PackStatus, PendingEdge, RelationDirection, SearchHit, SearchPage,
+    SearchScope, TagUsage, encode_kind_list, split_kind_list,
 };
 
 use super::error::RepositoryError;
@@ -83,6 +83,11 @@ pub trait GraphRepository: Send + Sync {
     async fn list_edge_types(&self) -> Result<Vec<EdgeType>, RepositoryError>;
     async fn apply_pack(&self, pack: &PackDraft) -> Result<PackReport, RepositoryError>;
     async fn import_graph(&self, draft: &ImportDraft) -> Result<ImportReport, RepositoryError>;
+    async fn update_node(
+        &self,
+        node_id: i64,
+        patch: &NodePatch,
+    ) -> Result<(Node, Vec<String>), RepositoryError>;
 
     async fn upsert_node(&self, node: &Node) -> Result<Node, RepositoryError>;
     async fn upsert_node_with_tags(
@@ -152,6 +157,31 @@ pub struct SqliteGraphRepository {
 impl SqliteGraphRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    async fn update_node_once(
+        &self,
+        node_id: i64,
+        patch: &NodePatch,
+    ) -> Result<(Node, Vec<String>), RepositoryError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .map_err(RepositoryError::from)?;
+        match update_node_items(&mut connection, node_id, patch).await {
+            Ok(result) => {
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(RepositoryError::from(error));
+                }
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
     }
 
     async fn import_graph_once(
@@ -273,6 +303,27 @@ impl GraphRepository for SqliteGraphRepository {
             attempt += 1;
             match self.import_graph_once(draft).await {
                 Ok(report) => return Ok(report),
+                Err(RepositoryError::Busy(error)) => {
+                    if attempt >= 3 {
+                        return Err(RepositoryError::Busy(error));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50 * attempt)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn update_node(
+        &self,
+        node_id: i64,
+        patch: &NodePatch,
+    ) -> Result<(Node, Vec<String>), RepositoryError> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.update_node_once(node_id, patch).await {
+                Ok(result) => return Ok(result),
                 Err(RepositoryError::Busy(error)) => {
                     if attempt >= 3 {
                         return Err(RepositoryError::Busy(error));
@@ -1198,17 +1249,7 @@ async fn import_node(
             let next_content = node.content.clone().unwrap_or(content.clone());
             let tags_changed = match &node.tags {
                 None => false,
-                Some(tags) => {
-                    let current = sqlx::query_scalar::<_, String>(
-                        "SELECT tag FROM node_tag WHERE node_id = ? ORDER BY tag",
-                    )
-                    .bind(id)
-                    .fetch_all(&mut *connection)
-                    .await?;
-                    let mut proposed = tags.clone();
-                    proposed.sort();
-                    current != proposed
-                }
+                Some(tags) => !tags_equal(&node_tags_in(&mut *connection, id).await?, tags),
             };
             if next_description == description && next_content == content && !tags_changed {
                 return Ok(ImportNodeResult {
@@ -1337,6 +1378,99 @@ async fn node_kind_name(
     .fetch_optional(&mut *connection)
     .await?;
     name.ok_or_else(|| RepositoryError::ContractViolation(format!("node {node_id} does not exist")))
+}
+
+async fn update_node_items(
+    connection: &mut SqliteConnection,
+    node_id: i64,
+    patch: &NodePatch,
+) -> Result<(Node, Vec<String>), RepositoryError> {
+    let existing =
+        sqlx::query_as::<_, Node>(&format!("SELECT {NODE_COLUMNS} FROM node WHERE id = ?"))
+            .bind(node_id)
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or(RepositoryError::RowNotFound)?;
+
+    let name = patch.name.clone().unwrap_or_else(|| existing.name.clone());
+    let description = patch
+        .description
+        .clone()
+        .unwrap_or_else(|| existing.description.clone());
+    let content = patch
+        .content
+        .clone()
+        .unwrap_or_else(|| existing.content.clone());
+
+    let name_changed = name != existing.name;
+    if name_changed {
+        let conflict = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM node WHERE kind_id = ? AND name = ? LIMIT 1",
+        )
+        .bind(existing.kind_id)
+        .bind(&name)
+        .fetch_optional(&mut *connection)
+        .await?;
+        if let Some(other) = conflict
+            && other != node_id
+        {
+            return Err(RepositoryError::UniqueConstraintViolation(format!(
+                "a node named '{name}' already exists with id {other}"
+            )));
+        }
+    }
+
+    let current_tags = node_tags_in(&mut *connection, node_id).await?;
+    let (tags, tags_changed) = match &patch.tags {
+        Some(proposed) => {
+            let changed = !tags_equal(&current_tags, proposed);
+            if changed {
+                replace_tags(&mut *connection, node_id, proposed).await?;
+            }
+            (proposed.clone(), changed)
+        }
+        None => (current_tags, false),
+    };
+
+    let fields_changed = name_changed
+        || description != existing.description
+        || content != existing.content
+        || tags_changed;
+    let node = if fields_changed {
+        sqlx::query_as::<_, Node>(&format!(
+            "UPDATE node SET name = ?, description = ?, content = ?, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ? RETURNING {NODE_COLUMNS}"
+        ))
+        .bind(name)
+        .bind(description)
+        .bind(content)
+        .bind(node_id)
+        .fetch_one(&mut *connection)
+        .await?
+    } else {
+        existing
+    };
+
+    Ok((node, tags))
+}
+
+async fn node_tags_in(
+    connection: &mut SqliteConnection,
+    node_id: i64,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>("SELECT tag FROM node_tag WHERE node_id = ? ORDER BY tag")
+        .bind(node_id)
+        .fetch_all(&mut *connection)
+        .await
+}
+
+fn tags_equal(current: &[String], proposed: &[String]) -> bool {
+    let mut current = current.to_vec();
+    let mut proposed = proposed.to_vec();
+    current.sort();
+    proposed.sort();
+    current == proposed
 }
 
 fn push_tag_filter(builder: &mut QueryBuilder<Sqlite>, tags: &[String]) {
