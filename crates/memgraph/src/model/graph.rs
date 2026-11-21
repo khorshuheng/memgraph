@@ -190,7 +190,7 @@ pub enum ImportConflict {
     Skip,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ImportNode {
     pub reference: Option<String>,
     pub kind: String,
@@ -198,6 +198,7 @@ pub struct ImportNode {
     pub description: Option<String>,
     pub content: Option<String>,
     pub tags: Option<Vec<String>>,
+    pub properties: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,7 +239,7 @@ pub struct ImportEdgeResult {
     pub status: ImportStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ImportDraft {
     pub on_conflict: ImportConflict,
     pub nodes: Vec<ImportNode>,
@@ -406,12 +407,13 @@ pub struct TaskDraft {
     pub affects: Vec<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct NodePatch {
     pub name: Option<String>,
     pub description: Option<String>,
     pub content: Option<String>,
     pub tags: Option<Vec<String>>,
+    pub properties: Option<serde_json::Value>,
 }
 
 impl NodePatch {
@@ -420,6 +422,7 @@ impl NodePatch {
             && self.description.is_none()
             && self.content.is_none()
             && self.tags.is_none()
+            && self.properties.is_none()
     }
 }
 

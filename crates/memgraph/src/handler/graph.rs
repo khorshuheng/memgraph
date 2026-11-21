@@ -126,11 +126,16 @@ pub async fn create_node(
     Json(params): Json<CreateNodeParameters>,
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let tags = params.tags.clone();
+    let properties = params.properties.clone();
     let node: Node = params.into();
-    let (created, tags) = state.graph_service.create_node(&node, &tags).await?;
+    let (created, tags) = state
+        .graph_service
+        .create_node_with_properties(&node, &tags, properties.as_ref())
+        .await?;
+    let properties = state.graph_service.node_properties(created.id).await?;
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
-        data: NodeResponse::with_tags(created, tags),
+        data: NodeResponse::with_tags_and_properties(created, tags, properties),
     })
 }
 
@@ -206,13 +211,17 @@ pub async fn list_nodes(
     let nodes = state.graph_service.list_nodes(&filter).await?;
     let ids: Vec<i64> = nodes.iter().map(|node| node.id).collect();
     let mut tags = state.graph_service.node_tags_for_ids(&ids).await?;
+    let mut properties = state.graph_service.node_properties_for_ids(&ids).await?;
     Ok(ApiList {
         status: StatusCode::OK,
         items: nodes
             .into_iter()
             .map(|node| {
                 let node_tags = tags.remove(&node.id).unwrap_or_default();
-                NodeResponse::with_tags(node, node_tags)
+                let node_properties = properties
+                    .remove(&node.id)
+                    .unwrap_or_else(|| serde_json::json!({}));
+                NodeResponse::with_tags_and_properties(node, node_tags, node_properties)
             })
             .collect(),
     })
@@ -252,9 +261,10 @@ pub async fn get_node(
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let node = state.graph_service.get_node(node_id).await?;
     let tags = state.graph_service.node_tags(node_id).await?;
+    let properties = state.graph_service.node_properties(node_id).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: NodeResponse::with_tags(node, tags),
+        data: NodeResponse::with_tags_and_properties(node, tags, properties),
     })
 }
 
@@ -278,9 +288,10 @@ pub async fn update_node(
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let patch: NodePatch = params.into();
     let (node, tags) = state.graph_service.update_node(node_id, &patch).await?;
+    let properties = state.graph_service.node_properties(node_id).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: NodeResponse::with_tags(node, tags),
+        data: NodeResponse::with_tags_and_properties(node, tags, properties),
     })
 }
 
@@ -384,13 +395,17 @@ pub async fn list_neighbors(
         .await?;
     let ids: Vec<i64> = neighbors.iter().map(|neighbor| neighbor.node.id).collect();
     let mut tags = state.graph_service.node_tags_for_ids(&ids).await?;
+    let mut properties = state.graph_service.node_properties_for_ids(&ids).await?;
     Ok(ApiList {
         status: StatusCode::OK,
         items: neighbors
             .into_iter()
             .map(|neighbor| {
                 let node_tags = tags.remove(&neighbor.node.id).unwrap_or_default();
-                NeighborResponse::with_tags(neighbor, node_tags)
+                let node_properties = properties
+                    .remove(&neighbor.node.id)
+                    .unwrap_or_else(|| serde_json::json!({}));
+                NeighborResponse::with_tags_and_properties(neighbor, node_tags, node_properties)
             })
             .collect(),
     })
@@ -444,15 +459,29 @@ pub async fn search(
         .graph_service
         .search(params.q.as_deref(), &tags, params.limit, params.offset)
         .await?;
+    let hit_ids: Vec<i64> = page.hits.iter().map(|hit| hit.node.id).collect();
+    let mut properties = state
+        .graph_service
+        .node_properties_for_ids(&hit_ids)
+        .await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
         data: SearchResponse {
             items: page
                 .hits
                 .into_iter()
-                .map(|hit| SearchHitResponse {
-                    node: NodeResponse::with_tags(hit.node, hit.tags),
-                    score: hit.score,
+                .map(|hit| {
+                    let node_properties = properties
+                        .remove(&hit.node.id)
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    SearchHitResponse {
+                        node: NodeResponse::with_tags_and_properties(
+                            hit.node,
+                            hit.tags,
+                            node_properties,
+                        ),
+                        score: hit.score,
+                    }
                 })
                 .collect(),
             total: page.total,
@@ -533,6 +562,7 @@ mod tests {
                 description: description.to_string(),
                 content: content.to_string(),
                 tags: tags.iter().map(|tag| tag.to_string()).collect(),
+                properties: None,
             }),
         )
         .await
@@ -831,6 +861,7 @@ mod tests {
                 description: Some("single file".to_string()),
                 content: Some("portable".to_string()),
                 tags: Some(vec!["Repo:X".to_string()]),
+                properties: None,
             }],
             edges: vec![],
         };
@@ -872,6 +903,7 @@ mod tests {
                 description: Some("changed".to_string()),
                 content: None,
                 tags: Some(vec!["Two".to_string()]),
+                properties: None,
             }),
         )
         .await
@@ -887,5 +919,93 @@ mod tests {
             .expect("get node")
             .data;
         assert_eq!(fetched.name, "second");
+    }
+
+    #[tokio::test]
+    async fn node_properties_round_trip_over_http() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "decision").await;
+        let created = create_node(
+            State(state.clone()),
+            Json(CreateNodeParameters {
+                kind_id: kind,
+                name: "use sqlite".to_string(),
+                description: "portable database".to_string(),
+                content: String::new(),
+                tags: vec![],
+                properties: Some(serde_json::json!({
+                    "confidence": 0.9,
+                    "source": "docs"
+                })),
+            }),
+        )
+        .await
+        .expect("create")
+        .data;
+        assert_eq!(
+            created.properties,
+            serde_json::json!({"confidence": 0.9, "source": "docs"})
+        );
+
+        let updated = update_node(
+            State(state.clone()),
+            Path(created.id),
+            Json(UpdateNodeParameters {
+                name: None,
+                description: None,
+                content: None,
+                tags: None,
+                properties: Some(serde_json::json!({"status": "verified"})),
+            }),
+        )
+        .await
+        .expect("update")
+        .data;
+        assert_eq!(
+            updated.properties,
+            serde_json::json!({"status": "verified"})
+        );
+
+        let fetched = get_node(State(state.clone()), Path(created.id))
+            .await
+            .expect("get")
+            .data;
+        assert_eq!(
+            fetched.properties,
+            serde_json::json!({"status": "verified"})
+        );
+
+        let listed = list_nodes(
+            State(state.clone()),
+            Query(ListNodesParameters {
+                kind: None,
+                scope: None,
+                within: None,
+                via: None,
+                descend: None,
+            }),
+        )
+        .await
+        .expect("list");
+        assert_eq!(
+            listed.items[0].properties,
+            serde_json::json!({"status": "verified"})
+        );
+
+        let found = search(
+            State(state.clone()),
+            Query(SearchParameters {
+                q: Some("portable".to_string()),
+                tags: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("search");
+        assert_eq!(
+            found.data.items[0].node.properties,
+            serde_json::json!({"status": "verified"})
+        );
     }
 }

@@ -140,6 +140,8 @@ pub struct CreateNodeParameters {
     pub content: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
 }
 
 impl From<CreateNodeParameters> for NodeModel {
@@ -163,11 +165,16 @@ pub struct NodeResponse {
     pub description: String,
     pub content: String,
     pub tags: Vec<String>,
+    pub properties: serde_json::Value,
     pub updated_at: String,
 }
 
 impl NodeResponse {
-    pub fn with_tags(node: NodeModel, tags: Vec<String>) -> Self {
+    pub fn with_tags_and_properties(
+        node: NodeModel,
+        tags: Vec<String>,
+        properties: serde_json::Value,
+    ) -> Self {
         NodeResponse {
             id: node.id,
             kind_id: node.kind_id,
@@ -175,6 +182,7 @@ impl NodeResponse {
             description: node.description,
             content: node.content,
             tags,
+            properties,
             updated_at: node.updated_at,
         }
     }
@@ -189,6 +197,7 @@ impl From<NodeModel> for NodeResponse {
             description: node.description,
             content: node.content,
             tags: Vec::new(),
+            properties: serde_json::json!({}),
             updated_at: node.updated_at,
         }
     }
@@ -285,21 +294,25 @@ pub struct NeighborResponse {
 }
 
 impl NeighborResponse {
-    pub fn with_tags(neighbor: NeighborModel, tags: Vec<String>) -> Self {
+    pub fn with_tags_and_properties(
+        neighbor: NeighborModel,
+        tags: Vec<String>,
+        properties: serde_json::Value,
+    ) -> Self {
         NeighborResponse {
             direction: match neighbor.direction {
                 RelationDirectionModel::Outgoing => "outgoing".to_string(),
                 RelationDirectionModel::Ingoing => "incoming".to_string(),
             },
             edge: neighbor.edge.into(),
-            node: NodeResponse::with_tags(neighbor.node, tags),
+            node: NodeResponse::with_tags_and_properties(neighbor.node, tags, properties),
         }
     }
 }
 
 impl From<NeighborModel> for NeighborResponse {
     fn from(neighbor: NeighborModel) -> Self {
-        NeighborResponse::with_tags(neighbor, Vec::new())
+        NeighborResponse::with_tags_and_properties(neighbor, Vec::new(), serde_json::json!({}))
     }
 }
 
@@ -511,6 +524,8 @@ pub struct ImportNodeParameters {
     pub content: Option<String>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
 }
 
 impl From<ImportNodeParameters> for ImportNode {
@@ -522,6 +537,7 @@ impl From<ImportNodeParameters> for ImportNode {
             description: params.description,
             content: params.content,
             tags: params.tags,
+            properties: params.properties,
         }
     }
 }
@@ -846,6 +862,7 @@ pub struct UpdateNodeParameters {
     pub description: Option<String>,
     pub content: Option<String>,
     pub tags: Option<Vec<String>>,
+    pub properties: Option<serde_json::Value>,
 }
 
 impl From<UpdateNodeParameters> for NodePatch {
@@ -855,6 +872,7 @@ impl From<UpdateNodeParameters> for NodePatch {
             description: params.description,
             content: params.content,
             tags: params.tags,
+            properties: params.properties,
         }
     }
 }

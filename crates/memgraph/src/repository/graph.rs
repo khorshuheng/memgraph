@@ -94,6 +94,7 @@ pub trait GraphRepository: Send + Sync {
         &self,
         node: &Node,
         tags: &[String],
+        properties: Option<&str>,
     ) -> Result<Node, RepositoryError>;
     async fn insert_nodes_with_edges(
         &self,
@@ -116,6 +117,11 @@ pub trait GraphRepository: Send + Sync {
         &self,
         ids: &[i64],
     ) -> Result<HashMap<i64, Vec<String>>, RepositoryError>;
+    async fn node_properties(&self, node_id: i64) -> Result<String, RepositoryError>;
+    async fn node_properties_for_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, String>, RepositoryError>;
     async fn list_tags(&self) -> Result<Vec<TagUsage>, RepositoryError>;
 
     async fn add_edge(&self, edge: &Edge) -> Result<(), RepositoryError>;
@@ -341,10 +347,18 @@ impl GraphRepository for SqliteGraphRepository {
         &self,
         node: &Node,
         tags: &[String],
+        properties: Option<&str>,
     ) -> Result<Node, RepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let row = insert_node(&mut *transaction, node).await?;
         replace_tags(&mut transaction, row.id, tags).await?;
+        if let Some(properties) = properties {
+            sqlx::query("UPDATE node SET properties = ? WHERE id = ?")
+                .bind(properties)
+                .bind(row.id)
+                .execute(&mut *transaction)
+                .await?;
+        }
         transaction.commit().await?;
         Ok(row)
     }
@@ -600,6 +614,39 @@ impl GraphRepository for SqliteGraphRepository {
             .await?;
         for (node_id, tag) in rows {
             by_node.entry(node_id).or_default().push(tag);
+        }
+        Ok(by_node)
+    }
+
+    async fn node_properties(&self, node_id: i64) -> Result<String, RepositoryError> {
+        let properties =
+            sqlx::query_scalar::<_, String>("SELECT properties FROM node WHERE id = ?")
+                .bind(node_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        properties.ok_or(RepositoryError::RowNotFound)
+    }
+
+    async fn node_properties_for_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, String>, RepositoryError> {
+        let mut by_node: HashMap<i64, String> = HashMap::new();
+        if ids.is_empty() {
+            return Ok(by_node);
+        }
+        let mut builder = QueryBuilder::new("SELECT id, properties FROM node WHERE id IN (");
+        let mut separated = builder.separated(", ");
+        for id in ids {
+            separated.push_bind(*id);
+        }
+        builder.push(")");
+        let rows = builder
+            .build_query_as::<(i64, String)>()
+            .fetch_all(&self.pool)
+            .await?;
+        for (node_id, properties) in rows {
+            by_node.insert(node_id, properties);
         }
         Ok(by_node)
     }
@@ -1216,8 +1263,8 @@ async fn import_node(
     kind_id: i64,
     node: &crate::model::ImportNode,
 ) -> Result<ImportNodeResult, RepositoryError> {
-    let existing = sqlx::query_as::<_, (i64, String, String)>(
-        "SELECT id, description, content FROM node WHERE kind_id = ? AND name = ?",
+    let existing = sqlx::query_as::<_, (i64, String, String, String)>(
+        "SELECT id, description, content, properties FROM node WHERE kind_id = ? AND name = ?",
     )
     .bind(kind_id)
     .bind(&node.name)
@@ -1226,14 +1273,20 @@ async fn import_node(
 
     match existing {
         None => {
+            let properties = match &node.properties {
+                Some(value) => serde_json::to_string(value)
+                    .map_err(|error| RepositoryError::SqlExecutionError(error.to_string()))?,
+                None => "{}".to_string(),
+            };
             let id = sqlx::query_scalar::<_, i64>(
-                "INSERT INTO node (kind_id, name, description, content) \
-                 VALUES (?, ?, ?, ?) RETURNING id",
+                "INSERT INTO node (kind_id, name, description, content, properties) \
+                 VALUES (?, ?, ?, ?, ?) RETURNING id",
             )
             .bind(kind_id)
             .bind(&node.name)
             .bind(node.description.clone().unwrap_or_default())
             .bind(node.content.clone().unwrap_or_default())
+            .bind(properties)
             .fetch_one(&mut *connection)
             .await?;
             if let Some(tags) = &node.tags {
@@ -1245,7 +1298,7 @@ async fn import_node(
                 status: ImportStatus::Created,
             })
         }
-        Some((id, description, content)) => {
+        Some((id, description, content, properties)) => {
             if conflict == ImportConflict::Skip {
                 return Ok(ImportNodeResult {
                     reference: node.reference.clone(),
@@ -1259,7 +1312,20 @@ async fn import_node(
                 None => false,
                 Some(tags) => !tags_equal(&node_tags_in(&mut *connection, id).await?, tags),
             };
-            if next_description == description && next_content == content && !tags_changed {
+            let (next_properties, properties_changed) = match &node.properties {
+                Some(value) => {
+                    let encoded = serde_json::to_string(value)
+                        .map_err(|error| RepositoryError::SqlExecutionError(error.to_string()))?;
+                    let changed = encoded != properties;
+                    (encoded, changed)
+                }
+                None => (properties.clone(), false),
+            };
+            if next_description == description
+                && next_content == content
+                && !tags_changed
+                && !properties_changed
+            {
                 return Ok(ImportNodeResult {
                     reference: node.reference.clone(),
                     id,
@@ -1267,11 +1333,12 @@ async fn import_node(
                 });
             }
             sqlx::query(
-                "UPDATE node SET description = ?, content = ?, \
+                "UPDATE node SET description = ?, content = ?, properties = ?, \
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
             )
             .bind(next_description)
             .bind(next_content)
+            .bind(next_properties)
             .bind(id)
             .execute(&mut *connection)
             .await?;
@@ -1428,6 +1495,21 @@ async fn update_node_items(
         }
     }
 
+    let current_properties =
+        sqlx::query_scalar::<_, String>("SELECT properties FROM node WHERE id = ?")
+            .bind(node_id)
+            .fetch_one(&mut *connection)
+            .await?;
+    let (properties, properties_changed) = match &patch.properties {
+        Some(value) => {
+            let encoded = serde_json::to_string(value)
+                .map_err(|error| RepositoryError::SqlExecutionError(error.to_string()))?;
+            let changed = encoded != current_properties;
+            (encoded, changed)
+        }
+        None => (current_properties, false),
+    };
+
     let current_tags = node_tags_in(&mut *connection, node_id).await?;
     let (tags, tags_changed) = match &patch.tags {
         Some(proposed) => {
@@ -1443,16 +1525,18 @@ async fn update_node_items(
     let fields_changed = name_changed
         || description != existing.description
         || content != existing.content
-        || tags_changed;
+        || tags_changed
+        || properties_changed;
     let node = if fields_changed {
         sqlx::query_as::<_, Node>(&format!(
-            "UPDATE node SET name = ?, description = ?, content = ?, \
+            "UPDATE node SET name = ?, description = ?, content = ?, properties = ?, \
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
              WHERE id = ? RETURNING {NODE_COLUMNS}"
         ))
         .bind(name)
         .bind(description)
         .bind(content)
+        .bind(properties)
         .bind(node_id)
         .fetch_one(&mut *connection)
         .await?

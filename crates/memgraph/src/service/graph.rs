@@ -175,6 +175,15 @@ impl GraphService {
                     Some(tags) => Some(normalize_tags(tags)?),
                     None => None,
                 },
+                properties: match &node.properties {
+                    Some(properties) if properties.is_object() => Some(properties.clone()),
+                    Some(_) => {
+                        return Err(ServiceError::UnprocessableEntity(
+                            "properties must be a JSON object".to_string(),
+                        ));
+                    }
+                    None => None,
+                },
             });
         }
 
@@ -235,6 +244,13 @@ impl GraphService {
         }
         if let Some(tags) = &normalized.tags {
             normalized.tags = Some(normalize_tags(tags)?);
+        }
+        if let Some(properties) = &normalized.properties
+            && !properties.is_object()
+        {
+            return Err(ServiceError::UnprocessableEntity(
+                "properties must be a JSON object".to_string(),
+            ));
         }
         if let Some(name) = &normalized.name {
             self.require_available_name(node.kind_id, name, node_id)
@@ -440,6 +456,7 @@ impl GraphService {
                     description: patch.description.clone(),
                     content: patch.content.clone(),
                     tags: None,
+                    properties: None,
                 },
             )
             .await?;
@@ -740,13 +757,42 @@ impl GraphService {
         node: &Node,
         tags: &[String],
     ) -> Result<(Node, Vec<String>), ServiceError> {
+        self.create_node_with_properties(node, tags, None).await
+    }
+
+    pub async fn create_node_with_properties(
+        &self,
+        node: &Node,
+        tags: &[String],
+        properties: Option<&serde_json::Value>,
+    ) -> Result<(Node, Vec<String>), ServiceError> {
         let mut node = node.clone();
         node.name = node_name(&node.name)?;
         self.require_available_name(node.kind_id, &node.name, 0)
             .await?;
         let tags = normalize_tags(tags)?;
-        let created = self.repository.upsert_node_with_tags(&node, &tags).await?;
+        let encoded = encode_properties(properties)?;
+        let created = self
+            .repository
+            .upsert_node_with_tags(&node, &tags, encoded.as_deref())
+            .await?;
         Ok((created, tags))
+    }
+
+    pub async fn node_properties(&self, node_id: i64) -> Result<serde_json::Value, ServiceError> {
+        let raw = self.repository.node_properties(node_id).await?;
+        Ok(parse_properties(&raw))
+    }
+
+    pub async fn node_properties_for_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, serde_json::Value>, ServiceError> {
+        let raw = self.repository.node_properties_for_ids(ids).await?;
+        Ok(raw
+            .into_iter()
+            .map(|(node_id, properties)| (node_id, parse_properties(&properties)))
+            .collect())
     }
 
     pub async fn node_tags(&self, node_id: i64) -> Result<Vec<String>, ServiceError> {
@@ -1132,6 +1178,28 @@ fn visit_dependencies<'a>(
 }
 
 const MAX_TAG_LENGTH: usize = 128;
+
+fn encode_properties(
+    properties: Option<&serde_json::Value>,
+) -> Result<Option<String>, ServiceError> {
+    match properties {
+        None => Ok(None),
+        Some(value) if value.is_object() => {
+            serde_json::to_string(value).map(Some).map_err(|error| {
+                ServiceError::UnprocessableEntity(format!(
+                    "properties must be a JSON object: {error}"
+                ))
+            })
+        }
+        Some(_) => Err(ServiceError::UnprocessableEntity(
+            "properties must be a JSON object".to_string(),
+        )),
+    }
+}
+
+fn parse_properties(properties: &str) -> serde_json::Value {
+    serde_json::from_str(properties).unwrap_or_else(|_| serde_json::json!({}))
+}
 
 const MAX_NODE_NAME_LENGTH: usize = 512;
 
@@ -3698,6 +3766,7 @@ mod tests {
             description: None,
             content: None,
             tags: None,
+            properties: None,
         }
     }
 
@@ -4519,5 +4588,140 @@ mod tests {
 
         drop(service);
         remove_sqlite(&path);
+    }
+
+    #[tokio::test]
+    async fn node_properties_are_set_replaced_and_cleared() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let properties = serde_json::json!({"confidence": 0.9, "source": "docs"});
+        let (node, _) = service
+            .create_node_with_properties(&node(kind_id, "Ada", ""), &[], Some(&properties))
+            .await
+            .unwrap();
+        assert_eq!(service.node_properties(node.id).await.unwrap(), properties);
+
+        service
+            .update_node(
+                node.id,
+                &NodePatch {
+                    description: Some("kept".to_string()),
+                    ..NodePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(service.node_properties(node.id).await.unwrap(), properties);
+
+        let replaced = serde_json::json!({"status": "verified"});
+        let (updated, _) = service
+            .update_node(
+                node.id,
+                &NodePatch {
+                    properties: Some(replaced.clone()),
+                    ..NodePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(service.node_properties(node.id).await.unwrap(), replaced);
+        assert_ne!(updated.updated_at, node.updated_at);
+
+        service
+            .update_node(
+                node.id,
+                &NodePatch {
+                    properties: Some(serde_json::json!({})),
+                    ..NodePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service.node_properties(node.id).await.unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[tokio::test]
+    async fn import_sets_preserves_and_clears_properties() {
+        let service = service().await;
+        let mut decision = import_node(Some("d"), "decision", "use sqlite");
+        decision.properties = Some(serde_json::json!({"confidence": 0.8}));
+        let report = service
+            .import_graph(&import_draft(vec![decision], vec![]))
+            .await
+            .unwrap();
+        let node_id = report.nodes[0].id;
+        assert_eq!(
+            service.node_properties(node_id).await.unwrap(),
+            serde_json::json!({"confidence": 0.8})
+        );
+
+        let report = service
+            .import_graph(&import_draft(
+                vec![import_node(Some("d"), "decision", "use sqlite")],
+                vec![],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(report.nodes_unchanged(), 1);
+        assert_eq!(
+            service.node_properties(node_id).await.unwrap(),
+            serde_json::json!({"confidence": 0.8})
+        );
+
+        let mut cleared = import_node(Some("d"), "decision", "use sqlite");
+        cleared.properties = Some(serde_json::json!({}));
+        service
+            .import_graph(&import_draft(vec![cleared], vec![]))
+            .await
+            .unwrap();
+        assert_eq!(
+            service.node_properties(node_id).await.unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_non_object_properties() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        assert!(matches!(
+            service
+                .create_node_with_properties(
+                    &node(kind_id, "Ada", ""),
+                    &[],
+                    Some(&serde_json::json!([1])),
+                )
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+
+        let (node, _) = service
+            .create_node(&node(kind_id, "Bob", ""), &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .update_node(
+                    node.id,
+                    &NodePatch {
+                        properties: Some(serde_json::json!("nope")),
+                        ..NodePatch::default()
+                    }
+                )
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+
+        let mut invalid = import_node(None, "person", "Cara");
+        invalid.properties = Some(serde_json::json!(3));
+        assert!(matches!(
+            service
+                .import_graph(&import_draft(vec![invalid], vec![]))
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
     }
 }
