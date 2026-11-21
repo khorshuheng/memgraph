@@ -960,6 +960,7 @@ mod tests {
             on_conflict: ImportConflictParameters::Update,
             nodes: vec![ImportNodeParameters {
                 reference: Some("n1".to_string()),
+                id: None,
                 kind: "decision".to_string(),
                 name: "use sqlite".to_string(),
                 description: Some("single file".to_string()),

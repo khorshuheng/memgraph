@@ -631,6 +631,8 @@ impl From<ImportNodeRefParameters> for ImportRef {
 pub struct ImportNodeParameters {
     #[serde(default, rename = "ref")]
     pub reference: Option<String>,
+    #[serde(default)]
+    pub id: Option<i64>,
     pub kind: String,
     pub name: String,
     #[serde(default)]
@@ -647,6 +649,7 @@ impl From<ImportNodeParameters> for ImportNode {
     fn from(params: ImportNodeParameters) -> Self {
         ImportNode {
             reference: params.reference,
+            id: params.id,
             kind: params.kind,
             name: params.name,
             description: params.description,
@@ -680,9 +683,10 @@ impl From<ImportEdgeParameters> for ImportEdge {
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[schema(
-    description = "Batch import. Nodes are identified by (kind, name): re-importing updates \
-                   existing nodes instead of duplicating them. Omitted description/content/tags \
-                   are left unchanged. Edge endpoints are a numeric node id or a request-local ref. \
+    description = "Batch import. Nodes are identified by (kind, name) unless an id is given: \
+                   id targets that exact node, creating it if absent, and kind is immutable on \
+                   update. Omitted description/content/tags are left unchanged. Edge endpoints \
+                   are a numeric node id, a request-local ref, or a {kind, name} natural key. \
                    The whole batch is one transaction."
 )]
 pub struct ImportParameters {

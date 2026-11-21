@@ -398,6 +398,23 @@ impl GraphRepository for SqliteGraphRepository {
         let mut ids = Vec::with_capacity(nodes.len());
         for pending in nodes {
             let node = &pending.node;
+            if node.id != 0 {
+                let existing_kind =
+                    sqlx::query_scalar::<_, i64>("SELECT kind_id FROM node WHERE id = ?")
+                        .bind(node.id)
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                if let Some(existing_kind) = existing_kind
+                    && existing_kind != node.kind_id
+                {
+                    let from = kind_name_by_id(&mut transaction, existing_kind).await?;
+                    let to = kind_name_by_id(&mut transaction, node.kind_id).await?;
+                    return Err(RepositoryError::ContractViolation(format!(
+                        "node {} cannot change kind from '{from}' to '{to}'",
+                        node.id
+                    )));
+                }
+            }
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 declarations.entry(node.kind_id)
             {
@@ -1517,22 +1534,35 @@ async fn import_node(
     node: &crate::model::ImportNode,
 ) -> Result<ImportNodeResult, RepositoryError> {
     let declarations = load_kind_properties(&mut *connection, kind_id).await?;
-    let matches = sqlx::query_as::<_, (i64, String, String, String)>(
-        "SELECT id, description, content, properties FROM node WHERE kind_id = ? AND name = ? \
-         ORDER BY id",
-    )
-    .bind(kind_id)
-    .bind(&node.name)
-    .fetch_all(&mut *connection)
-    .await?;
-    if matches.len() > 1 {
-        return Err(RepositoryError::ContractViolation(format!(
-            "node name '{}' is not unique for its kind; import cannot choose between {} nodes",
-            node.name,
-            matches.len()
-        )));
-    }
-    let existing = matches.into_iter().next();
+    let existing = match node.id {
+        Some(id) => {
+            sqlx::query_as::<_, (i64, i64, String, String, String, String)>(
+                "SELECT id, kind_id, name, description, content, properties \
+                 FROM node WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&mut *connection)
+            .await?
+        }
+        None => {
+            let matches = sqlx::query_as::<_, (i64, i64, String, String, String, String)>(
+                "SELECT id, kind_id, name, description, content, properties \
+                 FROM node WHERE kind_id = ? AND name = ? ORDER BY id",
+            )
+            .bind(kind_id)
+            .bind(&node.name)
+            .fetch_all(&mut *connection)
+            .await?;
+            if matches.len() > 1 {
+                return Err(RepositoryError::ContractViolation(format!(
+                    "node name '{}' is not unique for its kind; import cannot choose between {} nodes",
+                    node.name,
+                    matches.len()
+                )));
+            }
+            matches.into_iter().next()
+        }
+    };
 
     match existing {
         None => {
@@ -1548,9 +1578,10 @@ async fn import_node(
                 None => "{}".to_string(),
             };
             let id = sqlx::query_scalar::<_, i64>(
-                "INSERT INTO node (kind_id, name, description, content, properties) \
-                 VALUES (?, ?, ?, ?, ?) RETURNING id",
+                "INSERT INTO node (id, kind_id, name, description, content, properties) \
+                 VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
             )
+            .bind(node.id)
             .bind(kind_id)
             .bind(&node.name)
             .bind(node.description.clone().unwrap_or_default())
@@ -1567,7 +1598,7 @@ async fn import_node(
                 status: ImportStatus::Created,
             })
         }
-        Some((id, description, content, properties)) => {
+        Some((id, existing_kind, existing_name, description, content, properties)) => {
             if conflict == ImportConflict::Skip {
                 return Ok(ImportNodeResult {
                     reference: node.reference.clone(),
@@ -1575,6 +1606,14 @@ async fn import_node(
                     status: ImportStatus::Skipped,
                 });
             }
+            if existing_kind != kind_id {
+                let from = kind_name_by_id(&mut *connection, existing_kind).await?;
+                let to = kind_name_by_id(&mut *connection, kind_id).await?;
+                return Err(RepositoryError::ContractViolation(format!(
+                    "node {id} cannot change kind from '{from}' to '{to}'"
+                )));
+            }
+            let name_changed = existing_name != node.name;
             if let Some(value) = &node.properties {
                 validate_declared_properties(value, &declarations)
                     .map_err(RepositoryError::ContractViolation)?;
@@ -1594,7 +1633,8 @@ async fn import_node(
                 }
                 None => (properties.clone(), false),
             };
-            if next_description == description
+            if !name_changed
+                && next_description == description
                 && next_content == content
                 && !tags_changed
                 && !properties_changed
@@ -1606,9 +1646,11 @@ async fn import_node(
                 });
             }
             sqlx::query(
-                "UPDATE node SET description = ?, content = ?, properties = ?, \
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+                "UPDATE node SET name = ?, description = ?, content = ?, \
+                 properties = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 WHERE id = ?",
             )
+            .bind(&node.name)
             .bind(next_description)
             .bind(next_content)
             .bind(next_properties)
@@ -1718,6 +1760,19 @@ async fn validate_import_edge(
         }
     }
     Ok(())
+}
+
+async fn kind_name_by_id(
+    connection: &mut SqliteConnection,
+    kind_id: i64,
+) -> Result<String, RepositoryError> {
+    let name = sqlx::query_scalar::<_, String>("SELECT name FROM node_kind WHERE id = ?")
+        .bind(kind_id)
+        .fetch_optional(&mut *connection)
+        .await?;
+    name.ok_or_else(|| {
+        RepositoryError::ContractViolation(format!("node kind {kind_id} is not defined"))
+    })
 }
 
 async fn node_kind_name(

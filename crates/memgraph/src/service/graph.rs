@@ -141,6 +141,7 @@ impl GraphService {
     pub async fn import_graph(&self, draft: &ImportDraft) -> Result<ImportReport, ServiceError> {
         let mut nodes = Vec::with_capacity(draft.nodes.len());
         let mut references: HashSet<String> = HashSet::new();
+        let mut ids: HashSet<i64> = HashSet::new();
         let mut pairs: HashSet<(String, String)> = HashSet::new();
         for node in &draft.nodes {
             let kind = node.kind.trim().to_string();
@@ -166,13 +167,25 @@ impl GraphService {
                     Some(reference.to_string())
                 }
             };
-            if !pairs.insert((kind.clone(), name.clone())) {
+            if let Some(id) = node.id {
+                if id <= 0 {
+                    return Err(ServiceError::UnprocessableEntity(
+                        "import node id must be positive".to_string(),
+                    ));
+                }
+                if !ids.insert(id) {
+                    return Err(ServiceError::UnprocessableEntity(format!(
+                        "node id {id} appears more than once in the import"
+                    )));
+                }
+            } else if !pairs.insert((kind.clone(), name.clone())) {
                 return Err(ServiceError::UnprocessableEntity(format!(
                     "node ({kind}, {name}) appears more than once in the import"
                 )));
             }
             nodes.push(ImportNode {
                 reference,
+                id: node.id,
                 kind,
                 name,
                 description: node.description.clone(),
@@ -3922,6 +3935,7 @@ mod tests {
     fn import_node(reference: Option<&str>, kind: &str, name: &str) -> ImportNode {
         ImportNode {
             reference: reference.map(str::to_string),
+            id: None,
             kind: kind.to_string(),
             name: name.to_string(),
             description: None,
@@ -5795,5 +5809,126 @@ mod tests {
             .await
             .unwrap_err();
         assert!(rejection(error).contains("not unique"));
+    }
+
+    #[tokio::test]
+    async fn import_updates_a_duplicate_named_node_by_id() {
+        let service = service().await;
+        set_task_unique(&service, false).await;
+        let task_kind = seeded_kind(&service, "task").await;
+        let first = service
+            .create_node(&described_node(task_kind, "dup", "first"), &[])
+            .await
+            .unwrap()
+            .0;
+        let second = service
+            .create_node(&described_node(task_kind, "dup", "second"), &[])
+            .await
+            .unwrap()
+            .0;
+
+        let mut imported = import_node(None, "task", "dup");
+        imported.id = Some(second.id);
+        imported.description = Some("third".to_string());
+        let report = service
+            .import_graph(&import_draft(vec![imported], vec![]))
+            .await
+            .unwrap();
+        assert_eq!(report.nodes_updated(), 1);
+        assert_eq!(report.nodes[0].id, second.id);
+        assert_eq!(
+            service.get_node(second.id).await.unwrap().description,
+            "third"
+        );
+        assert_eq!(
+            service.get_node(first.id).await.unwrap().description,
+            "first"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_creates_with_an_explicit_id() {
+        let service = service().await;
+        let mut imported = import_node(None, "task", "explicit");
+        imported.id = Some(1000);
+        let report = service
+            .import_graph(&import_draft(vec![imported], vec![]))
+            .await
+            .unwrap();
+        assert_eq!(report.nodes_created(), 1);
+        assert_eq!(report.nodes[0].id, 1000);
+        assert_eq!(service.get_node(1000).await.unwrap().name, "explicit");
+    }
+
+    #[tokio::test]
+    async fn import_rejects_a_kind_change_by_id() {
+        let service = service().await;
+        let person_kind = seed_person(&service).await;
+        let node = service
+            .create_node(&described_node(person_kind, "Ada", ""), &[])
+            .await
+            .unwrap()
+            .0;
+
+        let mut imported = import_node(None, "task", "moved");
+        imported.id = Some(node.id);
+        let error = service
+            .import_graph(&import_draft(vec![imported], vec![]))
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("cannot change kind"));
+        let stored = service.get_node(node.id).await.unwrap();
+        assert_eq!(stored.kind_id, person_kind);
+        assert_eq!(stored.name, "Ada");
+    }
+
+    #[tokio::test]
+    async fn plan_upsert_rejects_a_kind_change() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let person_kind = seed_person(&service).await;
+        let person = service
+            .create_node(&described_node(person_kind, "Ada", ""), &[])
+            .await
+            .unwrap()
+            .0;
+
+        let mut task = plan_task("a", None, &[]);
+        task.id = person.id;
+        let error = service
+            .create_plan(&plan_draft(repo, vec![task]))
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("cannot change kind"));
+        assert_eq!(
+            service.get_node(person.id).await.unwrap().kind_id,
+            person_kind
+        );
+    }
+
+    #[tokio::test]
+    async fn import_rejects_bad_ids() {
+        let service = service().await;
+        for id in [0, -1] {
+            let mut node = import_node(None, "task", "bad");
+            node.id = Some(id);
+            assert!(matches!(
+                service
+                    .import_graph(&import_draft(vec![node], vec![]))
+                    .await,
+                Err(ServiceError::UnprocessableEntity(_))
+            ));
+        }
+
+        let mut first = import_node(None, "task", "one");
+        first.id = Some(5);
+        let mut second = import_node(None, "task", "two");
+        second.id = Some(5);
+        assert!(matches!(
+            service
+                .import_graph(&import_draft(vec![first, second], vec![]))
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
     }
 }

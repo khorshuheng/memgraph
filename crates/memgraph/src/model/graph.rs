@@ -291,6 +291,7 @@ pub enum ImportConflict {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportNode {
     pub reference: Option<String>,
+    pub id: Option<i64>,
     pub kind: String,
     pub name: String,
     pub description: Option<String>,
