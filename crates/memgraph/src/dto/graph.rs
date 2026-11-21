@@ -4,10 +4,10 @@ use utoipa::{IntoParams, ToSchema};
 use crate::model::{
     Edge as EdgeModel, EdgeType as EdgeTypeModel, Neighbor as NeighborModel,
     NeighborDirection as NeighborDirectionModel, Node as NodeModel, NodeFilter,
-    NodeKind as NodeKindModel, Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft,
-    PlanTask as PlanTaskModel, PlanTaskDraft, ReachFilter,
-    RelationDirection as RelationDirectionModel, SearchScope as SearchScopeModel, TaskDraft,
-    TaskPatch,
+    NodeKind as NodeKindModel, PackDraft, PackEdgeType, PackNodeKind, PackReport,
+    Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft, PlanTask as PlanTaskModel,
+    PlanTaskDraft, ReachFilter, RelationDirection as RelationDirectionModel,
+    SearchScope as SearchScopeModel, TaskDraft, TaskPatch,
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -19,6 +19,7 @@ pub struct CreateNodeKindParameters {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct NodeKindResponse {
     pub id: i64,
+    pub version: i64,
     pub name: String,
     pub description: String,
     pub updated_at: String,
@@ -28,6 +29,7 @@ impl From<CreateNodeKindParameters> for NodeKindModel {
     fn from(params: CreateNodeKindParameters) -> Self {
         NodeKindModel {
             id: 0,
+            version: 1,
             name: params.name,
             description: params.description,
             updated_at: String::new(),
@@ -39,6 +41,7 @@ impl From<NodeKindModel> for NodeKindResponse {
     fn from(node_kind: NodeKindModel) -> Self {
         NodeKindResponse {
             id: node_kind.id,
+            version: node_kind.version,
             name: node_kind.name,
             description: node_kind.description,
             updated_at: node_kind.updated_at,
@@ -332,6 +335,119 @@ impl From<ListNodesParameters> for NodeFilter {
                 within: params.within,
                 via: params.via,
                 descend: params.descend,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PackNodeKindParameters {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl From<PackNodeKindParameters> for PackNodeKind {
+    fn from(params: PackNodeKindParameters) -> Self {
+        PackNodeKind {
+            name: params.name,
+            description: params.description,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PackEdgeTypeParameters {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub resolves: Option<bool>,
+    #[serde(default)]
+    pub single_outgoing: Option<bool>,
+    #[serde(default)]
+    pub source_kinds: Option<Vec<String>>,
+    #[serde(default)]
+    pub destination_kinds: Option<Vec<String>>,
+}
+
+impl From<PackEdgeTypeParameters> for PackEdgeType {
+    fn from(params: PackEdgeTypeParameters) -> Self {
+        PackEdgeType {
+            name: params.name,
+            description: params.description,
+            resolves: params.resolves,
+            single_outgoing: params.single_outgoing,
+            source_kinds: params.source_kinds,
+            destination_kinds: params.destination_kinds,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    description = "Vocabulary pack. Names are matched exactly (case-sensitive). \
+                   Omitted node-kind fields are left unchanged; omitted edge-type fields \
+                   keep their stored value, and an empty list clears a constraint. \
+                   Nothing is deleted."
+)]
+pub struct ApplyPackParameters {
+    #[serde(default)]
+    pub node_kinds: Vec<PackNodeKindParameters>,
+    #[serde(default)]
+    pub edge_types: Vec<PackEdgeTypeParameters>,
+}
+
+impl From<ApplyPackParameters> for PackDraft {
+    fn from(params: ApplyPackParameters) -> Self {
+        PackDraft {
+            node_kinds: params.node_kinds.into_iter().map(Into::into).collect(),
+            edge_types: params.edge_types.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PackItemResponse {
+    pub id: i64,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<i64>,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PackReportResponse {
+    pub node_kinds: Vec<PackItemResponse>,
+    pub edge_types: Vec<PackItemResponse>,
+    pub created: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+}
+
+impl From<PackReport> for PackReportResponse {
+    fn from(report: PackReport) -> Self {
+        PackReportResponse {
+            created: report.created(),
+            updated: report.updated(),
+            unchanged: report.unchanged(),
+            node_kinds: report.node_kinds.into_iter().map(Into::into).collect(),
+            edge_types: report.edge_types.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<crate::model::PackItem> for PackItemResponse {
+    fn from(item: crate::model::PackItem) -> Self {
+        use crate::model::PackStatus;
+        PackItemResponse {
+            id: item.id,
+            name: item.name,
+            version: item.version,
+            status: match item.status {
+                PackStatus::Created => "created".to_string(),
+                PackStatus::Updated => "updated".to_string(),
+                PackStatus::Unchanged => "unchanged".to_string(),
             },
         }
     }

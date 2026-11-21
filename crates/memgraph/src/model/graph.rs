@@ -3,6 +3,7 @@ use sqlx::FromRow;
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct NodeKind {
     pub id: i64,
+    pub version: i64,
     pub name: String,
     pub description: String,
     pub updated_at: String,
@@ -30,7 +31,7 @@ impl EdgeType {
     }
 }
 
-fn split_kind_list(kinds: Option<&str>) -> Vec<&str> {
+pub(crate) fn split_kind_list(kinds: Option<&str>) -> Vec<&str> {
     kinds
         .map(|kinds| {
             kinds
@@ -40,6 +41,17 @@ fn split_kind_list(kinds: Option<&str>) -> Vec<&str> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+pub(crate) fn encode_kind_list(kinds: &[String]) -> Option<String> {
+    let mut unique: Vec<&str> = Vec::new();
+    for kind in kinds {
+        let kind = kind.trim();
+        if !kind.is_empty() && !unique.contains(&kind) {
+            unique.push(kind);
+        }
+    }
+    (!unique.is_empty()).then(|| unique.join(","))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -130,6 +142,73 @@ pub struct SearchPage {
 pub struct TagUsage {
     pub tag: String,
     pub node_count: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackStatus {
+    Created,
+    Updated,
+    Unchanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackItem {
+    pub id: i64,
+    pub name: String,
+    pub version: Option<i64>,
+    pub status: PackStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackNodeKind {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackEdgeType {
+    pub name: String,
+    pub description: Option<String>,
+    pub resolves: Option<bool>,
+    pub single_outgoing: Option<bool>,
+    pub source_kinds: Option<Vec<String>>,
+    pub destination_kinds: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PackDraft {
+    pub node_kinds: Vec<PackNodeKind>,
+    pub edge_types: Vec<PackEdgeType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PackReport {
+    pub node_kinds: Vec<PackItem>,
+    pub edge_types: Vec<PackItem>,
+}
+
+impl PackReport {
+    pub fn created(&self) -> usize {
+        self.items()
+            .filter(|item| item.status == PackStatus::Created)
+            .count()
+    }
+
+    pub fn updated(&self) -> usize {
+        self.items()
+            .filter(|item| item.status == PackStatus::Updated)
+            .count()
+    }
+
+    pub fn unchanged(&self) -> usize {
+        self.items()
+            .filter(|item| item.status == PackStatus::Unchanged)
+            .count()
+    }
+
+    fn items(&self) -> impl Iterator<Item = &PackItem> {
+        self.node_kinds.iter().chain(self.edge_types.iter())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]

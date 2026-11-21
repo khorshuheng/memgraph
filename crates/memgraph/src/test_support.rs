@@ -139,6 +139,7 @@ pub async fn seed_vocabulary(repository: &Arc<dyn GraphRepository>) {
         if let Err(error) = repository
             .create_node_kind(&NodeKind {
                 id: 0,
+                version: 0,
                 name: name.to_string(),
                 description: description.to_string(),
                 updated_at: String::new(),

@@ -7,16 +7,19 @@ use axum::{
 use crate::{
     dto::{
         graph::{
-            CreateEdgeParameters, CreateEdgeTypeParameters, CreateNodeKindParameters,
-            CreateNodeParameters, CreatePlanParameters, CreateTaskParameters, DeleteEdgeParameters,
-            EdgeTypeResponse, ListNodesParameters, NeighborParameters, NeighborResponse,
-            NodeKindResponse, NodeResponse, PlanResponse, ReplaceTagsParameters, SearchHitResponse,
+            ApplyPackParameters, CreateEdgeParameters, CreateEdgeTypeParameters,
+            CreateNodeKindParameters, CreateNodeParameters, CreatePlanParameters,
+            CreateTaskParameters, DeleteEdgeParameters, EdgeTypeResponse, ListNodesParameters,
+            NeighborParameters, NeighborResponse, NodeKindResponse, NodeResponse,
+            PackReportResponse, PlanResponse, ReplaceTagsParameters, SearchHitResponse,
             SearchParameters, SearchResponse, TagUsageResponse, UpdateTaskParameters,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
     },
-    model::{Edge, EdgeType, Node, NodeFilter, NodeKind, PlanDraft, TaskDraft, TaskPatch},
+    model::{
+        Edge, EdgeType, Node, NodeFilter, NodeKind, PackDraft, PlanDraft, TaskDraft, TaskPatch,
+    },
     state::AppState,
 };
 
@@ -87,6 +90,25 @@ pub async fn list_edge_types(
     Ok(ApiList {
         status: StatusCode::OK,
         items: edge_types.into_iter().map(Into::into).collect(),
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    post,
+    path = "/pack",
+    request_body = ApplyPackParameters,
+    responses((status = 200, description = "Vocabulary pack applied", body = PackReportResponse))
+)]
+pub async fn apply_pack(
+    State(state): State<AppState>,
+    Json(params): Json<ApplyPackParameters>,
+) -> Result<ApiSuccess<PackReportResponse>, ApiError> {
+    let pack: PackDraft = params.into();
+    let report = state.graph_service.apply_pack(&pack).await?;
+    Ok(ApiSuccess {
+        status: StatusCode::OK,
+        data: report.into(),
     })
 }
 
@@ -413,6 +435,7 @@ pub async fn graph_health(
 mod tests {
     use super::*;
     use crate::config::{AppConfig, DatabaseConfig, SearchConfig, ServerConfig};
+    use crate::dto::graph::{PackEdgeTypeParameters, PackNodeKindParameters};
 
     async fn test_state() -> AppState {
         AppState::new(&AppConfig {
@@ -434,6 +457,7 @@ mod tests {
             .graph_service
             .create_node_kind(&NodeKind {
                 id: 0,
+                version: 0,
                 name: name.to_string(),
                 description: String::new(),
                 updated_at: String::new(),
@@ -696,5 +720,50 @@ mod tests {
             .await
             .expect_err("missing node rejected");
         assert_eq!(error.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn applies_a_pack_and_reports_statuses() {
+        let state = test_state().await;
+        let pack = |description: &str| ApplyPackParameters {
+            node_kinds: vec![PackNodeKindParameters {
+                name: "widget".to_string(),
+                description: Some(description.to_string()),
+            }],
+            edge_types: vec![PackEdgeTypeParameters {
+                name: "widget_part".to_string(),
+                description: Some("widget -> widget".to_string()),
+                resolves: None,
+                single_outgoing: None,
+                source_kinds: Some(vec!["widget".to_string()]),
+                destination_kinds: Some(vec!["widget".to_string()]),
+            }],
+        };
+
+        let first = apply_pack(State(state.clone()), Json(pack("a widget")))
+            .await
+            .expect("first apply")
+            .data;
+        assert_eq!((first.created, first.updated, first.unchanged), (2, 0, 0));
+        assert_eq!(first.node_kinds[0].status, "created");
+
+        let second = apply_pack(State(state.clone()), Json(pack("a widget")))
+            .await
+            .expect("second apply")
+            .data;
+        assert_eq!(
+            (second.created, second.updated, second.unchanged),
+            (0, 0, 2)
+        );
+        assert_eq!(second.node_kinds[0].version, Some(1));
+        assert_eq!(second.edge_types[0].status, "unchanged");
+
+        let third = apply_pack(State(state.clone()), Json(pack("a changed widget")))
+            .await
+            .expect("third apply")
+            .data;
+        assert_eq!((third.updated, third.unchanged), (1, 1));
+        assert_eq!(third.node_kinds[0].version, Some(2));
+        assert_eq!(third.node_kinds[0].status, "updated");
     }
 }

@@ -17,6 +17,10 @@ pub enum RepositoryError {
     NotNullViolation(String),
     #[error("check constraint violation: {0}")]
     CheckViolation(String),
+    #[error("vocabulary contract violation: {0}")]
+    ContractViolation(String),
+    #[error("database busy: {0}")]
+    Busy(String),
 }
 
 impl From<sqlx::Error> for RepositoryError {
@@ -33,6 +37,9 @@ impl From<sqlx::Error> for RepositoryError {
                 }
                 ErrorKind::NotNullViolation => RepositoryError::NotNullViolation(err.to_string()),
                 ErrorKind::CheckViolation => RepositoryError::CheckViolation(err.to_string()),
+                _ if matches!(err.code().as_deref(), Some("5") | Some("6")) => {
+                    RepositoryError::Busy(err.to_string())
+                }
                 _ => RepositoryError::SqlExecutionError(err.to_string()),
             },
             _ => RepositoryError::SqlExecutionError(error.to_string()),

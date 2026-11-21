@@ -13,6 +13,8 @@ pub enum ServiceError {
     Conflict(String),
     #[error("unprocessable entity: {0}")]
     UnprocessableEntity(String),
+    #[error("service unavailable: {0}")]
+    Unavailable(String),
 }
 
 impl From<RepositoryError> for ServiceError {
@@ -21,6 +23,8 @@ impl From<RepositoryError> for ServiceError {
             RepositoryError::RowNotFound => ServiceError::EntityNotFound,
             RepositoryError::UniqueConstraintViolation(err) => ServiceError::Conflict(err),
             RepositoryError::ForeignKeyViolation(err) => ServiceError::UnprocessableEntity(err),
+            RepositoryError::ContractViolation(err) => ServiceError::UnprocessableEntity(err),
+            RepositoryError::Busy(err) => ServiceError::Unavailable(err),
             err => ServiceError::InternalError(err.to_string()),
         }
     }
@@ -43,6 +47,10 @@ impl From<ServiceError> for ApiError {
             },
             ServiceError::UnprocessableEntity(_) => ApiError {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
+                message: error.to_string(),
+            },
+            ServiceError::Unavailable(_) => ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
                 message: error.to_string(),
             },
         }

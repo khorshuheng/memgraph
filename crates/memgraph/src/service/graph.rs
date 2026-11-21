@@ -5,8 +5,8 @@ use crate::{
     config::SearchConfig,
     model::{
         Edge, EdgeType, Neighbor, NeighborDirection, Node, NodeFilter, NodeKind, NodeRef,
-        PendingEdge, Plan, PlanDraft, PlanTask, PlanTaskDraft, ReachFilter, SearchPage, TagUsage,
-        TaskDraft, TaskPatch,
+        PackDraft, PackEdgeType, PackNodeKind, PackReport, PendingEdge, Plan, PlanDraft, PlanTask,
+        PlanTaskDraft, ReachFilter, SearchPage, TagUsage, TaskDraft, TaskPatch,
     },
     repository::graph::GraphRepository,
 };
@@ -31,8 +31,10 @@ impl GraphService {
     }
 
     pub async fn create_node_kind(&self, node_kind: &NodeKind) -> Result<NodeKind, ServiceError> {
+        let mut node_kind = node_kind.clone();
+        node_kind.name = vocabulary_name(&node_kind.name, "node kind")?;
         self.repository
-            .create_node_kind(node_kind)
+            .create_node_kind(&node_kind)
             .await
             .map_err(ServiceError::from)
     }
@@ -45,8 +47,10 @@ impl GraphService {
     }
 
     pub async fn create_edge_type(&self, edge_type: &EdgeType) -> Result<EdgeType, ServiceError> {
+        let mut edge_type = edge_type.clone();
+        edge_type.name = vocabulary_name(&edge_type.name, "edge type")?;
         self.repository
-            .create_edge_type(edge_type)
+            .create_edge_type(&edge_type)
             .await
             .map_err(ServiceError::from)
     }
@@ -56,6 +60,74 @@ impl GraphService {
             .list_edge_types()
             .await
             .map_err(ServiceError::from)
+    }
+
+    pub async fn apply_pack(&self, pack: &PackDraft) -> Result<PackReport, ServiceError> {
+        let mut node_kinds = Vec::with_capacity(pack.node_kinds.len());
+        for kind in &pack.node_kinds {
+            node_kinds.push(PackNodeKind {
+                name: vocabulary_name(&kind.name, "node kind")?,
+                description: kind.description.clone(),
+            });
+        }
+
+        let mut edge_types = Vec::with_capacity(pack.edge_types.len());
+        for edge_type in &pack.edge_types {
+            edge_types.push(PackEdgeType {
+                name: vocabulary_name(&edge_type.name, "edge type")?,
+                description: edge_type.description.clone(),
+                resolves: edge_type.resolves,
+                single_outgoing: edge_type.single_outgoing,
+                source_kinds: edge_type
+                    .source_kinds
+                    .as_deref()
+                    .map(normalize_kind_list)
+                    .transpose()?,
+                destination_kinds: edge_type
+                    .destination_kinds
+                    .as_deref()
+                    .map(normalize_kind_list)
+                    .transpose()?,
+            });
+        }
+
+        reject_duplicate_names(&node_kinds, "node kind", |kind| kind.name.as_str())?;
+        reject_duplicate_names(&edge_types, "edge type", |edge_type| {
+            edge_type.name.as_str()
+        })?;
+
+        let mut known: HashSet<String> = self
+            .repository
+            .list_node_kinds()
+            .await?
+            .into_iter()
+            .map(|kind| kind.name)
+            .collect();
+        known.extend(node_kinds.iter().map(|kind| kind.name.clone()));
+        for edge_type in &edge_types {
+            let referenced = edge_type
+                .source_kinds
+                .iter()
+                .flatten()
+                .chain(edge_type.destination_kinds.iter().flatten());
+            for kind in referenced {
+                if !known.contains(kind) {
+                    return Err(ServiceError::UnprocessableEntity(format!(
+                        "edge type '{}' references undefined node kind '{kind}' \
+                         (kind names are case-sensitive)",
+                        edge_type.name
+                    )));
+                }
+            }
+        }
+
+        self.repository
+            .apply_pack(&PackDraft {
+                node_kinds,
+                edge_types,
+            })
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn upsert_node(&self, node: &Node) -> Result<Node, ServiceError> {
@@ -903,6 +975,63 @@ fn visit_dependencies<'a>(
 
 const MAX_TAG_LENGTH: usize = 128;
 
+const MAX_VOCABULARY_NAME_LENGTH: usize = 128;
+
+fn vocabulary_name(name: &str, label: &str) -> Result<String, ServiceError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ServiceError::UnprocessableEntity(format!(
+            "{label} name must not be empty"
+        )));
+    }
+    if name.chars().count() > MAX_VOCABULARY_NAME_LENGTH {
+        return Err(ServiceError::UnprocessableEntity(format!(
+            "{label} name exceeds {MAX_VOCABULARY_NAME_LENGTH} characters"
+        )));
+    }
+    if name.contains(',') {
+        return Err(ServiceError::UnprocessableEntity(format!(
+            "{label} name must not contain ','"
+        )));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(ServiceError::UnprocessableEntity(format!(
+            "{label} name must not contain control characters"
+        )));
+    }
+    Ok(name.to_string())
+}
+
+fn normalize_kind_list(kinds: &[String]) -> Result<Vec<String>, ServiceError> {
+    let mut normalized: Vec<String> = Vec::new();
+    for kind in kinds {
+        if kind.trim().is_empty() {
+            continue;
+        }
+        let kind = vocabulary_name(kind, "node kind")?;
+        if !normalized.contains(&kind) {
+            normalized.push(kind);
+        }
+    }
+    Ok(normalized)
+}
+
+fn reject_duplicate_names<T, F>(items: &[T], label: &str, name: F) -> Result<(), ServiceError>
+where
+    F: Fn(&T) -> &str,
+{
+    let mut seen: HashSet<&str> = HashSet::new();
+    for item in items {
+        let name = name(item);
+        if !seen.insert(name) {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "{label} '{name}' appears more than once in the pack"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn normalize_tags(tags: &[String]) -> Result<Vec<String>, ServiceError> {
     let mut normalized: Vec<String> = Vec::new();
     for tag in tags {
@@ -958,6 +1087,7 @@ mod tests {
     fn node_kind(name: &str) -> NodeKind {
         NodeKind {
             id: 0,
+            version: 0,
             name: name.to_string(),
             description: String::new(),
             updated_at: String::new(),
@@ -2714,5 +2844,433 @@ mod tests {
             .unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.hits[0].node.id, original.id);
+    }
+
+    fn pack_kind(name: &str, description: Option<&str>) -> PackNodeKind {
+        PackNodeKind {
+            name: name.to_string(),
+            description: description.map(str::to_string),
+        }
+    }
+
+    fn pack_edge_type(name: &str, source: &str, destination: &str) -> PackEdgeType {
+        PackEdgeType {
+            name: name.to_string(),
+            description: Some(format!("{source} -> {destination}")),
+            resolves: None,
+            single_outgoing: None,
+            source_kinds: Some(vec![source.to_string()]),
+            destination_kinds: Some(vec![destination.to_string()]),
+        }
+    }
+
+    #[tokio::test]
+    async fn applies_packs_idempotently_and_bumps_version_on_change() {
+        let service = service().await;
+        let pack = PackDraft {
+            node_kinds: vec![pack_kind("widget", Some("a widget"))],
+            edge_types: vec![pack_edge_type("widget_part", "widget", "widget")],
+        };
+
+        let first = service.apply_pack(&pack).await.unwrap();
+        assert_eq!(
+            (first.created(), first.updated(), first.unchanged()),
+            (2, 0, 0)
+        );
+        assert_eq!(first.node_kinds[0].version, Some(1));
+
+        let second = service.apply_pack(&pack).await.unwrap();
+        assert_eq!(
+            (second.created(), second.updated(), second.unchanged()),
+            (0, 0, 2)
+        );
+        assert_eq!(second.node_kinds[0].version, Some(1));
+
+        let mut changed = pack.clone();
+        changed.node_kinds[0].description = Some("a changed widget".to_string());
+        let third = service.apply_pack(&changed).await.unwrap();
+        assert_eq!(
+            (third.created(), third.updated(), third.unchanged()),
+            (0, 1, 1)
+        );
+        assert_eq!(third.node_kinds[0].version, Some(2));
+    }
+
+    #[tokio::test]
+    async fn trims_pack_names_before_matching() {
+        let service = service().await;
+        let pack = PackDraft {
+            node_kinds: vec![pack_kind("  widget  ", Some("a widget"))],
+            edge_types: vec![],
+        };
+        let first = service.apply_pack(&pack).await.unwrap();
+        assert_eq!(first.node_kinds[0].name, "widget");
+
+        let second = service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![pack_kind("widget", Some("a widget"))],
+                edge_types: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.unchanged(), 1);
+    }
+
+    #[tokio::test]
+    async fn updates_edge_type_contracts_in_place() {
+        let service = service().await;
+        let pack = PackDraft {
+            node_kinds: vec![pack_kind("widget", Some("a widget"))],
+            edge_types: vec![pack_edge_type("widget_part", "widget", "widget")],
+        };
+        service.apply_pack(&pack).await.unwrap();
+
+        let mut changed = pack.clone();
+        changed.edge_types[0].single_outgoing = Some(true);
+        let report = service.apply_pack(&changed).await.unwrap();
+        assert_eq!((report.updated(), report.unchanged()), (1, 1));
+
+        let stored = service
+            .list_edge_types()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|edge_type| edge_type.name == "widget_part")
+            .expect("edge type stored");
+        assert!(stored.single_outgoing);
+    }
+
+    #[tokio::test]
+    async fn a_partial_pack_leaves_edge_type_fields_untouched() {
+        let service = service().await;
+        service
+            .create_edge_type(&EdgeType {
+                id: 0,
+                name: "custom".to_string(),
+                description: "original".to_string(),
+                resolves: true,
+                single_outgoing: true,
+                source_kinds: Some("task".to_string()),
+                destination_kinds: Some("goal".to_string()),
+                updated_at: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let report = service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![],
+                edge_types: vec![PackEdgeType {
+                    name: "custom".to_string(),
+                    description: Some("changed".to_string()),
+                    resolves: None,
+                    single_outgoing: None,
+                    source_kinds: None,
+                    destination_kinds: None,
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.updated(), 1);
+
+        let stored = service
+            .list_edge_types()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|edge_type| edge_type.name == "custom")
+            .expect("edge type stored");
+        assert_eq!(stored.description, "changed");
+        assert!(stored.resolves);
+        assert!(stored.single_outgoing);
+        assert_eq!(stored.source_kinds.as_deref(), Some("task"));
+        assert_eq!(stored.destination_kinds.as_deref(), Some("goal"));
+
+        service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![],
+                edge_types: vec![PackEdgeType {
+                    name: "custom".to_string(),
+                    description: None,
+                    resolves: None,
+                    single_outgoing: None,
+                    source_kinds: Some(vec![]),
+                    destination_kinds: None,
+                }],
+            })
+            .await
+            .unwrap();
+        let cleared = service
+            .list_edge_types()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|edge_type| edge_type.name == "custom")
+            .expect("edge type stored");
+        assert_eq!(cleared.source_kinds, None);
+        assert_eq!(cleared.destination_kinds.as_deref(), Some("goal"));
+    }
+
+    #[tokio::test]
+    async fn rejects_contract_tightening_that_orphans_existing_edges() {
+        let service = service().await;
+        let alpha = service
+            .create_node_kind(&node_kind("alpha"))
+            .await
+            .unwrap()
+            .id;
+        let beta = service
+            .create_node_kind(&node_kind("beta"))
+            .await
+            .unwrap()
+            .id;
+        let links = service
+            .create_edge_type(&edge_type("links", "alpha -> beta"))
+            .await
+            .unwrap()
+            .id;
+        let source = service
+            .create_node(&node(alpha, "na", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let destination = service
+            .create_node(&node(beta, "nb", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        service
+            .add_edge(&Edge {
+                source: source.id,
+                destination: destination.id,
+                edge_type_id: links,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let error = service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![],
+                edge_types: vec![PackEdgeType {
+                    name: "links".to_string(),
+                    description: None,
+                    resolves: None,
+                    single_outgoing: None,
+                    source_kinds: Some(vec!["beta".to_string()]),
+                    destination_kinds: Some(vec!["beta".to_string()]),
+                }],
+            })
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("existing edges in violation"));
+
+        let stored = service
+            .list_edge_types()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|edge_type| edge_type.name == "links")
+            .expect("edge type stored");
+        assert_eq!(stored.source_kinds, None);
+    }
+
+    #[tokio::test]
+    async fn rejects_single_outgoing_tightening_with_existing_fan_out() {
+        let service = service().await;
+        let alpha = service
+            .create_node_kind(&node_kind("alpha"))
+            .await
+            .unwrap()
+            .id;
+        let beta = service
+            .create_node_kind(&node_kind("beta"))
+            .await
+            .unwrap()
+            .id;
+        let fan = service
+            .create_edge_type(&edge_type("fan", "alpha -> beta"))
+            .await
+            .unwrap()
+            .id;
+        let source = service
+            .create_node(&node(alpha, "na", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        for name in ["first", "second"] {
+            let destination = service
+                .create_node(&node(beta, name, ""), &[])
+                .await
+                .unwrap()
+                .0;
+            service
+                .add_edge(&Edge {
+                    source: source.id,
+                    destination: destination.id,
+                    edge_type_id: fan,
+                    created_at: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let error = service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![],
+                edge_types: vec![PackEdgeType {
+                    name: "fan".to_string(),
+                    description: None,
+                    resolves: None,
+                    single_outgoing: Some(true),
+                    source_kinds: None,
+                    destination_kinds: None,
+                }],
+            })
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("outgoing edges"));
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_and_undefined_pack_entries() {
+        let service = service().await;
+        assert!(matches!(
+            service
+                .apply_pack(&PackDraft {
+                    node_kinds: vec![pack_kind("widget", None), pack_kind("widget", None)],
+                    edge_types: vec![],
+                })
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+
+        let ghost = pack_edge_type("widget_part", "widget", "ghost");
+        let error = service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![pack_kind("widget", None)],
+                edge_types: vec![ghost],
+            })
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("ghost"));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_vocabulary_names() {
+        let service = service().await;
+        for name in ["", "   ", "a,b", "a\nb"] {
+            assert!(
+                matches!(
+                    service.create_node_kind(&node_kind(name)).await,
+                    Err(ServiceError::UnprocessableEntity(_))
+                ),
+                "{name:?} must be rejected"
+            );
+        }
+        let long = "n".repeat(MAX_VOCABULARY_NAME_LENGTH + 1);
+        assert!(matches!(
+            service.create_node_kind(&node_kind(&long)).await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+        assert!(matches!(
+            service.create_edge_type(&edge_type("a,b", "")).await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+        assert!(matches!(
+            service
+                .apply_pack(&PackDraft {
+                    node_kinds: vec![pack_kind("a,b", None)],
+                    edge_types: vec![],
+                })
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn pack_never_deletes_omitted_vocabulary() {
+        let service = service().await;
+        service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![pack_kind("widget", Some("a widget"))],
+                edge_types: vec![pack_edge_type("widget_part", "widget", "widget")],
+            })
+            .await
+            .unwrap();
+
+        let report = service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![],
+                edge_types: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.created(), 0);
+        assert!(
+            service
+                .list_node_kinds()
+                .await
+                .unwrap()
+                .iter()
+                .any(|existing| existing.name == "widget")
+        );
+        assert!(
+            service
+                .list_edge_types()
+                .await
+                .unwrap()
+                .iter()
+                .any(|existing| existing.name == "widget_part")
+        );
+    }
+
+    async fn file_service(path: &std::path::Path) -> GraphService {
+        let config = crate::config::DatabaseConfig {
+            path: path.to_string_lossy().into_owned(),
+            max_connections: 5,
+        };
+        let pool = create_sqlite_pool(&config)
+            .await
+            .expect("failed to create database connection pool");
+        migrate(&pool).await.expect("failed to migrate database");
+        let repository: Arc<dyn GraphRepository> = Arc::new(SqliteGraphRepository::new(pool));
+        GraphService::new(repository, crate::config::SearchConfig::default())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_applies_serialize_as_idempotent_writes() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "memgraph-pack-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let service = file_service(&path).await;
+        let pack = PackDraft {
+            node_kinds: vec![pack_kind("race", Some("race kind"))],
+            edge_types: vec![pack_edge_type("race_edge", "race", "race")],
+        };
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let service = service.clone();
+            let pack = pack.clone();
+            handles.push(tokio::spawn(async move { service.apply_pack(&pack).await }));
+        }
+        let mut created = 0;
+        let mut unchanged = 0;
+        for handle in handles {
+            let report = handle.await.unwrap().expect("apply succeeds");
+            created += report.created();
+            unchanged += report.unchanged();
+        }
+        assert_eq!(created, 2);
+        assert_eq!(unchanged, 14);
+
+        drop(service);
+        std::fs::remove_file(&path).ok();
     }
 }
