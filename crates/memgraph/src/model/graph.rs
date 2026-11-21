@@ -163,10 +163,103 @@ pub struct PackItem {
     pub status: PackStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PropertyType {
+    #[default]
+    Any,
+    String,
+    Number,
+    Integer,
+    Boolean,
+    Array,
+    Object,
+}
+
+impl PropertyType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PropertyType::Any => "any",
+            PropertyType::String => "string",
+            PropertyType::Number => "number",
+            PropertyType::Integer => "integer",
+            PropertyType::Boolean => "boolean",
+            PropertyType::Array => "array",
+            PropertyType::Object => "object",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "any" => Some(PropertyType::Any),
+            "string" => Some(PropertyType::String),
+            "number" => Some(PropertyType::Number),
+            "integer" => Some(PropertyType::Integer),
+            "boolean" => Some(PropertyType::Boolean),
+            "array" => Some(PropertyType::Array),
+            "object" => Some(PropertyType::Object),
+            _ => None,
+        }
+    }
+
+    pub fn accepts(self, value: &serde_json::Value) -> bool {
+        match self {
+            PropertyType::Any => true,
+            PropertyType::String => value.is_string(),
+            PropertyType::Number => value.is_number(),
+            PropertyType::Integer => value.as_i64().is_some() || value.as_u64().is_some(),
+            PropertyType::Boolean => value.is_boolean(),
+            PropertyType::Array => value.is_array(),
+            PropertyType::Object => value.is_object(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeKindProperty {
+    pub key: String,
+    pub value_type: PropertyType,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackProperty {
+    pub key: String,
+    pub value_type: Option<String>,
+    pub required: bool,
+}
+
+pub fn validate_declared_properties(
+    properties: &serde_json::Value,
+    declarations: &[NodeKindProperty],
+) -> Result<(), String> {
+    let object = properties
+        .as_object()
+        .ok_or_else(|| "properties must be a JSON object".to_string())?;
+    for declaration in declarations {
+        match object.get(&declaration.key) {
+            Some(value) => {
+                if !declaration.value_type.accepts(value) {
+                    return Err(format!(
+                        "property '{}' must be a {}",
+                        declaration.key,
+                        declaration.value_type.as_str()
+                    ));
+                }
+            }
+            None if declaration.required => {
+                return Err(format!("property '{}' is required", declaration.key));
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackNodeKind {
     pub name: String,
     pub description: Option<String>,
+    pub properties: Option<Vec<PackProperty>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,6 +486,12 @@ pub enum NodeRef {
     New(usize),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingNode {
+    pub node: Node,
+    pub properties: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingEdge {
     pub source: NodeRef,
@@ -409,6 +508,7 @@ pub struct TaskDraft {
     pub parent: Option<i64>,
     pub depends_on: Vec<i64>,
     pub affects: Vec<i64>,
+    pub properties: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -435,11 +535,15 @@ pub struct TaskPatch {
     pub name: Option<String>,
     pub description: Option<String>,
     pub content: Option<String>,
+    pub properties: Option<serde_json::Value>,
 }
 
 impl TaskPatch {
     pub fn is_empty(&self) -> bool {
-        self.name.is_none() && self.description.is_none() && self.content.is_none()
+        self.name.is_none()
+            && self.description.is_none()
+            && self.content.is_none()
+            && self.properties.is_none()
     }
 }
 
@@ -449,6 +553,7 @@ pub struct PlanGoalDraft {
     pub name: String,
     pub description: String,
     pub content: String,
+    pub properties: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,6 +566,7 @@ pub struct PlanTaskDraft {
     pub parent: Option<String>,
     pub depends_on: Vec<String>,
     pub affects: Vec<i64>,
+    pub properties: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

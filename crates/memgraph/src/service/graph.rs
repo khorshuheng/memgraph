@@ -5,9 +5,10 @@ use crate::{
     config::SearchConfig,
     model::{
         Edge, EdgeType, ImportDraft, ImportEdge, ImportNode, ImportRef, ImportReport, Neighbor,
-        NeighborDirection, Node, NodeFilter, NodeKind, NodePatch, NodeRef, PackDraft, PackEdgeType,
-        PackNodeKind, PackReport, PendingEdge, Plan, PlanDraft, PlanTask, PlanTaskDraft,
-        ReachFilter, SearchPage, TagUsage, TaskDraft, TaskPatch,
+        NeighborDirection, Node, NodeFilter, NodeKind, NodeKindProperty, NodePatch, NodeRef,
+        PackDraft, PackEdgeType, PackNodeKind, PackProperty, PackReport, PendingEdge, PendingNode,
+        Plan, PlanDraft, PlanTask, PlanTaskDraft, PropertyType, ReachFilter, SearchPage, TagUsage,
+        TaskDraft, TaskPatch,
     },
     repository::graph::GraphRepository,
 };
@@ -69,6 +70,10 @@ impl GraphService {
             node_kinds.push(PackNodeKind {
                 name: vocabulary_name(&kind.name, "node kind")?,
                 description: kind.description.clone(),
+                properties: match &kind.properties {
+                    None => None,
+                    Some(properties) => Some(normalize_property_declarations(properties)?),
+                },
             });
         }
 
@@ -492,7 +497,7 @@ impl GraphService {
                     description: patch.description.clone(),
                     content: patch.content.clone(),
                     tags: None,
-                    properties: None,
+                    properties: patch.properties.clone(),
                 },
             )
             .await?;
@@ -584,9 +589,13 @@ impl GraphService {
             });
         }
 
+        let pending = PendingNode {
+            node,
+            properties: draft.properties.clone(),
+        };
         let mut created = self
             .repository
-            .insert_nodes_with_edges(std::slice::from_ref(&node), &edges)
+            .insert_nodes_with_edges(std::slice::from_ref(&pending), &edges)
             .await?;
         created.pop().ok_or_else(|| {
             ServiceError::InternalError("task creation returned no node".to_string())
@@ -808,10 +817,10 @@ impl GraphService {
         self.require_available_name(node.kind_id, &node.name, 0)
             .await?;
         let tags = normalize_tags(tags)?;
-        let encoded = encode_properties(properties)?;
+        encode_properties(properties)?;
         let created = self
             .repository
-            .upsert_node_with_tags(&node, &tags, encoded.as_deref())
+            .upsert_node_with_tags(&node, &tags, properties)
             .await?;
         Ok((created, tags))
     }
@@ -819,6 +828,16 @@ impl GraphService {
     pub async fn node_properties(&self, node_id: i64) -> Result<serde_json::Value, ServiceError> {
         let raw = self.repository.node_properties(node_id).await?;
         Ok(parse_properties(&raw))
+    }
+
+    pub async fn node_kind_properties_for_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<NodeKindProperty>>, ServiceError> {
+        self.repository
+            .node_kind_properties_for_ids(ids)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn node_properties_for_ids(
@@ -973,26 +992,32 @@ fn build_plan_nodes(
     task_kind: i64,
     goal_kind: Option<i64>,
     offset: usize,
-) -> Vec<Node> {
+) -> Vec<PendingNode> {
     let mut nodes = Vec::with_capacity(offset + draft.tasks.len());
     if let (Some(goal), Some(goal_kind)) = (&draft.goal, goal_kind) {
-        nodes.push(Node {
-            id: goal.id,
-            kind_id: goal_kind,
-            name: goal.name.clone(),
-            description: goal.description.clone(),
-            content: goal.content.clone(),
-            updated_at: String::new(),
+        nodes.push(PendingNode {
+            node: Node {
+                id: goal.id,
+                kind_id: goal_kind,
+                name: goal.name.clone(),
+                description: goal.description.clone(),
+                content: goal.content.clone(),
+                updated_at: String::new(),
+            },
+            properties: goal.properties.clone(),
         });
     }
     for task in &draft.tasks {
-        nodes.push(Node {
-            id: task.id,
-            kind_id: task_kind,
-            name: task.name.clone(),
-            description: task.description.clone(),
-            content: task.content.clone(),
-            updated_at: String::new(),
+        nodes.push(PendingNode {
+            node: Node {
+                id: task.id,
+                kind_id: task_kind,
+                name: task.name.clone(),
+                description: task.description.clone(),
+                content: task.content.clone(),
+                updated_at: String::new(),
+            },
+            properties: task.properties.clone(),
         });
     }
     nodes
@@ -1215,6 +1240,49 @@ fn visit_dependencies<'a>(
 }
 
 const MAX_TAG_LENGTH: usize = 128;
+
+fn normalize_property_declarations(
+    properties: &[PackProperty],
+) -> Result<Vec<PackProperty>, ServiceError> {
+    let mut normalized: Vec<PackProperty> = Vec::new();
+    for property in properties {
+        let key = property.key.trim().to_string();
+        if key.is_empty() {
+            return Err(ServiceError::UnprocessableEntity(
+                "property key must not be empty".to_string(),
+            ));
+        }
+        if key.chars().count() > MAX_VOCABULARY_NAME_LENGTH {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "property key '{key}' exceeds {MAX_VOCABULARY_NAME_LENGTH} characters"
+            )));
+        }
+        if key.chars().any(char::is_control) {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "property key '{key}' must not contain control characters"
+            )));
+        }
+        let value_type = PropertyType::parse(property.value_type.as_deref().unwrap_or("any"))
+            .ok_or_else(|| {
+                ServiceError::UnprocessableEntity(format!(
+                    "property '{key}' has an unknown type '{}'",
+                    property.value_type.as_deref().unwrap_or("")
+                ))
+            })?;
+        if normalized.iter().any(|existing| existing.key == key) {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "property '{key}' appears more than once"
+            )));
+        }
+        normalized.push(PackProperty {
+            key,
+            value_type: Some(value_type.as_str().to_string()),
+            required: property.required,
+        });
+    }
+    normalized.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(normalized)
+}
 
 fn encode_properties(
     properties: Option<&serde_json::Value>,
@@ -1681,6 +1749,7 @@ mod tests {
             parent: parent.map(str::to_string),
             depends_on: depends_on.iter().map(|value| value.to_string()).collect(),
             affects: vec![],
+            properties: None,
         }
     }
 
@@ -1691,6 +1760,7 @@ mod tests {
                 name: "ship feature".to_string(),
                 description: String::new(),
                 content: String::new(),
+                properties: None,
             }),
             goal_id: None,
             anchor: Some(PlanAnchorDraft {
@@ -1745,6 +1815,7 @@ mod tests {
             parent: None,
             depends_on: vec![],
             affects: vec![],
+            properties: None,
         }
     }
 
@@ -2116,6 +2187,7 @@ mod tests {
                 name: "ship".to_string(),
                 description: String::new(),
                 content: String::new(),
+                properties: None,
             }),
             goal_id: None,
             anchor: Some(PlanAnchorDraft {
@@ -2268,6 +2340,7 @@ mod tests {
                     name: None,
                     description: Some("recalibrated widget".to_string()),
                     content: None,
+                    properties: None,
                 },
             )
             .await
@@ -2315,6 +2388,7 @@ mod tests {
                         name: None,
                         description: None,
                         content: None,
+                        properties: None,
                     },
                 )
                 .await,
@@ -2328,6 +2402,7 @@ mod tests {
                         name: None,
                         description: Some("x".to_string()),
                         content: None,
+                        properties: None,
                     },
                 )
                 .await,
@@ -2341,6 +2416,7 @@ mod tests {
                         name: None,
                         description: Some("x".to_string()),
                         content: None,
+                        properties: None,
                     },
                 )
                 .await
@@ -2735,6 +2811,7 @@ mod tests {
                 name: goal.to_string(),
                 description: String::new(),
                 content: String::new(),
+                properties: None,
             }),
             goal_id: None,
             anchor: Some(anchor),
@@ -2866,6 +2943,7 @@ mod tests {
                 name: "ship feature".to_string(),
                 description: String::new(),
                 content: String::new(),
+                properties: None,
             }),
             goal_id: None,
             anchor: None,
@@ -3383,6 +3461,7 @@ mod tests {
         PackNodeKind {
             name: name.to_string(),
             description: description.map(str::to_string),
+            properties: None,
         }
     }
 
@@ -4154,6 +4233,7 @@ mod tests {
                     name: "ship widgets".to_string(),
                     description: String::new(),
                     content: String::new(),
+                    properties: None,
                 }),
                 goal_id: None,
                 anchor: Some(PlanAnchorDraft {
@@ -4180,6 +4260,7 @@ mod tests {
                     name: "first goal".to_string(),
                     description: String::new(),
                     content: String::new(),
+                    properties: None,
                 }),
                 goal_id: None,
                 anchor: Some(PlanAnchorDraft {
@@ -4200,6 +4281,7 @@ mod tests {
                     name: "second goal".to_string(),
                     description: String::new(),
                     content: String::new(),
+                    properties: None,
                 }),
                 goal_id: None,
                 anchor: Some(PlanAnchorDraft {
@@ -4570,6 +4652,7 @@ mod tests {
                                 name: Some(name),
                                 description: None,
                                 content: None,
+                                properties: None,
                             },
                         )
                         .await
@@ -5201,5 +5284,281 @@ mod tests {
                 .await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
+    }
+
+    fn property(key: &str, value_type: &str, required: bool) -> PackProperty {
+        PackProperty {
+            key: key.to_string(),
+            value_type: Some(value_type.to_string()),
+            required,
+        }
+    }
+
+    fn widget_pack(properties: Option<Vec<PackProperty>>) -> PackDraft {
+        PackDraft {
+            node_kinds: vec![PackNodeKind {
+                name: "widget".to_string(),
+                description: Some("a widget".to_string()),
+                properties,
+            }],
+            edge_types: vec![],
+        }
+    }
+
+    async fn widget_kind_id(service: &GraphService) -> i64 {
+        service
+            .list_node_kinds()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|kind| kind.name == "widget")
+            .expect("widget kind")
+            .id
+    }
+
+    #[tokio::test]
+    async fn pack_declares_and_replaces_kind_properties() {
+        let service = service().await;
+        let report = service
+            .apply_pack(&widget_pack(Some(vec![
+                property("status", "string", true),
+                property("confidence", "number", false),
+            ])))
+            .await
+            .unwrap();
+        assert_eq!(report.created(), 1);
+        let kind_id = widget_kind_id(&service).await;
+        let declarations = service
+            .node_kind_properties_for_ids(&[kind_id])
+            .await
+            .unwrap();
+        let declared = declarations.get(&kind_id).cloned().unwrap_or_default();
+        assert_eq!(declared.len(), 2);
+        assert_eq!(declared[0].key, "confidence");
+        assert!(declared.iter().any(|property| property.key == "status"
+            && property.required
+            && property.value_type == PropertyType::String));
+
+        let report = service
+            .apply_pack(&widget_pack(Some(vec![property(
+                "status", "string", false,
+            )])))
+            .await
+            .unwrap();
+        assert_eq!(report.updated(), 1);
+        let kind = service
+            .list_node_kinds()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|kind| kind.name == "widget")
+            .unwrap();
+        assert_eq!(kind.version, 2);
+        let declarations = service
+            .node_kind_properties_for_ids(&[kind_id])
+            .await
+            .unwrap();
+        let declared = declarations.get(&kind_id).cloned().unwrap_or_default();
+        assert_eq!(declared.len(), 1);
+        assert!(!declared[0].required);
+
+        let report = service.apply_pack(&widget_pack(None)).await.unwrap();
+        assert_eq!(report.unchanged(), 1);
+        let declarations = service
+            .node_kind_properties_for_ids(&[kind_id])
+            .await
+            .unwrap();
+        assert_eq!(declarations.get(&kind_id).map(Vec::len).unwrap_or(0), 1);
+
+        service
+            .apply_pack(&widget_pack(Some(vec![])))
+            .await
+            .unwrap();
+        let declarations = service
+            .node_kind_properties_for_ids(&[kind_id])
+            .await
+            .unwrap();
+        assert!(
+            declarations
+                .get(&kind_id)
+                .map(Vec::is_empty)
+                .unwrap_or(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_properties_are_enforced_on_writes() {
+        let service = service().await;
+        service
+            .apply_pack(&widget_pack(Some(vec![
+                property("status", "string", true),
+                property("confidence", "number", false),
+            ])))
+            .await
+            .unwrap();
+        let kind_id = widget_kind_id(&service).await;
+
+        let missing = service
+            .create_node(&node(kind_id, "missing", ""), &[])
+            .await
+            .unwrap_err();
+        assert!(rejection(missing).contains("required"));
+
+        let wrong = service
+            .create_node_with_properties(
+                &node(kind_id, "wrong", ""),
+                &[],
+                Some(&serde_json::json!({"status": 1})),
+            )
+            .await
+            .unwrap_err();
+        assert!(rejection(wrong).contains("must be a string"));
+
+        let created = service
+            .create_node_with_properties(
+                &node(kind_id, "ok", ""),
+                &[],
+                Some(&serde_json::json!({
+                    "status": "new",
+                    "confidence": 0.5,
+                    "undeclared": true
+                })),
+            )
+            .await
+            .unwrap()
+            .0;
+
+        let patched = service
+            .update_node(
+                created.id,
+                &NodePatch {
+                    properties: Some(serde_json::json!({"confidence": 0.9})),
+                    ..NodePatch::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(rejection(patched).contains("required"));
+
+        let patched = service
+            .update_node(
+                created.id,
+                &NodePatch {
+                    properties: Some(serde_json::json!({"status": 5})),
+                    ..NodePatch::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(rejection(patched).contains("must be a string"));
+
+        let imported = import_node(None, "widget", "imported");
+        let error = service
+            .import_graph(&import_draft(vec![imported], vec![]))
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("required"));
+
+        let mut imported = import_node(None, "widget", "imported");
+        imported.properties = Some(serde_json::json!({"status": "new"}));
+        service
+            .import_graph(&import_draft(vec![imported], vec![]))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_property_declarations() {
+        let service = service().await;
+        for properties in [
+            vec![property("status", "strange", false)],
+            vec![property(" ", "string", false)],
+            vec![
+                property("a", "string", false),
+                property("a", "number", false),
+            ],
+        ] {
+            assert!(matches!(
+                service.apply_pack(&widget_pack(Some(properties))).await,
+                Err(ServiceError::UnprocessableEntity(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn tasks_and_plans_enforce_and_store_declared_properties() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+        service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![PackNodeKind {
+                    name: "task".to_string(),
+                    description: None,
+                    properties: Some(vec![property("owner", "string", true)]),
+                }],
+                edge_types: vec![],
+            })
+            .await
+            .unwrap();
+        let goal = anchored_goal(&service, repo).await;
+
+        let mut draft = new_task("planned child");
+        draft.parent = Some(goal);
+        let error = service.create_task(&draft).await.unwrap_err();
+        assert!(rejection(error).contains("owner"));
+
+        draft.properties = Some(serde_json::json!({"owner": "alice"}));
+        let created = service.create_task(&draft).await.unwrap();
+        assert_eq!(
+            service.node_properties(created.id).await.unwrap(),
+            serde_json::json!({"owner": "alice"})
+        );
+
+        let mut task = plan_task("planned", None, &[]);
+        let error = service
+            .create_plan(&plan_draft(repo, vec![task.clone()]))
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("owner"));
+
+        task.properties = Some(serde_json::json!({"owner": "bob"}));
+        let plan = service
+            .create_plan(&plan_draft(repo, vec![task]))
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .node_properties(plan.tasks[0].node.id)
+                .await
+                .unwrap(),
+            serde_json::json!({"owner": "bob"})
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_mode_does_not_validate_properties_it_will_not_write() {
+        let service = service().await;
+        service
+            .apply_pack(&widget_pack(Some(vec![property("owner", "string", true)])))
+            .await
+            .unwrap();
+        let mut created = import_node(Some("w"), "widget", "w");
+        created.properties = Some(serde_json::json!({"owner": "x"}));
+        service
+            .import_graph(&import_draft(vec![created], vec![]))
+            .await
+            .unwrap();
+
+        let mut skipped = import_node(Some("w"), "widget", "w");
+        skipped.properties = Some(serde_json::json!({}));
+        let report = service
+            .import_graph(&ImportDraft {
+                on_conflict: ImportConflict::Skip,
+                nodes: vec![skipped],
+                edges: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.nodes_skipped(), 1);
     }
 }

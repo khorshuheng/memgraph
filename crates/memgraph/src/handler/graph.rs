@@ -11,7 +11,7 @@ use crate::{
             CreateNodeKindParameters, CreateNodeParameters, CreatePlanParameters,
             CreateTaskParameters, DeleteEdgeParameters, EdgeTypeResponse, ImportParameters,
             ImportReportResponse, ListNodesParameters, NeighborParameters, NeighborResponse,
-            NodeKindResponse, NodeResponse, PackReportResponse, PlanResponse,
+            NodeKindResponse, NodeResponse, PackReportResponse, PlanResponse, PlanTaskResponse,
             ReplaceTagsParameters, SearchHitResponse, SearchParameters, SearchResponse,
             TagUsageResponse, UpdateEdgeParameters, UpdateNodeParameters, UpdateTaskParameters,
         },
@@ -54,9 +54,25 @@ pub async fn list_node_kinds(
     State(state): State<AppState>,
 ) -> Result<ApiList<NodeKindResponse>, ApiError> {
     let node_kinds = state.graph_service.list_node_kinds().await?;
+    let ids: Vec<i64> = node_kinds.iter().map(|kind| kind.id).collect();
+    let mut properties = state
+        .graph_service
+        .node_kind_properties_for_ids(&ids)
+        .await?;
     Ok(ApiList {
         status: StatusCode::OK,
-        items: node_kinds.into_iter().map(Into::into).collect(),
+        items: node_kinds
+            .into_iter()
+            .map(|kind| {
+                let declared = properties
+                    .remove(&kind.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
+                NodeKindResponse::with_properties(kind, declared)
+            })
+            .collect(),
     })
 }
 
@@ -152,9 +168,10 @@ pub async fn create_task(
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let draft: TaskDraft = params.into();
     let created = state.graph_service.create_task(&draft).await?;
+    let properties = state.graph_service.node_properties(created.id).await?;
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
-        data: created.into(),
+        data: NodeResponse::with_tags_and_properties(created, Vec::new(), properties),
     })
 }
 
@@ -171,9 +188,35 @@ pub async fn create_plan(
 ) -> Result<ApiSuccess<PlanResponse>, ApiError> {
     let draft: PlanDraft = params.into();
     let plan = state.graph_service.create_plan(&draft).await?;
+    let ids: Vec<i64> = plan
+        .goal
+        .iter()
+        .map(|goal| goal.id)
+        .chain(plan.tasks.iter().map(|task| task.node.id))
+        .collect();
+    let mut properties = state.graph_service.node_properties_for_ids(&ids).await?;
+    let goal = plan.goal.map(|goal| {
+        let properties = properties
+            .remove(&goal.id)
+            .unwrap_or_else(|| serde_json::json!({}));
+        NodeResponse::with_tags_and_properties(goal, Vec::new(), properties)
+    });
+    let tasks = plan
+        .tasks
+        .into_iter()
+        .map(|task| {
+            let properties = properties
+                .remove(&task.node.id)
+                .unwrap_or_else(|| serde_json::json!({}));
+            PlanTaskResponse {
+                key: task.key,
+                node: NodeResponse::with_tags_and_properties(task.node, Vec::new(), properties),
+            }
+        })
+        .collect();
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
-        data: plan.into(),
+        data: PlanResponse { goal, tasks },
     })
 }
 
@@ -247,9 +290,10 @@ pub async fn update_task(
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let patch: TaskPatch = params.into();
     let updated = state.graph_service.update_task(task_id, &patch).await?;
+    let properties = state.graph_service.node_properties(updated.id).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: updated.into(),
+        data: NodeResponse::with_tags_and_properties(updated, Vec::new(), properties),
     })
 }
 
@@ -559,9 +603,11 @@ mod tests {
     use super::*;
     use crate::config::{AppConfig, DatabaseConfig, SearchConfig, ServerConfig};
     use crate::dto::graph::{
-        ImportConflictParameters, ImportNodeParameters, NeighborDirection, PackEdgeTypeParameters,
-        PackNodeKindParameters,
+        CreatePlanGoalParameters, CreatePlanTaskParameters, ImportConflictParameters,
+        ImportNodeParameters, NeighborDirection, PackEdgeTypeParameters, PackNodeKindParameters,
+        PackPropertyParameters, PlanAnchorParameters,
     };
+    use crate::model::{PackNodeKind, PackProperty};
 
     async fn test_state() -> AppState {
         AppState::new(&AppConfig {
@@ -840,6 +886,7 @@ mod tests {
                 name: Some("b".to_string()),
                 description: None,
                 content: None,
+                properties: None,
             }),
         )
         .await
@@ -863,6 +910,7 @@ mod tests {
             node_kinds: vec![PackNodeKindParameters {
                 name: "widget".to_string(),
                 description: Some(description.to_string()),
+                properties: None,
             }],
             edge_types: vec![PackEdgeTypeParameters {
                 name: "widget_part".to_string(),
@@ -1292,5 +1340,123 @@ mod tests {
         .await
         .expect_err("invalid properties");
         assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn node_kind_responses_include_declared_properties() {
+        let state = test_state().await;
+        state
+            .graph_service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![PackNodeKind {
+                    name: "widget".to_string(),
+                    description: Some("a widget".to_string()),
+                    properties: Some(vec![PackProperty {
+                        key: "status".to_string(),
+                        value_type: Some("string".to_string()),
+                        required: true,
+                    }]),
+                }],
+                edge_types: vec![],
+            })
+            .await
+            .expect("apply pack");
+
+        let kinds = list_node_kinds(State(state.clone()))
+            .await
+            .expect("list node kinds");
+        let widget = kinds
+            .items
+            .iter()
+            .find(|kind| kind.name == "widget")
+            .expect("widget kind");
+        assert_eq!(widget.properties.len(), 1);
+        assert_eq!(widget.properties[0].key, "status");
+        assert_eq!(widget.properties[0].value_type, "string");
+        assert!(widget.properties[0].required);
+    }
+
+    #[test]
+    fn pack_property_type_rejects_unknown_values() {
+        assert!(
+            serde_json::from_str::<PackPropertyParameters>(r#"{"key":"x","value_type":"strange"}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<PackPropertyParameters>(r#"{"key":"x","value_type":"string"}"#)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_responses_include_task_and_goal_properties() {
+        let state = test_state().await;
+        let repo_kind = seed_kind(&state, "repo").await;
+        seed_kind(&state, "goal").await;
+        seed_kind(&state, "task").await;
+        seed_kind(&state, "file").await;
+        for (name, source, destination) in [
+            ("belongs_to", "goal", "repo"),
+            ("part_of", "task", "task,goal"),
+            ("depends_on", "task", "task"),
+            ("affects", "task", "file"),
+        ] {
+            state
+                .graph_service
+                .create_edge_type(&EdgeType {
+                    id: 0,
+                    name: name.to_string(),
+                    description: String::new(),
+                    resolves: false,
+                    single_outgoing: false,
+                    acyclic: false,
+                    source_kinds: Some(source.to_string()),
+                    destination_kinds: Some(destination.to_string()),
+                    updated_at: String::new(),
+                })
+                .await
+                .expect("edge type");
+        }
+        let repo = new_node(&state, repo_kind, "acme/widget", "", "", &[]).await;
+
+        let plan = create_plan(
+            State(state.clone()),
+            Json(CreatePlanParameters {
+                goal: Some(CreatePlanGoalParameters {
+                    id: None,
+                    name: "ship".to_string(),
+                    description: String::new(),
+                    content: String::new(),
+                    properties: Some(serde_json::json!({"owner": "goal"})),
+                }),
+                goal_id: None,
+                anchor: Some(PlanAnchorParameters {
+                    node_id: repo.id,
+                    edge_type: "belongs_to".to_string(),
+                }),
+                tasks: vec![CreatePlanTaskParameters {
+                    id: None,
+                    key: "t".to_string(),
+                    name: "task".to_string(),
+                    description: String::new(),
+                    content: String::new(),
+                    parent: None,
+                    depends_on: vec![],
+                    affects: vec![],
+                    properties: Some(serde_json::json!({"owner": "task"})),
+                }],
+            }),
+        )
+        .await
+        .expect("create plan")
+        .data;
+        assert_eq!(
+            plan.goal.expect("goal").properties,
+            serde_json::json!({"owner": "goal"})
+        );
+        assert_eq!(
+            plan.tasks[0].node.properties,
+            serde_json::json!({"owner": "task"})
+        );
     }
 }

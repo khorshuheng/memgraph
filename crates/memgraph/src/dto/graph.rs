@@ -5,10 +5,11 @@ use crate::model::{
     Edge as EdgeModel, EdgeType as EdgeTypeModel, ImportConflict, ImportDraft, ImportEdge,
     ImportNode, ImportRef, ImportReport, ImportStatus, Neighbor as NeighborModel,
     NeighborDirection as NeighborDirectionModel, Node as NodeModel, NodeFilter,
-    NodeKind as NodeKindModel, NodePatch, PackDraft, PackEdgeType, PackNodeKind, PackReport,
-    Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft, PlanTask as PlanTaskModel,
-    PlanTaskDraft, ReachFilter, RelationDirection as RelationDirectionModel,
-    SearchScope as SearchScopeModel, TaskDraft, TaskPatch,
+    NodeKind as NodeKindModel, NodeKindProperty, NodePatch, PackDraft, PackEdgeType, PackNodeKind,
+    PackReport, Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft,
+    PlanTask as PlanTaskModel, PlanTaskDraft, ReachFilter,
+    RelationDirection as RelationDirectionModel, SearchScope as SearchScopeModel, TaskDraft,
+    TaskPatch,
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -23,7 +24,25 @@ pub struct NodeKindResponse {
     pub version: i64,
     pub name: String,
     pub description: String,
+    pub properties: Vec<NodeKindPropertyResponse>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NodeKindPropertyResponse {
+    pub key: String,
+    pub value_type: String,
+    pub required: bool,
+}
+
+impl From<NodeKindProperty> for NodeKindPropertyResponse {
+    fn from(property: NodeKindProperty) -> Self {
+        NodeKindPropertyResponse {
+            key: property.key,
+            value_type: property.value_type.as_str().to_string(),
+            required: property.required,
+        }
+    }
 }
 
 impl From<CreateNodeKindParameters> for NodeKindModel {
@@ -38,15 +57,25 @@ impl From<CreateNodeKindParameters> for NodeKindModel {
     }
 }
 
-impl From<NodeKindModel> for NodeKindResponse {
-    fn from(node_kind: NodeKindModel) -> Self {
+impl NodeKindResponse {
+    pub fn with_properties(
+        node_kind: NodeKindModel,
+        properties: Vec<NodeKindPropertyResponse>,
+    ) -> Self {
         NodeKindResponse {
             id: node_kind.id,
             version: node_kind.version,
             name: node_kind.name,
             description: node_kind.description,
+            properties,
             updated_at: node_kind.updated_at,
         }
+    }
+}
+
+impl From<NodeKindModel> for NodeKindResponse {
+    fn from(node_kind: NodeKindModel) -> Self {
+        NodeKindResponse::with_properties(node_kind, Vec::new())
     }
 }
 
@@ -389,6 +418,44 @@ pub struct PackNodeKindParameters {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub properties: Option<Vec<PackPropertyParameters>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PackPropertyType {
+    #[default]
+    Any,
+    String,
+    Number,
+    Integer,
+    Boolean,
+    Array,
+    Object,
+}
+
+impl PackPropertyType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PackPropertyType::Any => "any",
+            PackPropertyType::String => "string",
+            PackPropertyType::Number => "number",
+            PackPropertyType::Integer => "integer",
+            PackPropertyType::Boolean => "boolean",
+            PackPropertyType::Array => "array",
+            PackPropertyType::Object => "object",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PackPropertyParameters {
+    pub key: String,
+    #[serde(default)]
+    pub value_type: PackPropertyType,
+    #[serde(default)]
+    pub required: bool,
 }
 
 impl From<PackNodeKindParameters> for PackNodeKind {
@@ -396,6 +463,16 @@ impl From<PackNodeKindParameters> for PackNodeKind {
         PackNodeKind {
             name: params.name,
             description: params.description,
+            properties: params.properties.map(|properties| {
+                properties
+                    .into_iter()
+                    .map(|property| crate::model::PackProperty {
+                        key: property.key,
+                        value_type: Some(property.value_type.as_str().to_string()),
+                        required: property.required,
+                    })
+                    .collect()
+            }),
         }
     }
 }
@@ -763,6 +840,8 @@ pub struct CreateTaskParameters {
     pub depends_on: Vec<i64>,
     #[serde(default)]
     pub affects: Vec<i64>,
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
 }
 
 impl From<CreateTaskParameters> for TaskDraft {
@@ -775,6 +854,7 @@ impl From<CreateTaskParameters> for TaskDraft {
             parent: params.parent,
             depends_on: params.depends_on,
             affects: params.affects,
+            properties: params.properties,
         }
     }
 }
@@ -809,6 +889,8 @@ pub struct CreatePlanGoalParameters {
     pub name: String,
     pub description: String,
     pub content: String,
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -827,6 +909,8 @@ pub struct CreatePlanTaskParameters {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub affects: Vec<i64>,
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
 }
 
 impl From<CreatePlanParameters> for PlanDraft {
@@ -847,6 +931,7 @@ impl From<CreatePlanGoalParameters> for PlanGoalDraft {
             name: params.name,
             description: params.description,
             content: params.content,
+            properties: params.properties,
         }
     }
 }
@@ -862,6 +947,7 @@ impl From<CreatePlanTaskParameters> for PlanTaskDraft {
             parent: params.parent,
             depends_on: params.depends_on,
             affects: params.affects,
+            properties: params.properties,
         }
     }
 }
@@ -929,6 +1015,8 @@ pub struct UpdateTaskParameters {
     pub name: Option<String>,
     pub description: Option<String>,
     pub content: Option<String>,
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
 }
 
 impl From<UpdateTaskParameters> for TaskPatch {
@@ -937,6 +1025,7 @@ impl From<UpdateTaskParameters> for TaskPatch {
             name: params.name,
             description: params.description,
             content: params.content,
+            properties: params.properties,
         }
     }
 }
