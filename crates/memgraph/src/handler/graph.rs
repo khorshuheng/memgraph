@@ -633,6 +633,7 @@ mod tests {
                 name: name.to_string(),
                 description: String::new(),
                 unique_name: true,
+                strict_properties: false,
                 updated_at: String::new(),
             })
             .await
@@ -913,6 +914,7 @@ mod tests {
                 description: Some(description.to_string()),
                 unique_name: None,
                 properties: None,
+                strict_properties: None,
             }],
             edge_types: vec![PackEdgeTypeParameters {
                 name: "widget_part".to_string(),
@@ -1361,6 +1363,7 @@ mod tests {
                         required: true,
                         indexed: true,
                     }]),
+                    strict_properties: Some(true),
                 }],
                 edge_types: vec![],
             })
@@ -1380,6 +1383,7 @@ mod tests {
         assert_eq!(widget.properties[0].value_type, "string");
         assert!(widget.properties[0].required);
         assert!(widget.properties[0].indexed);
+        assert!(widget.strict_properties);
     }
 
     #[test]
@@ -1477,6 +1481,7 @@ mod tests {
                     description: Some("a widget".to_string()),
                     unique_name: Some(false),
                     properties: None,
+                    strict_properties: None,
                 }],
                 edge_types: vec![],
             })
@@ -1503,6 +1508,7 @@ mod tests {
                 name: "note".to_string(),
                 description: "a note".to_string(),
                 unique_name: false,
+                strict_properties: false,
             }),
         )
         .await

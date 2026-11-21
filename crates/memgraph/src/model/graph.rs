@@ -7,6 +7,7 @@ pub struct NodeKind {
     pub name: String,
     pub description: String,
     pub unique_name: bool,
+    pub strict_properties: bool,
     pub updated_at: String,
 }
 
@@ -234,10 +235,21 @@ pub struct PackProperty {
 pub fn validate_declared_properties(
     properties: &serde_json::Value,
     declarations: &[NodeKindProperty],
+    strict: bool,
 ) -> Result<(), String> {
     let object = properties
         .as_object()
         .ok_or_else(|| "properties must be a JSON object".to_string())?;
+    if strict {
+        for key in object.keys() {
+            if !declarations
+                .iter()
+                .any(|declaration| declaration.key == *key)
+            {
+                return Err(format!("property '{key}' is not declared for this kind"));
+            }
+        }
+    }
     for declaration in declarations {
         match object.get(&declaration.key) {
             Some(value) => {
@@ -263,6 +275,7 @@ pub struct PackNodeKind {
     pub name: String,
     pub description: Option<String>,
     pub unique_name: Option<bool>,
+    pub strict_properties: Option<bool>,
     pub properties: Option<Vec<PackProperty>>,
 }
 

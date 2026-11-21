@@ -202,6 +202,7 @@ pub async fn seed_vocabulary(repository: &Arc<dyn GraphRepository>) {
                 name: name.to_string(),
                 description: description.to_string(),
                 unique_name: true,
+                strict_properties: false,
                 updated_at: String::new(),
             })
             .await

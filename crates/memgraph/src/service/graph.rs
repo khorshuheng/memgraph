@@ -71,6 +71,7 @@ impl GraphService {
                 name: vocabulary_name(&kind.name, "node kind")?,
                 description: kind.description.clone(),
                 unique_name: kind.unique_name,
+                strict_properties: kind.strict_properties,
                 properties: match &kind.properties {
                     None => None,
                     Some(properties) => Some(normalize_property_declarations(properties)?),
@@ -1519,6 +1520,7 @@ mod tests {
             name: name.to_string(),
             description: String::new(),
             unique_name: true,
+            strict_properties: false,
             updated_at: String::new(),
         }
     }
@@ -3508,6 +3510,7 @@ mod tests {
             description: description.map(str::to_string),
             unique_name: None,
             properties: None,
+            strict_properties: None,
         }
     }
 
@@ -5349,6 +5352,7 @@ mod tests {
                 description: Some("a widget".to_string()),
                 unique_name: None,
                 properties,
+                strict_properties: None,
             }],
             edge_types: vec![],
         }
@@ -5545,6 +5549,7 @@ mod tests {
                     description: None,
                     unique_name: None,
                     properties: Some(vec![property("owner", "string", true)]),
+                    strict_properties: None,
                 }],
                 edge_types: vec![],
             })
@@ -5620,6 +5625,7 @@ mod tests {
                     description: None,
                     unique_name: Some(unique),
                     properties: None,
+                    strict_properties: None,
                 }],
                 edge_types: vec![],
             })
@@ -5683,6 +5689,7 @@ mod tests {
                     description: None,
                     unique_name: Some(false),
                     properties: None,
+                    strict_properties: None,
                 }],
                 edge_types: vec![],
             })
@@ -5736,6 +5743,7 @@ mod tests {
                     description: Some("a note".to_string()),
                     unique_name: Some(false),
                     properties: None,
+                    strict_properties: None,
                 }],
                 edge_types: vec![],
             })
@@ -5788,6 +5796,7 @@ mod tests {
                     description: None,
                     unique_name: Some(true),
                     properties: None,
+                    strict_properties: None,
                 }],
                 edge_types: vec![],
             })
@@ -6045,12 +6054,14 @@ mod tests {
                         description: None,
                         unique_name: None,
                         properties: Some(vec![indexed.clone()]),
+                        strict_properties: None,
                     },
                     PackNodeKind {
                         name: "db_view".to_string(),
                         description: None,
                         unique_name: None,
                         properties: Some(vec![indexed.clone()]),
+                        strict_properties: None,
                     },
                 ],
                 edge_types: vec![],
@@ -6079,6 +6090,7 @@ mod tests {
                     description: None,
                     unique_name: None,
                     properties: Some(vec![indexed, property("owner", "string", false)]),
+                    strict_properties: None,
                 }],
                 edge_types: vec![],
             })
@@ -6110,5 +6122,240 @@ mod tests {
             .await
             .unwrap_err();
         assert!(rejection(error).contains("double quote"));
+    }
+
+    #[tokio::test]
+    async fn strict_kinds_reject_undeclared_properties() {
+        let (service, _pool) = service_with_pool().await;
+        let mut pack = widget_pack(Some(vec![property("status", "string", true)]));
+        pack.node_kinds[0].strict_properties = Some(true);
+        service.apply_pack(&pack).await.unwrap();
+        let kind_id = widget_kind_id(&service).await;
+
+        let undeclared = service
+            .create_node_with_properties(
+                &node(kind_id, "bad", ""),
+                &[],
+                Some(&serde_json::json!({"status": "x", "extra": 1})),
+            )
+            .await
+            .unwrap_err();
+        assert!(rejection(undeclared).contains("not declared"));
+
+        let created = service
+            .create_node_with_properties(
+                &node(kind_id, "good", ""),
+                &[],
+                Some(&serde_json::json!({"status": "x"})),
+            )
+            .await
+            .unwrap()
+            .0;
+
+        let patched = service
+            .update_node(
+                created.id,
+                &NodePatch {
+                    properties: Some(serde_json::json!({"status": "y", "extra": 1})),
+                    ..NodePatch::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(rejection(patched).contains("not declared"));
+
+        let mut imported = import_node(None, "widget", "imported");
+        imported.properties = Some(serde_json::json!({"status": "x", "extra": 1}));
+        let imported = service
+            .import_graph(&import_draft(vec![imported], vec![]))
+            .await
+            .unwrap_err();
+        assert!(rejection(imported).contains("not declared"));
+
+        let mut accepted = import_node(None, "widget", "imported");
+        accepted.properties = Some(serde_json::json!({"status": "x"}));
+        service
+            .import_graph(&import_draft(vec![accepted], vec![]))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn plan_tasks_respect_strict_property_kinds() {
+        let service = service().await;
+        service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![PackNodeKind {
+                    name: "task".to_string(),
+                    description: None,
+                    unique_name: None,
+                    strict_properties: Some(true),
+                    properties: Some(vec![property("owner", "string", false)]),
+                }],
+                edge_types: vec![],
+            })
+            .await
+            .unwrap();
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+
+        let mut task = new_task("strict task");
+        task.parent = Some(goal);
+        task.properties = Some(serde_json::json!({"extra": 1}));
+        let error = service.create_task(&task).await.unwrap_err();
+        assert!(rejection(error).contains("not declared"));
+
+        task.properties = Some(serde_json::json!({"owner": "a"}));
+        service.create_task(&task).await.unwrap();
+
+        let mut plan_task = plan_task("a", None, &[]);
+        plan_task.properties = Some(serde_json::json!({"extra": 1}));
+        let error = service
+            .create_plan(&plan_draft(repo, vec![plan_task]))
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("not declared"));
+    }
+
+    #[tokio::test]
+    async fn pack_toggles_strict_properties_and_bumps_version() {
+        let service = service().await;
+        let before = service
+            .list_node_kinds()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|kind| kind.name == "task")
+            .unwrap();
+        assert!(!before.strict_properties);
+
+        service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![PackNodeKind {
+                    name: "task".to_string(),
+                    description: None,
+                    unique_name: None,
+                    strict_properties: Some(true),
+                    properties: None,
+                }],
+                edge_types: vec![],
+            })
+            .await
+            .unwrap();
+        let after = service
+            .list_node_kinds()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|kind| kind.name == "task")
+            .unwrap();
+        assert!(after.strict_properties);
+        assert_eq!(after.version, before.version + 1);
+
+        let report = service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![PackNodeKind {
+                    name: "task".to_string(),
+                    description: None,
+                    unique_name: None,
+                    strict_properties: Some(true),
+                    properties: None,
+                }],
+                edge_types: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.unchanged(), 1);
+    }
+
+    #[tokio::test]
+    async fn tightening_declarations_rejects_existing_violations() {
+        let service = service().await;
+        service.apply_pack(&widget_pack(None)).await.unwrap();
+        let kind_id = widget_kind_id(&service).await;
+        service
+            .create_node_with_properties(
+                &node(kind_id, "wrong-type", ""),
+                &[],
+                Some(&serde_json::json!({"status": 1})),
+            )
+            .await
+            .unwrap();
+        service
+            .create_node_with_properties(&node(kind_id, "missing", ""), &[], None)
+            .await
+            .unwrap();
+
+        let error = service
+            .apply_pack(&widget_pack(Some(vec![property("status", "string", true)])))
+            .await
+            .unwrap_err();
+        let message = rejection(error);
+        assert!(message.contains("cannot tighten"), "message: {message}");
+
+        let declarations = service
+            .node_kind_properties_for_ids(&[kind_id])
+            .await
+            .unwrap();
+        assert!(
+            declarations
+                .get(&kind_id)
+                .map(Vec::is_empty)
+                .unwrap_or(true)
+        );
+
+        let nodes = service
+            .list_nodes(&NodeFilter {
+                kind: Some("widget".to_string()),
+                ..NodeFilter::default()
+            })
+            .await
+            .unwrap();
+        for node in &nodes {
+            service
+                .update_node(
+                    node.id,
+                    &NodePatch {
+                        properties: Some(serde_json::json!({"status": "x"})),
+                        ..NodePatch::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        service
+            .apply_pack(&widget_pack(Some(vec![property("status", "string", true)])))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tightening_strict_rejects_existing_undeclared_keys() {
+        let service = service().await;
+        service.apply_pack(&widget_pack(None)).await.unwrap();
+        let kind_id = widget_kind_id(&service).await;
+        service
+            .create_node_with_properties(
+                &node(kind_id, "legacy", ""),
+                &[],
+                Some(&serde_json::json!({"extra": 1})),
+            )
+            .await
+            .unwrap();
+
+        let mut pack = widget_pack(None);
+        pack.node_kinds[0].strict_properties = Some(true);
+        let error = service.apply_pack(&pack).await.unwrap_err();
+        let message = rejection(error);
+        assert!(message.contains("cannot tighten"), "message: {message}");
+
+        let kind = service
+            .list_node_kinds()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|kind| kind.name == "widget")
+            .unwrap();
+        assert!(!kind.strict_properties);
     }
 }

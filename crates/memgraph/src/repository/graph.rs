@@ -15,7 +15,8 @@ use crate::model::{
 
 use super::error::RepositoryError;
 
-const NODE_KIND_COLUMNS: &str = "id, version, name, description, unique_name, updated_at";
+const NODE_KIND_COLUMNS: &str =
+    "id, version, name, description, unique_name, strict_properties, updated_at";
 const EDGE_TYPE_COLUMNS: &str = "id, name, description, resolves, single_outgoing, acyclic, source_kinds, destination_kinds, \
      updated_at";
 const NODE_COLUMNS: &str = "id, kind_id, name, description, content, updated_at";
@@ -253,12 +254,13 @@ impl SqliteGraphRepository {
 impl GraphRepository for SqliteGraphRepository {
     async fn create_node_kind(&self, node_kind: &NodeKind) -> Result<NodeKind, RepositoryError> {
         let row = sqlx::query_as::<_, NodeKind>(&format!(
-            "INSERT INTO node_kind (name, description, unique_name) VALUES (?, ?, ?) \
-             RETURNING {NODE_KIND_COLUMNS}"
+            "INSERT INTO node_kind (name, description, unique_name, strict_properties) \
+             VALUES (?, ?, ?, ?) RETURNING {NODE_KIND_COLUMNS}"
         ))
         .bind(&node_kind.name)
         .bind(&node_kind.description)
         .bind(node_kind.unique_name)
+        .bind(node_kind.strict_properties)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -365,11 +367,11 @@ impl GraphRepository for SqliteGraphRepository {
         properties: Option<&serde_json::Value>,
     ) -> Result<Node, RepositoryError> {
         let mut transaction = self.pool.begin().await?;
-        let declarations = load_kind_properties(&mut transaction, node.kind_id).await?;
+        let schema = load_kind_schema(&mut transaction, node.kind_id).await?;
         let empty = serde_json::json!({});
         let candidate = properties.unwrap_or(&empty);
         if properties.is_some() || node.id == 0 {
-            validate_declared_properties(candidate, &declarations)
+            validate_declared_properties(candidate, &schema.properties, schema.strict)
                 .map_err(RepositoryError::ContractViolation)?;
         }
         let row = insert_node(&mut *transaction, node).await?;
@@ -393,7 +395,7 @@ impl GraphRepository for SqliteGraphRepository {
         edges: &[PendingEdge],
     ) -> Result<Vec<Node>, RepositoryError> {
         let mut transaction = self.pool.begin().await?;
-        let mut declarations: HashMap<i64, Vec<NodeKindProperty>> = HashMap::new();
+        let mut schemas: HashMap<i64, KindSchema> = HashMap::new();
         let mut created = Vec::with_capacity(nodes.len());
         let mut ids = Vec::with_capacity(nodes.len());
         for pending in nodes {
@@ -415,16 +417,15 @@ impl GraphRepository for SqliteGraphRepository {
                     )));
                 }
             }
-            if let std::collections::hash_map::Entry::Vacant(entry) =
-                declarations.entry(node.kind_id)
-            {
-                let loaded = load_kind_properties(&mut transaction, node.kind_id).await?;
+            if let std::collections::hash_map::Entry::Vacant(entry) = schemas.entry(node.kind_id) {
+                let loaded = load_kind_schema(&mut transaction, node.kind_id).await?;
                 entry.insert(loaded);
             }
             let empty = serde_json::json!({});
             let candidate = pending.properties.as_ref().unwrap_or(&empty);
             if pending.properties.is_some() || node.id == 0 {
-                validate_declared_properties(candidate, declarations.get(&node.kind_id).unwrap())
+                let schema = schemas.get(&node.kind_id).unwrap();
+                validate_declared_properties(candidate, &schema.properties, schema.strict)
                     .map_err(RepositoryError::ContractViolation)?;
             }
             let row = if node.id == 0 {
@@ -1056,13 +1057,15 @@ async fn apply_node_kind(
         None => {
             let description = kind.description.clone().unwrap_or_default();
             let unique_name = kind.unique_name.unwrap_or(true);
+            let strict_properties = kind.strict_properties.unwrap_or(false);
             let (id, version) = sqlx::query_as::<_, (i64, i64)>(
-                "INSERT INTO node_kind (name, description, unique_name) \
-                 VALUES (?, ?, ?) RETURNING id, version",
+                "INSERT INTO node_kind (name, description, unique_name, strict_properties) \
+                 VALUES (?, ?, ?, ?) RETURNING id, version",
             )
             .bind(&kind.name)
             .bind(description)
             .bind(unique_name)
+            .bind(strict_properties)
             .fetch_one(&mut *connection)
             .await?;
             if let Some(declared) = &declared {
@@ -1083,6 +1086,8 @@ async fn apply_node_kind(
             let description_changed = description != row.description;
             let unique_name = kind.unique_name.unwrap_or(row.unique_name);
             let unique_changed = unique_name != row.unique_name;
+            let strict_properties = kind.strict_properties.unwrap_or(row.strict_properties);
+            let strict_changed = strict_properties != row.strict_properties;
             if unique_changed && unique_name {
                 let duplicates = duplicate_kind_names(&mut *connection, row.id).await?;
                 if !duplicates.is_empty() {
@@ -1103,13 +1108,21 @@ async fn apply_node_kind(
                     load_kind_properties(&mut *connection, row.id).await? != *declared
                 }
             };
-            if !description_changed && !unique_changed && !declarations_changed {
+            if !description_changed && !unique_changed && !strict_changed && !declarations_changed {
                 return Ok(PackItem {
                     id: row.id,
                     name: row.name,
                     version: Some(row.version),
                     status: PackStatus::Unchanged,
                 });
+            }
+            if declarations_changed || strict_changed {
+                let effective = match &declared {
+                    Some(declared) => declared.clone(),
+                    None => load_kind_properties(&mut *connection, row.id).await?,
+                };
+                validate_kind_nodes(&mut *connection, row.id, &effective, strict_properties)
+                    .await?;
             }
             if declarations_changed {
                 replace_kind_properties(
@@ -1121,12 +1134,13 @@ async fn apply_node_kind(
             }
             let (id, version) = sqlx::query_as::<_, (i64, i64)>(
                 "UPDATE node_kind SET description = ?, unique_name = ?, \
-                 version = version + 1, \
+                 strict_properties = ?, version = version + 1, \
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
                  WHERE id = ? RETURNING id, version",
             )
             .bind(description)
             .bind(unique_name)
+            .bind(strict_properties)
             .bind(row.id)
             .fetch_one(&mut *connection)
             .await?;
@@ -1153,6 +1167,66 @@ fn declared_properties(properties: &[PackProperty]) -> Vec<NodeKindProperty> {
         .collect();
     declared.sort_by(|left, right| left.key.cmp(&right.key));
     declared
+}
+
+struct KindSchema {
+    properties: Vec<NodeKindProperty>,
+    strict: bool,
+}
+
+async fn validate_kind_nodes(
+    connection: &mut SqliteConnection,
+    kind_id: i64,
+    declarations: &[NodeKindProperty],
+    strict: bool,
+) -> Result<(), RepositoryError> {
+    let rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT id, properties FROM node WHERE kind_id = ? ORDER BY id",
+    )
+    .bind(kind_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    let mut failures: Vec<String> = Vec::new();
+    for (id, raw) in rows {
+        let value: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(_) => {
+                failures.push(format!("node {id}: invalid properties JSON"));
+                if failures.len() >= 10 {
+                    break;
+                }
+                continue;
+            }
+        };
+        if let Err(error) = validate_declared_properties(&value, declarations, strict) {
+            failures.push(format!("node {id}: {error}"));
+            if failures.len() >= 10 {
+                break;
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(RepositoryError::ContractViolation(format!(
+            "node kind cannot tighten its declarations while existing nodes violate them: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
+async fn load_kind_schema(
+    connection: &mut SqliteConnection,
+    kind_id: i64,
+) -> Result<KindSchema, RepositoryError> {
+    let properties = load_kind_properties(&mut *connection, kind_id).await?;
+    let strict =
+        sqlx::query_scalar::<_, bool>("SELECT strict_properties FROM node_kind WHERE id = ?")
+            .bind(kind_id)
+            .fetch_optional(&mut *connection)
+            .await?
+            .unwrap_or(false);
+    Ok(KindSchema { properties, strict })
 }
 
 async fn duplicate_kind_names(
@@ -1573,7 +1647,7 @@ async fn import_node(
     kind_id: i64,
     node: &crate::model::ImportNode,
 ) -> Result<ImportNodeResult, RepositoryError> {
-    let declarations = load_kind_properties(&mut *connection, kind_id).await?;
+    let schema = load_kind_schema(&mut *connection, kind_id).await?;
     let existing = match node.id {
         Some(id) => {
             sqlx::query_as::<_, (i64, i64, String, String, String, String)>(
@@ -1610,7 +1684,7 @@ async fn import_node(
                 .properties
                 .clone()
                 .unwrap_or_else(|| serde_json::json!({}));
-            validate_declared_properties(&candidate, &declarations)
+            validate_declared_properties(&candidate, &schema.properties, schema.strict)
                 .map_err(RepositoryError::ContractViolation)?;
             let properties = match &node.properties {
                 Some(value) => serde_json::to_string(value)
@@ -1655,7 +1729,7 @@ async fn import_node(
             }
             let name_changed = existing_name != node.name;
             if let Some(value) = &node.properties {
-                validate_declared_properties(value, &declarations)
+                validate_declared_properties(value, &schema.properties, schema.strict)
                     .map_err(RepositoryError::ContractViolation)?;
             }
             let next_description = node.description.clone().unwrap_or(description.clone());
@@ -1841,8 +1915,8 @@ async fn update_node_items(
             .ok_or(RepositoryError::RowNotFound)?;
 
     if let Some(properties) = &patch.properties {
-        let declarations = load_kind_properties(&mut *connection, existing.kind_id).await?;
-        validate_declared_properties(properties, &declarations)
+        let schema = load_kind_schema(&mut *connection, existing.kind_id).await?;
+        validate_declared_properties(properties, &schema.properties, schema.strict)
             .map_err(RepositoryError::ContractViolation)?;
     }
 

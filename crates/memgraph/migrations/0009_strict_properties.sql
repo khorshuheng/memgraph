@@ -1,0 +1,1 @@
+ALTER TABLE node_kind ADD COLUMN strict_properties INTEGER NOT NULL DEFAULT 0;

@@ -13,12 +13,20 @@ use crate::model::{
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    description = "A node kind. strict_properties rejects property keys that are not \
+                   declared for the kind; it defaults to open, and a strict kind with no \
+                   declarations accepts only {}."
+)]
 pub struct CreateNodeKindParameters {
     pub name: String,
     pub description: String,
     #[serde(default = "default_unique_name")]
     #[schema(default = true)]
     pub unique_name: bool,
+    #[serde(default)]
+    #[schema(default = false)]
+    pub strict_properties: bool,
 }
 
 fn default_unique_name() -> bool {
@@ -32,6 +40,7 @@ pub struct NodeKindResponse {
     pub name: String,
     pub description: String,
     pub unique_name: bool,
+    pub strict_properties: bool,
     pub properties: Vec<NodeKindPropertyResponse>,
     pub updated_at: String,
 }
@@ -67,6 +76,7 @@ impl From<CreateNodeKindParameters> for NodeKindModel {
             name: params.name,
             description: params.description,
             unique_name: params.unique_name,
+            strict_properties: params.strict_properties,
             updated_at: String::new(),
         }
     }
@@ -83,6 +93,7 @@ impl NodeKindResponse {
             name: node_kind.name,
             description: node_kind.description,
             unique_name: node_kind.unique_name,
+            strict_properties: node_kind.strict_properties,
             properties,
             updated_at: node_kind.updated_at,
         }
@@ -430,12 +441,19 @@ impl From<ListNodesParameters> for NodeFilter {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    description = "A node kind declaration. unique_name controls name uniqueness and \
+                   strict_properties rejects undeclared property keys; omitted fields keep \
+                   the stored value."
+)]
 pub struct PackNodeKindParameters {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub unique_name: Option<bool>,
+    #[serde(default)]
+    pub strict_properties: Option<bool>,
     #[serde(default)]
     pub properties: Option<Vec<PackPropertyParameters>>,
 }
@@ -488,6 +506,7 @@ impl From<PackNodeKindParameters> for PackNodeKind {
             name: params.name,
             description: params.description,
             unique_name: params.unique_name,
+            strict_properties: params.strict_properties,
             properties: params.properties.map(|properties| {
                 properties
                     .into_iter()
