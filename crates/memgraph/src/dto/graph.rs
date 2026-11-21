@@ -37,10 +37,15 @@ pub struct NodeKindResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[schema(
+    description = "A declared property. indexed means a single-column expression index \
+                   backs exact-match property filters."
+)]
 pub struct NodeKindPropertyResponse {
     pub key: String,
     pub value_type: String,
     pub required: bool,
+    pub indexed: bool,
 }
 
 impl From<NodeKindProperty> for NodeKindPropertyResponse {
@@ -49,6 +54,7 @@ impl From<NodeKindProperty> for NodeKindPropertyResponse {
             key: property.key,
             value_type: property.value_type.as_str().to_string(),
             required: property.required,
+            indexed: property.indexed,
         }
     }
 }
@@ -462,12 +468,18 @@ impl PackPropertyType {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    description = "A declared property. indexed=true maintains a single-column expression \
+                   index used by exact-match property filters. Keys must not contain a double quote."
+)]
 pub struct PackPropertyParameters {
     pub key: String,
     #[serde(default)]
     pub value_type: PackPropertyType,
     #[serde(default)]
     pub required: bool,
+    #[serde(default)]
+    pub indexed: bool,
 }
 
 impl From<PackNodeKindParameters> for PackNodeKind {
@@ -483,6 +495,7 @@ impl From<PackNodeKindParameters> for PackNodeKind {
                         key: property.key,
                         value_type: Some(property.value_type.as_str().to_string()),
                         required: property.required,
+                        indexed: property.indexed,
                     })
                     .collect()
             }),
@@ -811,7 +824,18 @@ fn parse_property_filter(
     let value: serde_json::Value = serde_json::from_str(raw)
         .map_err(|error| format!("properties must be a JSON object: {error}"))?;
     match value {
-        serde_json::Value::Object(map) => Ok(map),
+        serde_json::Value::Object(map) => {
+            for key in map.keys() {
+                if key.is_empty()
+                    || key.chars().count() > 128
+                    || key.chars().any(char::is_control)
+                    || key.contains('"')
+                {
+                    return Err(format!("invalid property filter key '{key}'"));
+                }
+            }
+            Ok(map)
+        }
         _ => Err("properties must be a JSON object".to_string()),
     }
 }

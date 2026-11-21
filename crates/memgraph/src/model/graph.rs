@@ -220,6 +220,7 @@ pub struct NodeKindProperty {
     pub key: String,
     pub value_type: PropertyType,
     pub required: bool,
+    pub indexed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +228,7 @@ pub struct PackProperty {
     pub key: String,
     pub value_type: Option<String>,
     pub required: bool,
+    pub indexed: bool,
 }
 
 pub fn validate_declared_properties(

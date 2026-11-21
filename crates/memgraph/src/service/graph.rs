@@ -1281,6 +1281,11 @@ fn normalize_property_declarations(
                 "property key '{key}' must not contain control characters"
             )));
         }
+        if key.contains('"') {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "property key '{key}' must not contain a double quote"
+            )));
+        }
         let value_type = PropertyType::parse(property.value_type.as_deref().unwrap_or("any"))
             .ok_or_else(|| {
                 ServiceError::UnprocessableEntity(format!(
@@ -1297,6 +1302,7 @@ fn normalize_property_declarations(
             key,
             value_type: Some(value_type.as_str().to_string()),
             required: property.required,
+            indexed: property.indexed,
         });
     }
     normalized.sort_by(|left, right| left.key.cmp(&right.key));
@@ -1470,6 +1476,7 @@ mod tests {
         },
         repository::graph::SqliteGraphRepository,
     };
+    use sqlx::SqlitePool;
 
     use super::*;
 
@@ -1485,6 +1492,24 @@ mod tests {
         let repository: Arc<dyn GraphRepository> = Arc::new(SqliteGraphRepository::new(pool));
         crate::test_support::seed_vocabulary(&repository).await;
         GraphService::new(repository, crate::config::SearchConfig::default())
+    }
+
+    async fn service_with_pool() -> (GraphService, SqlitePool) {
+        let config = crate::config::DatabaseConfig {
+            path: ":memory:".to_string(),
+            max_connections: 1,
+        };
+        let pool = create_sqlite_pool(&config)
+            .await
+            .expect("failed to create database connection pool");
+        migrate(&pool).await.expect("failed to migrate database");
+        let repository: Arc<dyn GraphRepository> =
+            Arc::new(SqliteGraphRepository::new(pool.clone()));
+        crate::test_support::seed_vocabulary(&repository).await;
+        (
+            GraphService::new(repository, crate::config::SearchConfig::default()),
+            pool,
+        )
     }
 
     fn node_kind(name: &str) -> NodeKind {
@@ -5313,6 +5338,7 @@ mod tests {
             key: key.to_string(),
             value_type: Some(value_type.to_string()),
             required,
+            indexed: false,
         }
     }
 
@@ -5930,5 +5956,159 @@ mod tests {
                 .await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn pack_maintains_property_indexes() {
+        let (service, pool) = service_with_pool().await;
+        let mut indexed = property("status", "string", false);
+        indexed.indexed = true;
+        service
+            .apply_pack(&widget_pack(Some(vec![indexed])))
+            .await
+            .unwrap();
+
+        let index_names = |pool: SqlitePool| async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'index' AND name LIKE 'idx_node_prop_%'",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        };
+        let names = index_names(pool.clone()).await;
+        assert_eq!(names.len(), 1);
+
+        let kind_id = widget_kind_id(&service).await;
+        service
+            .create_node_with_properties(
+                &node(kind_id, "indexed", ""),
+                &[],
+                Some(&serde_json::json!({"status": "on"})),
+            )
+            .await
+            .unwrap();
+        let found = service
+            .list_nodes(&property_filter(serde_json::json!({"status": "on"})))
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+
+        let plan = sqlx::query_as::<_, (i64, i64, i64, String)>(
+            "EXPLAIN QUERY PLAN SELECT id FROM node \
+             WHERE json_extract(properties, '$.\"status\"') = 'on'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let detail = plan
+            .iter()
+            .map(|(_, _, _, detail)| detail.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(detail.contains("USING INDEX"), "plan: {detail}");
+
+        let mut moved = property("owner", "string", false);
+        moved.indexed = true;
+        service
+            .apply_pack(&widget_pack(Some(vec![moved])))
+            .await
+            .unwrap();
+        let names = index_names(pool.clone()).await;
+        assert_eq!(names.len(), 1);
+        let definition: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_node_prop_%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(definition.contains("owner"), "definition: {definition}");
+
+        service
+            .apply_pack(&widget_pack(Some(vec![])))
+            .await
+            .unwrap();
+        assert!(index_names(pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn updating_one_kind_does_not_drop_another_kinds_index() {
+        let (service, pool) = service_with_pool().await;
+        let mut indexed = property("status", "string", false);
+        indexed.indexed = true;
+        service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![
+                    PackNodeKind {
+                        name: "repo".to_string(),
+                        description: None,
+                        unique_name: None,
+                        properties: Some(vec![indexed.clone()]),
+                    },
+                    PackNodeKind {
+                        name: "db_view".to_string(),
+                        description: None,
+                        unique_name: None,
+                        properties: Some(vec![indexed.clone()]),
+                    },
+                ],
+                edge_types: vec![],
+            })
+            .await
+            .unwrap();
+
+        let names = || {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type = 'index' AND name GLOB 'idx_node_prop_*'",
+                )
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(names().await.len(), 2);
+
+        service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![PackNodeKind {
+                    name: "repo".to_string(),
+                    description: None,
+                    unique_name: None,
+                    properties: Some(vec![indexed, property("owner", "string", false)]),
+                }],
+                edge_types: vec![],
+            })
+            .await
+            .unwrap();
+
+        let remaining = names().await;
+        assert_eq!(remaining.len(), 2, "indexes: {remaining:?}");
+        assert!(
+            remaining
+                .iter()
+                .any(|name| name.starts_with("idx_node_prop_10_")),
+            "kind 10 index dropped: {remaining:?}"
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|name| name.starts_with("idx_node_prop_1_")),
+            "kind 1 index missing: {remaining:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_double_quotes_in_property_keys() {
+        let (service, _pool) = service_with_pool().await;
+        let bad = property("a\"b", "string", false);
+        let error = service
+            .apply_pack(&widget_pack(Some(vec![bad])))
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("double quote"));
     }
 }

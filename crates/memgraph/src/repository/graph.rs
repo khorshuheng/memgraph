@@ -758,7 +758,7 @@ impl GraphRepository for SqliteGraphRepository {
             return Ok(by_kind);
         }
         let mut builder = QueryBuilder::new(
-            "SELECT kind_id, key, value_type, required FROM node_kind_property \
+            "SELECT kind_id, key, value_type, required, indexed FROM node_kind_property \
              WHERE kind_id IN (",
         );
         let mut separated = builder.separated(", ");
@@ -767,14 +767,15 @@ impl GraphRepository for SqliteGraphRepository {
         }
         builder.push(") ORDER BY kind_id, key");
         let rows = builder
-            .build_query_as::<(i64, String, String, bool)>()
+            .build_query_as::<(i64, String, String, bool, bool)>()
             .fetch_all(&self.pool)
             .await?;
-        for (kind_id, key, value_type, required) in rows {
+        for (kind_id, key, value_type, required, indexed) in rows {
             by_kind.entry(kind_id).or_default().push(NodeKindProperty {
                 key,
                 value_type: PropertyType::parse(&value_type).unwrap_or_default(),
                 required,
+                indexed,
             });
         }
         Ok(by_kind)
@@ -1147,6 +1148,7 @@ fn declared_properties(properties: &[PackProperty]) -> Vec<NodeKindProperty> {
             value_type: PropertyType::parse(property.value_type.as_deref().unwrap_or("any"))
                 .unwrap_or_default(),
             required: property.required,
+            indexed: property.indexed,
         })
         .collect();
     declared.sort_by(|left, right| left.key.cmp(&right.key));
@@ -1171,8 +1173,8 @@ async fn load_kind_properties(
     connection: &mut SqliteConnection,
     kind_id: i64,
 ) -> Result<Vec<NodeKindProperty>, RepositoryError> {
-    let rows = sqlx::query_as::<_, (String, String, bool)>(
-        "SELECT key, value_type, required FROM node_kind_property \
+    let rows = sqlx::query_as::<_, (String, String, bool, bool)>(
+        "SELECT key, value_type, required, indexed FROM node_kind_property \
          WHERE kind_id = ? ORDER BY key",
     )
     .bind(kind_id)
@@ -1180,10 +1182,11 @@ async fn load_kind_properties(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(key, value_type, required)| NodeKindProperty {
+        .map(|(key, value_type, required, indexed)| NodeKindProperty {
             key,
             value_type: PropertyType::parse(&value_type).unwrap_or_default(),
             required,
+            indexed,
         })
         .collect())
 }
@@ -1193,23 +1196,60 @@ async fn replace_kind_properties(
     kind_id: i64,
     properties: &[NodeKindProperty],
 ) -> Result<(), RepositoryError> {
+    let existing = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name GLOB ?",
+    )
+    .bind(format!("idx_node_prop_{kind_id}_*"))
+    .fetch_all(&mut *connection)
+    .await?;
+    for name in existing {
+        sqlx::query(&format!("DROP INDEX IF EXISTS \"{name}\""))
+            .execute(&mut *connection)
+            .await?;
+    }
+
     sqlx::query("DELETE FROM node_kind_property WHERE kind_id = ?")
         .bind(kind_id)
         .execute(&mut *connection)
         .await?;
     for property in properties {
         sqlx::query(
-            "INSERT INTO node_kind_property (kind_id, key, value_type, required) \
-             VALUES (?, ?, ?, ?)",
+            "INSERT INTO node_kind_property (kind_id, key, value_type, required, indexed) \
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(kind_id)
         .bind(&property.key)
         .bind(property.value_type.as_str())
         .bind(property.required)
+        .bind(property.indexed)
+        .execute(&mut *connection)
+        .await?;
+    }
+    for property in properties.iter().filter(|property| property.indexed) {
+        let name = property_index_name(kind_id, &property.key);
+        let path = json_path_literal(&property.key);
+        sqlx::query(&format!(
+            "CREATE INDEX IF NOT EXISTS \"{name}\" \
+             ON node(json_extract(properties, '{path}'))"
+        ))
         .execute(&mut *connection)
         .await?;
     }
     Ok(())
+}
+
+fn property_index_name(kind_id: i64, key: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("idx_node_prop_{kind_id}_{hash:016x}")
+}
+
+fn json_path_literal(key: &str) -> String {
+    let escaped = key.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("$.\"{escaped}\"").replace('\'', "''")
 }
 
 async fn apply_edge_type(
@@ -1914,56 +1954,6 @@ fn tags_equal(current: &[String], proposed: &[String]) -> bool {
     current == proposed
 }
 
-fn push_property_filters(
-    builder: &mut QueryBuilder<Sqlite>,
-    properties: &serde_json::Map<String, serde_json::Value>,
-) {
-    for (key, value) in properties {
-        let path = property_path(key);
-        match value {
-            serde_json::Value::Null => {
-                builder.push(" AND json_type(n.properties, ");
-                builder.push_bind(path);
-                builder.push(") = 'null'");
-            }
-            serde_json::Value::Bool(value) => {
-                builder.push(" AND json_extract(n.properties, ");
-                builder.push_bind(path);
-                builder.push(") = ");
-                builder.push_bind(if *value { 1i64 } else { 0i64 });
-            }
-            serde_json::Value::Number(number) => {
-                builder.push(" AND json_extract(n.properties, ");
-                builder.push_bind(path);
-                builder.push(") = ");
-                if let Some(integer) = number.as_i64() {
-                    builder.push_bind(integer);
-                } else {
-                    builder.push_bind(number.as_f64().unwrap_or_default());
-                }
-            }
-            serde_json::Value::String(value) => {
-                builder.push(" AND json_extract(n.properties, ");
-                builder.push_bind(path);
-                builder.push(") = ");
-                builder.push_bind(value.clone());
-            }
-            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-                builder.push(" AND json_extract(n.properties, ");
-                builder.push_bind(path);
-                builder.push(") = json(");
-                builder.push_bind(serde_json::to_string(value).unwrap_or_default());
-                builder.push(")");
-            }
-        }
-    }
-}
-
-fn property_path(key: &str) -> String {
-    let escaped = key.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("$.\"{escaped}\"")
-}
-
 fn push_reach_cte(builder: &mut QueryBuilder<Sqlite>, reach: &ReachFilter) {
     builder.push(
         "WITH RECURSIVE reach(id) AS ( \
@@ -1986,6 +1976,41 @@ fn push_reach_cte(builder: &mut QueryBuilder<Sqlite>, reach: &ReachFilter) {
     );
     builder.push_bind(reach.descend.clone());
     builder.push(")) ");
+}
+
+fn push_property_filters(
+    builder: &mut QueryBuilder<Sqlite>,
+    properties: &serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, value) in properties {
+        let path = json_path_literal(key);
+        match value {
+            serde_json::Value::Null => {
+                builder.push(format!(" AND json_type(n.properties, '{path}') = 'null'"));
+            }
+            serde_json::Value::Bool(value) => {
+                builder.push(format!(" AND json_extract(n.properties, '{path}') = "));
+                builder.push_bind(if *value { 1i64 } else { 0i64 });
+            }
+            serde_json::Value::Number(number) => {
+                builder.push(format!(" AND json_extract(n.properties, '{path}') = "));
+                if let Some(integer) = number.as_i64() {
+                    builder.push_bind(integer);
+                } else {
+                    builder.push_bind(number.as_f64().unwrap_or_default());
+                }
+            }
+            serde_json::Value::String(value) => {
+                builder.push(format!(" AND json_extract(n.properties, '{path}') = "));
+                builder.push_bind(value.clone());
+            }
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                builder.push(format!(" AND json_extract(n.properties, '{path}') = json("));
+                builder.push_bind(serde_json::to_string(value).unwrap_or_default());
+                builder.push(")");
+            }
+        }
+    }
 }
 
 fn push_tag_filter(builder: &mut QueryBuilder<Sqlite>, tags: &[String]) {

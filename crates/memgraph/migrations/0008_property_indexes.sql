@@ -1,0 +1,1 @@
+ALTER TABLE node_kind_property ADD COLUMN indexed INTEGER NOT NULL DEFAULT 0;

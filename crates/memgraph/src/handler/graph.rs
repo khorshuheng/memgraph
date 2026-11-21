@@ -1359,6 +1359,7 @@ mod tests {
                         key: "status".to_string(),
                         value_type: Some("string".to_string()),
                         required: true,
+                        indexed: true,
                     }]),
                 }],
                 edge_types: vec![],
@@ -1378,6 +1379,7 @@ mod tests {
         assert_eq!(widget.properties[0].key, "status");
         assert_eq!(widget.properties[0].value_type, "string");
         assert!(widget.properties[0].required);
+        assert!(widget.properties[0].indexed);
     }
 
     #[test]
@@ -1512,5 +1514,24 @@ mod tests {
             serde_json::from_str(r#"{"name":"person","description":"p"}"#)
                 .expect("default deserializes");
         assert!(defaulted.unique_name);
+    }
+
+    #[tokio::test]
+    async fn rejects_double_quotes_in_property_filters() {
+        let state = test_state().await;
+        let error = list_nodes(
+            State(state),
+            Query(ListNodesParameters {
+                kind: None,
+                scope: None,
+                within: None,
+                via: None,
+                descend: None,
+                properties: Some(r#"{"a\"b":1}"#.to_string()),
+            }),
+        )
+        .await
+        .expect_err("quote key rejected");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
