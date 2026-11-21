@@ -2,9 +2,8 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::model::{
-    DuplicateGroup as DuplicateGroupModel, EdgeTypeUsage as EdgeTypeUsageModel,
-    GraphHealth as GraphHealthModel, IsolatedNode as IsolatedNodeModel,
-    KindUsage as KindUsageModel,
+    EdgeTypeUsage as EdgeTypeUsageModel, GraphHealth as GraphHealthModel,
+    IsolatedNode as IsolatedNodeModel, KindUsage as KindUsageModel,
 };
 
 #[derive(Serialize, ToSchema)]
@@ -58,25 +57,6 @@ impl From<EdgeTypeUsageModel> for EdgeTypeUsageResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct DuplicateGroupResponse {
-    pub kind_id: i64,
-    pub kind: String,
-    pub name: String,
-    pub node_ids: Vec<i64>,
-}
-
-impl From<DuplicateGroupModel> for DuplicateGroupResponse {
-    fn from(group: DuplicateGroupModel) -> Self {
-        DuplicateGroupResponse {
-            kind_id: group.kind_id,
-            kind: group.kind,
-            name: group.name,
-            node_ids: group.node_ids,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, ToSchema)]
 pub struct IsolatedNodeResponse {
     pub id: i64,
     pub kind: String,
@@ -101,7 +81,6 @@ pub struct GraphHealthResponse {
     pub edge_type_count: i64,
     pub kinds: Vec<KindUsageResponse>,
     pub edge_types: Vec<EdgeTypeUsageResponse>,
-    pub duplicate_groups: Vec<DuplicateGroupResponse>,
     pub isolated_node_count: i64,
     pub isolated_nodes: Vec<IsolatedNodeResponse>,
     pub unanchored_work_count: i64,
@@ -117,7 +96,6 @@ impl From<GraphHealthModel> for GraphHealthResponse {
             edge_type_count: health.edge_types.len() as i64,
             kinds: health.kinds.into_iter().map(Into::into).collect(),
             edge_types: health.edge_types.into_iter().map(Into::into).collect(),
-            duplicate_groups: health.duplicates.into_iter().map(Into::into).collect(),
             isolated_node_count: health.isolated_count,
             isolated_nodes: health.isolated.into_iter().map(Into::into).collect(),
             unanchored_work_count: health.unanchored_count,

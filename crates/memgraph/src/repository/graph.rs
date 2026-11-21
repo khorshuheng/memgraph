@@ -5,10 +5,11 @@ use sqlx::sqlite::Sqlite;
 use sqlx::{FromRow, QueryBuilder, SqliteConnection, SqlitePool};
 
 use crate::model::{
-    Edge, EdgeType, EdgeTypeUsage, IsolatedNode, KindUsage, Neighbor, NeighborDirection, Node,
-    NodeFilter, NodeKind, NodeRef, PackDraft, PackEdgeType, PackItem, PackNodeKind, PackReport,
-    PackStatus, PendingEdge, RelationDirection, SearchHit, SearchPage, SearchScope, TagUsage,
-    encode_kind_list, split_kind_list,
+    Edge, EdgeType, EdgeTypeUsage, ImportConflict, ImportDraft, ImportEdgeResult, ImportNodeResult,
+    ImportRef, ImportReport, ImportStatus, IsolatedNode, KindUsage, Neighbor, NeighborDirection,
+    Node, NodeFilter, NodeKind, NodeRef, PackDraft, PackEdgeType, PackItem, PackNodeKind,
+    PackReport, PackStatus, PendingEdge, RelationDirection, SearchHit, SearchPage, SearchScope,
+    TagUsage, encode_kind_list, split_kind_list,
 };
 
 use super::error::RepositoryError;
@@ -81,6 +82,7 @@ pub trait GraphRepository: Send + Sync {
     async fn create_edge_type(&self, edge_type: &EdgeType) -> Result<EdgeType, RepositoryError>;
     async fn list_edge_types(&self) -> Result<Vec<EdgeType>, RepositoryError>;
     async fn apply_pack(&self, pack: &PackDraft) -> Result<PackReport, RepositoryError>;
+    async fn import_graph(&self, draft: &ImportDraft) -> Result<ImportReport, RepositoryError>;
 
     async fn upsert_node(&self, node: &Node) -> Result<Node, RepositoryError>;
     async fn upsert_node_with_tags(
@@ -97,6 +99,11 @@ pub trait GraphRepository: Send + Sync {
     async fn delete_node(&self, id: i64) -> Result<bool, RepositoryError>;
     async fn list_nodes(&self, filter: &NodeFilter) -> Result<Vec<Node>, RepositoryError>;
     async fn node_kinds_for_ids(&self, ids: &[i64]) -> Result<Vec<(i64, String)>, RepositoryError>;
+    async fn node_id_by_natural_key(
+        &self,
+        kind_id: i64,
+        name: &str,
+    ) -> Result<Option<i64>, RepositoryError>;
 
     async fn set_node_tags(&self, node_id: i64, tags: &[String]) -> Result<(), RepositoryError>;
     async fn node_tags(&self, node_id: i64) -> Result<Vec<String>, RepositoryError>;
@@ -125,8 +132,6 @@ pub trait GraphRepository: Send + Sync {
 
     async fn kind_usage(&self) -> Result<Vec<KindUsage>, RepositoryError>;
     async fn edge_type_usage(&self) -> Result<Vec<EdgeTypeUsage>, RepositoryError>;
-    async fn duplicate_node_rows(&self)
-    -> Result<Vec<(i64, String, String, i64)>, RepositoryError>;
     async fn isolated_node_count(&self) -> Result<i64, RepositoryError>;
     async fn isolated_nodes(&self, limit: i64) -> Result<Vec<IsolatedNode>, RepositoryError>;
     async fn is_anchored(&self, node_id: i64) -> Result<bool, RepositoryError>;
@@ -147,6 +152,30 @@ pub struct SqliteGraphRepository {
 impl SqliteGraphRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    async fn import_graph_once(
+        &self,
+        draft: &ImportDraft,
+    ) -> Result<ImportReport, RepositoryError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .map_err(RepositoryError::from)?;
+        match import_graph_items(&mut connection, draft).await {
+            Ok(report) => {
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(RepositoryError::from(error));
+                }
+                Ok(report)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
     }
 
     async fn apply_pack_once(&self, pack: &PackDraft) -> Result<PackReport, RepositoryError> {
@@ -226,6 +255,23 @@ impl GraphRepository for SqliteGraphRepository {
         loop {
             attempt += 1;
             match self.apply_pack_once(pack).await {
+                Ok(report) => return Ok(report),
+                Err(RepositoryError::Busy(error)) => {
+                    if attempt >= 3 {
+                        return Err(RepositoryError::Busy(error));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50 * attempt)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn import_graph(&self, draft: &ImportDraft) -> Result<ImportReport, RepositoryError> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.import_graph_once(draft).await {
                 Ok(report) => return Ok(report),
                 Err(RepositoryError::Busy(error)) => {
                     if attempt >= 3 {
@@ -383,6 +429,21 @@ impl GraphRepository for SqliteGraphRepository {
             .fetch_all(&self.pool)
             .await?;
         Ok(rows)
+    }
+
+    async fn node_id_by_natural_key(
+        &self,
+        kind_id: i64,
+        name: &str,
+    ) -> Result<Option<i64>, RepositoryError> {
+        let id = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM node WHERE kind_id = ? AND name = ? LIMIT 1",
+        )
+        .bind(kind_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id)
     }
 
     async fn add_edge(&self, edge: &Edge) -> Result<(), RepositoryError> {
@@ -592,23 +653,6 @@ impl GraphRepository for SqliteGraphRepository {
             "SELECT t.id AS edge_type_id, t.name AS edge_type, count(e.source) AS edge_count \
              FROM edge_type t LEFT JOIN edge e ON e.edge_type_id = t.id \
              GROUP BY t.id, t.name ORDER BY t.id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
-    async fn duplicate_node_rows(
-        &self,
-    ) -> Result<Vec<(i64, String, String, i64)>, RepositoryError> {
-        let rows = sqlx::query_as::<_, (i64, String, String, i64)>(
-            "SELECT n.kind_id, k.name, n.name, n.id \
-             FROM node n \
-             JOIN node_kind k ON k.id = n.kind_id \
-             JOIN (SELECT kind_id, name FROM node \
-                   GROUP BY kind_id, name HAVING count(*) > 1) d \
-               ON d.kind_id = n.kind_id AND d.name = n.name \
-             ORDER BY n.kind_id, n.name, n.id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1030,6 +1074,269 @@ async fn single_outgoing_violations(
         .into_iter()
         .map(|(source, count)| format!("node {source} has {count} outgoing edges"))
         .collect())
+}
+
+async fn import_graph_items(
+    connection: &mut SqliteConnection,
+    draft: &ImportDraft,
+) -> Result<ImportReport, RepositoryError> {
+    let kinds = load_node_kind_ids(connection).await?;
+    let edge_types = load_edge_types(connection).await?;
+    let mut resolved: HashMap<String, i64> = HashMap::new();
+    let mut nodes = Vec::with_capacity(draft.nodes.len());
+    for node in &draft.nodes {
+        let kind_id = *kinds.get(&node.kind).ok_or_else(|| {
+            RepositoryError::ContractViolation(format!("node kind '{}' is not defined", node.kind))
+        })?;
+        let result = import_node(connection, draft.on_conflict, kind_id, node).await?;
+        if let Some(reference) = &node.reference {
+            resolved.insert(reference.clone(), result.id);
+        }
+        nodes.push(result);
+    }
+
+    let mut edges = Vec::with_capacity(draft.edges.len());
+    for edge in &draft.edges {
+        let source = resolve_import_ref(connection, &edge.source, &resolved).await?;
+        let destination = resolve_import_ref(connection, &edge.destination, &resolved).await?;
+        let edge_type = edge_types.get(&edge.edge_type).ok_or_else(|| {
+            RepositoryError::ContractViolation(format!(
+                "edge type '{}' is not defined",
+                edge.edge_type
+            ))
+        })?;
+        validate_import_edge(connection, edge_type, source, destination).await?;
+        let result = sqlx::query(
+            "INSERT INTO edge (source, destination, edge_type_id) VALUES (?, ?, ?) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(source)
+        .bind(destination)
+        .bind(edge_type.id)
+        .execute(&mut *connection)
+        .await?;
+        edges.push(ImportEdgeResult {
+            source,
+            destination,
+            edge_type: edge.edge_type.clone(),
+            status: if result.rows_affected() == 1 {
+                ImportStatus::Created
+            } else {
+                ImportStatus::Existing
+            },
+        });
+    }
+
+    Ok(ImportReport { nodes, edges })
+}
+
+async fn load_node_kind_ids(
+    connection: &mut SqliteConnection,
+) -> Result<HashMap<String, i64>, RepositoryError> {
+    let rows = sqlx::query_as::<_, (i64, String)>("SELECT id, name FROM node_kind")
+        .fetch_all(&mut *connection)
+        .await?;
+    Ok(rows.into_iter().map(|(id, name)| (name, id)).collect())
+}
+
+async fn load_edge_types(
+    connection: &mut SqliteConnection,
+) -> Result<HashMap<String, EdgeType>, RepositoryError> {
+    let rows = sqlx::query_as::<_, EdgeType>(&format!("SELECT {EDGE_TYPE_COLUMNS} FROM edge_type"))
+        .fetch_all(&mut *connection)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|edge_type| (edge_type.name.clone(), edge_type))
+        .collect())
+}
+
+async fn import_node(
+    connection: &mut SqliteConnection,
+    conflict: ImportConflict,
+    kind_id: i64,
+    node: &crate::model::ImportNode,
+) -> Result<ImportNodeResult, RepositoryError> {
+    let existing = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT id, description, content FROM node WHERE kind_id = ? AND name = ?",
+    )
+    .bind(kind_id)
+    .bind(&node.name)
+    .fetch_optional(&mut *connection)
+    .await?;
+
+    match existing {
+        None => {
+            let id = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO node (kind_id, name, description, content) \
+                 VALUES (?, ?, ?, ?) RETURNING id",
+            )
+            .bind(kind_id)
+            .bind(&node.name)
+            .bind(node.description.clone().unwrap_or_default())
+            .bind(node.content.clone().unwrap_or_default())
+            .fetch_one(&mut *connection)
+            .await?;
+            if let Some(tags) = &node.tags {
+                replace_tags(&mut *connection, id, tags).await?;
+            }
+            Ok(ImportNodeResult {
+                reference: node.reference.clone(),
+                id,
+                status: ImportStatus::Created,
+            })
+        }
+        Some((id, description, content)) => {
+            if conflict == ImportConflict::Skip {
+                return Ok(ImportNodeResult {
+                    reference: node.reference.clone(),
+                    id,
+                    status: ImportStatus::Skipped,
+                });
+            }
+            let next_description = node.description.clone().unwrap_or(description.clone());
+            let next_content = node.content.clone().unwrap_or(content.clone());
+            let tags_changed = match &node.tags {
+                None => false,
+                Some(tags) => {
+                    let current = sqlx::query_scalar::<_, String>(
+                        "SELECT tag FROM node_tag WHERE node_id = ? ORDER BY tag",
+                    )
+                    .bind(id)
+                    .fetch_all(&mut *connection)
+                    .await?;
+                    let mut proposed = tags.clone();
+                    proposed.sort();
+                    current != proposed
+                }
+            };
+            if next_description == description && next_content == content && !tags_changed {
+                return Ok(ImportNodeResult {
+                    reference: node.reference.clone(),
+                    id,
+                    status: ImportStatus::Unchanged,
+                });
+            }
+            sqlx::query(
+                "UPDATE node SET description = ?, content = ?, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+            )
+            .bind(next_description)
+            .bind(next_content)
+            .bind(id)
+            .execute(&mut *connection)
+            .await?;
+            if tags_changed {
+                replace_tags(
+                    &mut *connection,
+                    id,
+                    node.tags.as_deref().unwrap_or_default(),
+                )
+                .await?;
+            }
+            Ok(ImportNodeResult {
+                reference: node.reference.clone(),
+                id,
+                status: ImportStatus::Updated,
+            })
+        }
+    }
+}
+
+async fn resolve_import_ref(
+    connection: &mut SqliteConnection,
+    reference: &ImportRef,
+    resolved: &HashMap<String, i64>,
+) -> Result<i64, RepositoryError> {
+    match reference {
+        ImportRef::Id(id) => {
+            let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM node WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *connection)
+                .await?;
+            exists.map(|_| *id).ok_or_else(|| {
+                RepositoryError::ContractViolation(format!("node {id} does not exist"))
+            })
+        }
+        ImportRef::Ref(reference) => resolved.get(reference).copied().ok_or_else(|| {
+            RepositoryError::ContractViolation(format!(
+                "ref '{reference}' is not defined in this import"
+            ))
+        }),
+        ImportRef::NaturalKey { kind, name } => {
+            let id = sqlx::query_scalar::<_, i64>(
+                "SELECT n.id FROM node n JOIN node_kind k ON k.id = n.kind_id \
+                 WHERE k.name = ? AND n.name = ? LIMIT 1",
+            )
+            .bind(kind)
+            .bind(name)
+            .fetch_optional(&mut *connection)
+            .await?;
+            id.ok_or_else(|| {
+                RepositoryError::ContractViolation(format!(
+                    "no node with kind '{kind}' and name '{name}'"
+                ))
+            })
+        }
+    }
+}
+
+async fn validate_import_edge(
+    connection: &mut SqliteConnection,
+    edge_type: &EdgeType,
+    source: i64,
+    destination: i64,
+) -> Result<(), RepositoryError> {
+    let source_kind = node_kind_name(connection, source).await?;
+    let destination_kind = node_kind_name(connection, destination).await?;
+    let sources = edge_type.source_kind_list();
+    if !sources.is_empty() && !sources.contains(&source_kind.as_str()) {
+        return Err(RepositoryError::ContractViolation(format!(
+            "edge type '{}' does not accept a '{source_kind}' source",
+            edge_type.name
+        )));
+    }
+    let destinations = edge_type.destination_kind_list();
+    if !destinations.is_empty() && !destinations.contains(&destination_kind.as_str()) {
+        return Err(RepositoryError::ContractViolation(format!(
+            "edge type '{}' does not accept a '{destination_kind}' destination",
+            edge_type.name
+        )));
+    }
+    if edge_type.single_outgoing {
+        let targets = sqlx::query_scalar::<_, i64>(
+            "SELECT destination FROM edge WHERE source = ? AND edge_type_id = ?",
+        )
+        .bind(source)
+        .bind(edge_type.id)
+        .fetch_all(&mut *connection)
+        .await?;
+        if targets.iter().any(|target| *target != destination) {
+            return Err(RepositoryError::ContractViolation(format!(
+                "edge type '{}' allows one outgoing edge, and node {source} already points at {}",
+                edge_type.name,
+                targets
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn node_kind_name(
+    connection: &mut SqliteConnection,
+    node_id: i64,
+) -> Result<String, RepositoryError> {
+    let name = sqlx::query_scalar::<_, String>(
+        "SELECT k.name FROM node n JOIN node_kind k ON k.id = n.kind_id WHERE n.id = ?",
+    )
+    .bind(node_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    name.ok_or_else(|| RepositoryError::ContractViolation(format!("node {node_id} does not exist")))
 }
 
 fn push_tag_filter(builder: &mut QueryBuilder<Sqlite>, tags: &[String]) {

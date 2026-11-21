@@ -1,10 +1,6 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{
-    model::{DuplicateGroup, GraphHealth},
-    repository::graph::GraphRepository,
-};
+use crate::{model::GraphHealth, repository::graph::GraphRepository};
 
 use super::error::ServiceError;
 
@@ -27,7 +23,6 @@ impl HealthService {
     pub async fn report_with_sample(&self, sample: i64) -> Result<GraphHealth, ServiceError> {
         let kinds = self.repository.kind_usage().await?;
         let edge_types = self.repository.edge_type_usage().await?;
-        let duplicate_rows = self.repository.duplicate_node_rows().await?;
         let isolated_count = self.repository.isolated_node_count().await?;
         let isolated = self.repository.isolated_nodes(sample).await?;
         let unanchored_count = self.repository.unanchored_work_count().await?;
@@ -41,36 +36,12 @@ impl HealthService {
             edge_count,
             kinds,
             edge_types,
-            duplicates: group_duplicates(duplicate_rows),
             isolated_count,
             isolated,
             unanchored_count,
             unanchored,
         })
     }
-}
-
-fn group_duplicates(rows: Vec<(i64, String, String, i64)>) -> Vec<DuplicateGroup> {
-    let mut groups: Vec<DuplicateGroup> = Vec::new();
-    let mut index: HashMap<(i64, String), usize> = HashMap::new();
-
-    for (kind_id, kind, name, node_id) in rows {
-        let key = (kind_id, name.clone());
-        match index.get(&key) {
-            Some(position) => groups[*position].node_ids.push(node_id),
-            None => {
-                index.insert(key, groups.len());
-                groups.push(DuplicateGroup {
-                    kind_id,
-                    kind,
-                    name,
-                    node_ids: vec![node_id],
-                });
-            }
-        }
-    }
-
-    groups
 }
 
 #[cfg(test)]
@@ -126,7 +97,6 @@ mod tests {
             report.underused_edge_types().count(),
             report.edge_types.len()
         );
-        assert!(report.duplicates.is_empty());
         assert_eq!(report.isolated_count, 0);
     }
 
@@ -160,7 +130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn groups_duplicate_nodes_by_kind_and_name() {
+    async fn the_natural_key_rejects_duplicate_nodes() {
         let (service, repository) = service().await;
         let file_kind = repository
             .list_node_kinds()
@@ -171,15 +141,30 @@ mod tests {
             .expect("seeded file kind");
 
         let first = node(&repository, file_kind.id, "src/main.rs").await;
-        let second = node(&repository, file_kind.id, "src/main.rs").await;
         node(&repository, file_kind.id, "src/lib.rs").await;
+        let duplicate = repository
+            .upsert_node(&Node {
+                id: 0,
+                kind_id: file_kind.id,
+                name: "src/main.rs".to_string(),
+                description: String::new(),
+                content: String::new(),
+                updated_at: String::new(),
+            })
+            .await;
+        assert!(matches!(
+            duplicate,
+            Err(crate::repository::error::RepositoryError::UniqueConstraintViolation(_))
+        ));
 
         let report = service.report().await.expect("report");
-        assert_eq!(report.duplicates.len(), 1);
-        let group = &report.duplicates[0];
-        assert_eq!(group.kind, "file");
-        assert_eq!(group.name, "src/main.rs");
-        assert_eq!(group.node_ids, vec![first, second]);
+        let usage = report
+            .kinds
+            .iter()
+            .find(|usage| usage.kind_id == file_kind.id)
+            .expect("file kind usage");
+        assert_eq!(usage.node_count, 2);
+        let _ = first;
     }
 
     #[tokio::test]
@@ -334,7 +319,6 @@ mod tests {
         let report = service.report().await.expect("report");
         let summary = report.summary_line();
         assert!(summary.contains(&format!("nodes={}", report.node_count)));
-        assert!(summary.contains(&format!("duplicate_groups={}", report.duplicates.len())));
         assert!(summary.contains(&format!("isolated_nodes={}", report.isolated_count)));
         assert!(summary.contains(&format!("unanchored_work={}", report.unanchored_count)));
     }

@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::model::{
-    Edge as EdgeModel, EdgeType as EdgeTypeModel, Neighbor as NeighborModel,
+    Edge as EdgeModel, EdgeType as EdgeTypeModel, ImportConflict, ImportDraft, ImportEdge,
+    ImportNode, ImportRef, ImportReport, ImportStatus, Neighbor as NeighborModel,
     NeighborDirection as NeighborDirectionModel, Node as NodeModel, NodeFilter,
     NodeKind as NodeKindModel, PackDraft, PackEdgeType, PackNodeKind, PackReport,
     Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft, PlanTask as PlanTaskModel,
@@ -449,6 +450,185 @@ impl From<crate::model::PackItem> for PackItemResponse {
                 PackStatus::Updated => "updated".to_string(),
                 PackStatus::Unchanged => "unchanged".to_string(),
             },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportConflictParameters {
+    #[default]
+    Update,
+    Skip,
+}
+
+impl From<ImportConflictParameters> for ImportConflict {
+    fn from(params: ImportConflictParameters) -> Self {
+        match params {
+            ImportConflictParameters::Update => ImportConflict::Update,
+            ImportConflictParameters::Skip => ImportConflict::Skip,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum ImportNodeRefParameters {
+    NaturalKey { kind: String, name: String },
+    Id(i64),
+    Ref(String),
+}
+
+impl From<ImportNodeRefParameters> for ImportRef {
+    fn from(params: ImportNodeRefParameters) -> Self {
+        match params {
+            ImportNodeRefParameters::Id(id) => ImportRef::Id(id),
+            ImportNodeRefParameters::Ref(reference) => ImportRef::Ref(reference),
+            ImportNodeRefParameters::NaturalKey { kind, name } => {
+                ImportRef::NaturalKey { kind, name }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ImportNodeParameters {
+    #[serde(default, rename = "ref")]
+    pub reference: Option<String>,
+    pub kind: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+impl From<ImportNodeParameters> for ImportNode {
+    fn from(params: ImportNodeParameters) -> Self {
+        ImportNode {
+            reference: params.reference,
+            kind: params.kind,
+            name: params.name,
+            description: params.description,
+            content: params.content,
+            tags: params.tags,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ImportEdgeParameters {
+    pub source: ImportNodeRefParameters,
+    pub destination: ImportNodeRefParameters,
+    #[serde(rename = "type")]
+    pub edge_type: String,
+}
+
+impl From<ImportEdgeParameters> for ImportEdge {
+    fn from(params: ImportEdgeParameters) -> Self {
+        ImportEdge {
+            source: params.source.into(),
+            destination: params.destination.into(),
+            edge_type: params.edge_type,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    description = "Batch import. Nodes are identified by (kind, name): re-importing updates \
+                   existing nodes instead of duplicating them. Omitted description/content/tags \
+                   are left unchanged. Edge endpoints are a numeric node id or a request-local ref. \
+                   The whole batch is one transaction."
+)]
+pub struct ImportParameters {
+    #[serde(default)]
+    pub on_conflict: ImportConflictParameters,
+    #[serde(default)]
+    pub nodes: Vec<ImportNodeParameters>,
+    #[serde(default)]
+    pub edges: Vec<ImportEdgeParameters>,
+}
+
+impl From<ImportParameters> for ImportDraft {
+    fn from(params: ImportParameters) -> Self {
+        ImportDraft {
+            on_conflict: params.on_conflict.into(),
+            nodes: params.nodes.into_iter().map(Into::into).collect(),
+            edges: params.edges.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+fn import_status(status: ImportStatus) -> String {
+    match status {
+        ImportStatus::Created => "created",
+        ImportStatus::Updated => "updated",
+        ImportStatus::Unchanged => "unchanged",
+        ImportStatus::Skipped => "skipped",
+        ImportStatus::Existing => "existing",
+    }
+    .to_string()
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ImportNodeResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    pub id: i64,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ImportEdgeResponse {
+    pub source: i64,
+    pub destination: i64,
+    pub edge_type: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ImportReportResponse {
+    pub nodes: Vec<ImportNodeResponse>,
+    pub edges: Vec<ImportEdgeResponse>,
+    pub nodes_created: usize,
+    pub nodes_updated: usize,
+    pub nodes_unchanged: usize,
+    pub nodes_skipped: usize,
+    pub edges_created: usize,
+    pub edges_existing: usize,
+}
+
+impl From<ImportReport> for ImportReportResponse {
+    fn from(report: ImportReport) -> Self {
+        ImportReportResponse {
+            nodes_created: report.nodes_created(),
+            nodes_updated: report.nodes_updated(),
+            nodes_unchanged: report.nodes_unchanged(),
+            nodes_skipped: report.nodes_skipped(),
+            edges_created: report.edges_created(),
+            edges_existing: report.edges_existing(),
+            nodes: report
+                .nodes
+                .into_iter()
+                .map(|node| ImportNodeResponse {
+                    reference: node.reference,
+                    id: node.id,
+                    status: import_status(node.status),
+                })
+                .collect(),
+            edges: report
+                .edges
+                .into_iter()
+                .map(|edge| ImportEdgeResponse {
+                    source: edge.source,
+                    destination: edge.destination,
+                    edge_type: edge.edge_type,
+                    status: import_status(edge.status),
+                })
+                .collect(),
         }
     }
 }

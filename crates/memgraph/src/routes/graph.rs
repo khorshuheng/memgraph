@@ -7,6 +7,7 @@ pub(crate) fn routes(app_state: AppState) -> OpenApiRouter {
         .routes(routes!(create_node_kind, list_node_kinds))
         .routes(routes!(create_edge_type, list_edge_types))
         .routes(routes!(apply_pack))
+        .routes(routes!(import_graph))
         .routes(routes!(create_node, list_nodes))
         .routes(routes!(create_task))
         .routes(routes!(create_plan))

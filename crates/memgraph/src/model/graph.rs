@@ -181,6 +181,118 @@ pub struct PackDraft {
     pub edge_types: Vec<PackEdgeType>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImportConflict {
+    #[default]
+    Update,
+    Skip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportNode {
+    pub reference: Option<String>,
+    pub kind: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub content: Option<String>,
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportRef {
+    Id(i64),
+    Ref(String),
+    NaturalKey { kind: String, name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportEdge {
+    pub source: ImportRef,
+    pub destination: ImportRef,
+    pub edge_type: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportStatus {
+    Created,
+    Updated,
+    Unchanged,
+    Skipped,
+    Existing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportNodeResult {
+    pub reference: Option<String>,
+    pub id: i64,
+    pub status: ImportStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportEdgeResult {
+    pub source: i64,
+    pub destination: i64,
+    pub edge_type: String,
+    pub status: ImportStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImportDraft {
+    pub on_conflict: ImportConflict,
+    pub nodes: Vec<ImportNode>,
+    pub edges: Vec<ImportEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImportReport {
+    pub nodes: Vec<ImportNodeResult>,
+    pub edges: Vec<ImportEdgeResult>,
+}
+
+impl ImportReport {
+    pub fn nodes_created(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| node.status == ImportStatus::Created)
+            .count()
+    }
+
+    pub fn nodes_updated(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| node.status == ImportStatus::Updated)
+            .count()
+    }
+
+    pub fn nodes_unchanged(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| node.status == ImportStatus::Unchanged)
+            .count()
+    }
+
+    pub fn nodes_skipped(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| node.status == ImportStatus::Skipped)
+            .count()
+    }
+
+    pub fn edges_created(&self) -> usize {
+        self.edges
+            .iter()
+            .filter(|edge| edge.status == ImportStatus::Created)
+            .count()
+    }
+
+    pub fn edges_existing(&self) -> usize {
+        self.edges
+            .iter()
+            .filter(|edge| edge.status == ImportStatus::Existing)
+            .count()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PackReport {
     pub node_kinds: Vec<PackItem>,
@@ -225,14 +337,6 @@ pub struct EdgeTypeUsage {
     pub edge_count: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DuplicateGroup {
-    pub kind_id: i64,
-    pub kind: String,
-    pub name: String,
-    pub node_ids: Vec<i64>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct IsolatedNode {
     pub id: i64,
@@ -246,7 +350,6 @@ pub struct GraphHealth {
     pub edge_count: i64,
     pub kinds: Vec<KindUsage>,
     pub edge_types: Vec<EdgeTypeUsage>,
-    pub duplicates: Vec<DuplicateGroup>,
     pub isolated_count: i64,
     pub isolated: Vec<IsolatedNode>,
     pub unanchored_count: i64,
@@ -264,14 +367,13 @@ impl GraphHealth {
 
     pub fn summary_line(&self) -> String {
         format!(
-            "nodes={} edges={} kinds={} (dead={}) edge_types={} (underused={}) duplicate_groups={} isolated_nodes={} unanchored_work={}",
+            "nodes={} edges={} kinds={} (dead={}) edge_types={} (underused={}) isolated_nodes={} unanchored_work={}",
             self.node_count,
             self.edge_count,
             self.kinds.len(),
             self.dead_kinds().count(),
             self.edge_types.len(),
             self.underused_edge_types().count(),
-            self.duplicates.len(),
             self.isolated_count,
             self.unanchored_count,
         )

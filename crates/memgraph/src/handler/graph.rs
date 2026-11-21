@@ -9,16 +9,18 @@ use crate::{
         graph::{
             ApplyPackParameters, CreateEdgeParameters, CreateEdgeTypeParameters,
             CreateNodeKindParameters, CreateNodeParameters, CreatePlanParameters,
-            CreateTaskParameters, DeleteEdgeParameters, EdgeTypeResponse, ListNodesParameters,
-            NeighborParameters, NeighborResponse, NodeKindResponse, NodeResponse,
-            PackReportResponse, PlanResponse, ReplaceTagsParameters, SearchHitResponse,
-            SearchParameters, SearchResponse, TagUsageResponse, UpdateTaskParameters,
+            CreateTaskParameters, DeleteEdgeParameters, EdgeTypeResponse, ImportParameters,
+            ImportReportResponse, ListNodesParameters, NeighborParameters, NeighborResponse,
+            NodeKindResponse, NodeResponse, PackReportResponse, PlanResponse,
+            ReplaceTagsParameters, SearchHitResponse, SearchParameters, SearchResponse,
+            TagUsageResponse, UpdateTaskParameters,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
     },
     model::{
-        Edge, EdgeType, Node, NodeFilter, NodeKind, PackDraft, PlanDraft, TaskDraft, TaskPatch,
+        Edge, EdgeType, ImportDraft, Node, NodeFilter, NodeKind, PackDraft, PlanDraft, TaskDraft,
+        TaskPatch,
     },
     state::AppState,
 };
@@ -167,6 +169,25 @@ pub async fn create_plan(
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
         data: plan.into(),
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    post,
+    path = "/graph/import",
+    request_body = ImportParameters,
+    responses((status = 200, description = "Batch import applied", body = ImportReportResponse))
+)]
+pub async fn import_graph(
+    State(state): State<AppState>,
+    Json(params): Json<ImportParameters>,
+) -> Result<ApiSuccess<ImportReportResponse>, ApiError> {
+    let draft: ImportDraft = params.into();
+    let report = state.graph_service.import_graph(&draft).await?;
+    Ok(ApiSuccess {
+        status: StatusCode::OK,
+        data: report.into(),
     })
 }
 
@@ -435,7 +456,10 @@ pub async fn graph_health(
 mod tests {
     use super::*;
     use crate::config::{AppConfig, DatabaseConfig, SearchConfig, ServerConfig};
-    use crate::dto::graph::{PackEdgeTypeParameters, PackNodeKindParameters};
+    use crate::dto::graph::{
+        ImportConflictParameters, ImportNodeParameters, PackEdgeTypeParameters,
+        PackNodeKindParameters,
+    };
 
     async fn test_state() -> AppState {
         AppState::new(&AppConfig {
@@ -765,5 +789,39 @@ mod tests {
         assert_eq!((third.updated, third.unchanged), (1, 1));
         assert_eq!(third.node_kinds[0].version, Some(2));
         assert_eq!(third.node_kinds[0].status, "updated");
+    }
+
+    #[tokio::test]
+    async fn imports_nodes_and_edges_over_http() {
+        let state = test_state().await;
+        seed_kind(&state, "decision").await;
+        let params = || ImportParameters {
+            on_conflict: ImportConflictParameters::Update,
+            nodes: vec![ImportNodeParameters {
+                reference: Some("n1".to_string()),
+                kind: "decision".to_string(),
+                name: "use sqlite".to_string(),
+                description: Some("single file".to_string()),
+                content: Some("portable".to_string()),
+                tags: Some(vec!["Repo:X".to_string()]),
+            }],
+            edges: vec![],
+        };
+
+        let first = import_graph(State(state.clone()), Json(params()))
+            .await
+            .expect("import")
+            .data;
+        assert_eq!(first.nodes_created, 1);
+        assert_eq!(first.nodes[0].reference.as_deref(), Some("n1"));
+        assert_eq!(first.nodes[0].status, "created");
+
+        let second = import_graph(State(state.clone()), Json(params()))
+            .await
+            .expect("re-import")
+            .data;
+        assert_eq!(second.nodes_created, 0);
+        assert_eq!(second.nodes_unchanged, 1);
+        assert_eq!(second.nodes[0].id, first.nodes[0].id);
     }
 }

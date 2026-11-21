@@ -4,9 +4,10 @@ use std::sync::Arc;
 use crate::{
     config::SearchConfig,
     model::{
-        Edge, EdgeType, Neighbor, NeighborDirection, Node, NodeFilter, NodeKind, NodeRef,
-        PackDraft, PackEdgeType, PackNodeKind, PackReport, PendingEdge, Plan, PlanDraft, PlanTask,
-        PlanTaskDraft, ReachFilter, SearchPage, TagUsage, TaskDraft, TaskPatch,
+        Edge, EdgeType, ImportDraft, ImportEdge, ImportNode, ImportRef, ImportReport, Neighbor,
+        NeighborDirection, Node, NodeFilter, NodeKind, NodeRef, PackDraft, PackEdgeType,
+        PackNodeKind, PackReport, PendingEdge, Plan, PlanDraft, PlanTask, PlanTaskDraft,
+        ReachFilter, SearchPage, TagUsage, TaskDraft, TaskPatch,
     },
     repository::graph::GraphRepository,
 };
@@ -125,6 +126,77 @@ impl GraphService {
             .apply_pack(&PackDraft {
                 node_kinds,
                 edge_types,
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn import_graph(&self, draft: &ImportDraft) -> Result<ImportReport, ServiceError> {
+        let mut nodes = Vec::with_capacity(draft.nodes.len());
+        let mut references: HashSet<String> = HashSet::new();
+        let mut pairs: HashSet<(String, String)> = HashSet::new();
+        for node in &draft.nodes {
+            let kind = node.kind.trim().to_string();
+            if kind.is_empty() {
+                return Err(ServiceError::UnprocessableEntity(
+                    "node kind must not be empty".to_string(),
+                ));
+            }
+            let name = node_name(&node.name)?;
+            let reference = match node.reference.as_deref().map(str::trim) {
+                None => None,
+                Some("") => {
+                    return Err(ServiceError::UnprocessableEntity(
+                        "ref must not be empty".to_string(),
+                    ));
+                }
+                Some(reference) => {
+                    if !references.insert(reference.to_string()) {
+                        return Err(ServiceError::UnprocessableEntity(format!(
+                            "ref '{reference}' appears more than once in the import"
+                        )));
+                    }
+                    Some(reference.to_string())
+                }
+            };
+            if !pairs.insert((kind.clone(), name.clone())) {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "node ({kind}, {name}) appears more than once in the import"
+                )));
+            }
+            nodes.push(ImportNode {
+                reference,
+                kind,
+                name,
+                description: node.description.clone(),
+                content: node.content.clone(),
+                tags: match &node.tags {
+                    Some(tags) => Some(normalize_tags(tags)?),
+                    None => None,
+                },
+            });
+        }
+
+        let mut edges = Vec::with_capacity(draft.edges.len());
+        for edge in &draft.edges {
+            let edge_type = edge.edge_type.trim().to_string();
+            if edge_type.is_empty() {
+                return Err(ServiceError::UnprocessableEntity(
+                    "edge type must not be empty".to_string(),
+                ));
+            }
+            edges.push(ImportEdge {
+                source: normalize_import_ref(&edge.source)?,
+                destination: normalize_import_ref(&edge.destination)?,
+                edge_type,
+            });
+        }
+
+        self.repository
+            .import_graph(&ImportDraft {
+                on_conflict: draft.on_conflict,
+                nodes,
+                edges,
             })
             .await
             .map_err(Into::into)
@@ -331,10 +403,16 @@ impl GraphService {
                 "node {task_id} is not a task"
             )));
         }
+        let name = match &patch.name {
+            Some(name) => node_name(name)?,
+            None => node.name.clone(),
+        };
+        self.require_available_name(task_kind, &name, node.id)
+            .await?;
         let updated = Node {
             id: node.id,
             kind_id: node.kind_id,
-            name: patch.name.clone().unwrap_or(node.name),
+            name,
             description: patch.description.clone().unwrap_or(node.description),
             content: patch.content.clone().unwrap_or(node.content),
             updated_at: String::new(),
@@ -346,6 +424,9 @@ impl GraphService {
     }
 
     pub async fn create_task(&self, draft: &TaskDraft) -> Result<Node, ServiceError> {
+        let mut normalized = draft.clone();
+        normalized.name = node_name(&normalized.name)?;
+        let draft = &normalized;
         if draft.id < 0 {
             return Err(ServiceError::UnprocessableEntity(format!(
                 "task has invalid node id {}",
@@ -358,6 +439,8 @@ impl GraphService {
             ));
         };
         let task_kind = self.kind_id("task").await?;
+        self.require_available_name(task_kind, &draft.name, draft.id)
+            .await?;
         let edge_types = self.repository.list_edge_types().await?;
         let PlanEdgeTypes {
             part_of,
@@ -435,6 +518,15 @@ impl GraphService {
     }
 
     pub async fn create_plan(&self, draft: &PlanDraft) -> Result<Plan, ServiceError> {
+        let mut normalized = draft.clone();
+        if let Some(goal) = &mut normalized.goal {
+            goal.name = node_name(&goal.name)?;
+        }
+        for task in &mut normalized.tasks {
+            task.name = node_name(&task.name)?;
+        }
+        let draft = &normalized;
+
         validate_plan_root(draft)?;
         validate_supplied_ids(draft)?;
 
@@ -445,6 +537,16 @@ impl GraphService {
         } else {
             None
         };
+
+        let mut task_names: HashSet<&str> = HashSet::new();
+        for task in &draft.tasks {
+            if !task_names.insert(task.name.as_str()) {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "two tasks share the name '{}'; node names are unique per kind",
+                    task.name
+                )));
+            }
+        }
         let edge_types = self.repository.list_edge_types().await?;
         let types = plan_edge_types(&edge_types)?;
 
@@ -454,6 +556,15 @@ impl GraphService {
         validate_key_references(draft, &key_index)?;
         assert_acyclic_parents(&draft.tasks)?;
         assert_acyclic_dependencies(&draft.tasks)?;
+
+        if let (Some(goal), Some(goal_kind)) = (&draft.goal, goal_kind) {
+            self.require_available_name(goal_kind, &goal.name, goal.id)
+                .await?;
+        }
+        for task in &draft.tasks {
+            self.require_available_name(task_kind, &task.name, task.id)
+                .await?;
+        }
 
         let nodes = build_plan_nodes(draft, task_kind, goal_kind, offset);
         let root = match draft.goal_id {
@@ -547,6 +658,26 @@ impl GraphService {
         Ok(rows.into_iter().collect())
     }
 
+    async fn require_available_name(
+        &self,
+        kind_id: i64,
+        name: &str,
+        own_id: i64,
+    ) -> Result<(), ServiceError> {
+        if let Some(existing) = self
+            .repository
+            .node_id_by_natural_key(kind_id, name)
+            .await?
+            && existing != own_id
+        {
+            return Err(ServiceError::Conflict(format!(
+                "a node named '{name}' already exists with id {existing}; \
+                 node names are unique per kind"
+            )));
+        }
+        Ok(())
+    }
+
     async fn kind_id(&self, name: &str) -> Result<i64, ServiceError> {
         kind_id_of(&self.repository.list_node_kinds().await?, name)
     }
@@ -586,8 +717,12 @@ impl GraphService {
         node: &Node,
         tags: &[String],
     ) -> Result<(Node, Vec<String>), ServiceError> {
+        let mut node = node.clone();
+        node.name = node_name(&node.name)?;
+        self.require_available_name(node.kind_id, &node.name, 0)
+            .await?;
         let tags = normalize_tags(tags)?;
-        let created = self.repository.upsert_node_with_tags(node, &tags).await?;
+        let created = self.repository.upsert_node_with_tags(&node, &tags).await?;
         Ok((created, tags))
     }
 
@@ -975,6 +1110,28 @@ fn visit_dependencies<'a>(
 
 const MAX_TAG_LENGTH: usize = 128;
 
+const MAX_NODE_NAME_LENGTH: usize = 512;
+
+fn node_name(name: &str) -> Result<String, ServiceError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ServiceError::UnprocessableEntity(
+            "node name must not be empty".to_string(),
+        ));
+    }
+    if name.chars().count() > MAX_NODE_NAME_LENGTH {
+        return Err(ServiceError::UnprocessableEntity(format!(
+            "node name exceeds {MAX_NODE_NAME_LENGTH} characters"
+        )));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(ServiceError::UnprocessableEntity(
+            "node name must not contain control characters".to_string(),
+        ));
+    }
+    Ok(name.to_string())
+}
+
 const MAX_VOCABULARY_NAME_LENGTH: usize = 128;
 
 fn vocabulary_name(name: &str, label: &str) -> Result<String, ServiceError> {
@@ -1032,6 +1189,34 @@ where
     Ok(())
 }
 
+fn normalize_import_ref(reference: &ImportRef) -> Result<ImportRef, ServiceError> {
+    match reference {
+        ImportRef::Id(id) => Ok(ImportRef::Id(*id)),
+        ImportRef::Ref(reference) => {
+            let reference = reference.trim();
+            if reference.is_empty() {
+                return Err(ServiceError::UnprocessableEntity(
+                    "ref must not be empty".to_string(),
+                ));
+            }
+            Ok(ImportRef::Ref(reference.to_string()))
+        }
+        ImportRef::NaturalKey { kind, name } => {
+            let kind = kind.trim();
+            let name = name.trim();
+            if kind.is_empty() || name.is_empty() {
+                return Err(ServiceError::UnprocessableEntity(
+                    "a natural-key reference requires both kind and name".to_string(),
+                ));
+            }
+            Ok(ImportRef::NaturalKey {
+                kind: kind.to_string(),
+                name: name.to_string(),
+            })
+        }
+    }
+}
+
 fn normalize_tags(tags: &[String]) -> Result<Vec<String>, ServiceError> {
     let mut normalized: Vec<String> = Vec::new();
     for tag in tags {
@@ -1064,7 +1249,10 @@ fn fts_query(text: &str) -> Option<String> {
 mod tests {
     use crate::{
         database::{create_sqlite_pool, migrate},
-        model::{PlanAnchorDraft, PlanGoalDraft, RelationDirection, SearchScope},
+        model::{
+            ImportConflict, ImportRef, PlanAnchorDraft, PlanGoalDraft, RelationDirection,
+            SearchScope,
+        },
         repository::graph::SqliteGraphRepository,
     };
 
@@ -2398,10 +2586,10 @@ mod tests {
             .await
             .unwrap();
 
-        let draft = |anchor: PlanAnchorDraft| PlanDraft {
+        let draft = |anchor: PlanAnchorDraft, goal: &str| PlanDraft {
             goal: Some(PlanGoalDraft {
                 id: 0,
-                name: "ship widget".to_string(),
+                name: goal.to_string(),
                 description: String::new(),
                 content: String::new(),
             }),
@@ -2411,10 +2599,13 @@ mod tests {
         };
 
         let plan = service
-            .create_plan(&draft(PlanAnchorDraft {
-                node_id: repo.id,
-                edge_type: "belongs_to".to_string(),
-            }))
+            .create_plan(&draft(
+                PlanAnchorDraft {
+                    node_id: repo.id,
+                    edge_type: "belongs_to".to_string(),
+                },
+                "ship widget",
+            ))
             .await
             .unwrap();
         let goal = plan.goal.as_ref().expect("goal created");
@@ -2428,28 +2619,37 @@ mod tests {
 
         assert!(matches!(
             service
-                .create_plan(&draft(PlanAnchorDraft {
-                    node_id: repo.id,
-                    edge_type: "contains".to_string(),
-                }))
+                .create_plan(&draft(
+                    PlanAnchorDraft {
+                        node_id: repo.id,
+                        edge_type: "contains".to_string(),
+                    },
+                    "invalid contract",
+                ))
                 .await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
         assert!(matches!(
             service
-                .create_plan(&draft(PlanAnchorDraft {
-                    node_id: 9999,
-                    edge_type: "belongs_to".to_string(),
-                }))
+                .create_plan(&draft(
+                    PlanAnchorDraft {
+                        node_id: 9999,
+                        edge_type: "belongs_to".to_string(),
+                    },
+                    "missing anchor",
+                ))
                 .await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
         assert!(matches!(
             service
-                .create_plan(&draft(PlanAnchorDraft {
-                    node_id: repo.id,
-                    edge_type: "nope".to_string(),
-                }))
+                .create_plan(&draft(
+                    PlanAnchorDraft {
+                        node_id: repo.id,
+                        edge_type: "nope".to_string(),
+                    },
+                    "unknown edge type",
+                ))
                 .await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
@@ -3272,5 +3472,483 @@ mod tests {
 
         drop(service);
         std::fs::remove_file(&path).ok();
+    }
+
+    fn import_node(reference: Option<&str>, kind: &str, name: &str) -> ImportNode {
+        ImportNode {
+            reference: reference.map(str::to_string),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            description: None,
+            content: None,
+            tags: None,
+        }
+    }
+
+    fn import_draft(nodes: Vec<ImportNode>, edges: Vec<ImportEdge>) -> ImportDraft {
+        ImportDraft {
+            on_conflict: ImportConflict::Update,
+            nodes,
+            edges,
+        }
+    }
+
+    #[tokio::test]
+    async fn imports_nodes_and_edges_with_refs() {
+        let service = service().await;
+        let goal_kind = seeded_kind(&service, "goal").await;
+        let goal = service
+            .create_node(&node(goal_kind, "ship import", ""), &[])
+            .await
+            .unwrap()
+            .0;
+
+        let mut task = import_node(Some("t1"), "task", "write import");
+        task.description = Some("desc".to_string());
+        task.content = Some("content".to_string());
+        task.tags = Some(vec!["Repo:X".to_string()]);
+        let draft = import_draft(
+            vec![task],
+            vec![ImportEdge {
+                source: ImportRef::Ref("t1".to_string()),
+                destination: ImportRef::Id(goal.id),
+                edge_type: "part_of".to_string(),
+            }],
+        );
+
+        let report = service.import_graph(&draft).await.unwrap();
+        assert_eq!(report.nodes_created(), 1);
+        assert_eq!(report.edges_created(), 1);
+        assert_eq!(report.nodes[0].reference.as_deref(), Some("t1"));
+
+        let stored = service.get_node(report.nodes[0].id).await.unwrap();
+        assert_eq!(stored.name, "write import");
+        assert_eq!(stored.content, "content");
+        assert_eq!(
+            service.node_tags(report.nodes[0].id).await.unwrap(),
+            vec!["repo:x"]
+        );
+    }
+
+    #[tokio::test]
+    async fn reimporting_converges() {
+        let service = service().await;
+        let mut decision = import_node(None, "decision", "use sqlite");
+        decision.tags = Some(vec!["topic:storage".to_string()]);
+        let draft = import_draft(vec![decision], vec![]);
+
+        let first = service.import_graph(&draft).await.unwrap();
+        assert_eq!(first.nodes_created(), 1);
+
+        let second = service.import_graph(&draft).await.unwrap();
+        assert_eq!(second.nodes_created(), 0);
+        assert_eq!(second.nodes_unchanged(), 1);
+        assert_eq!(second.nodes[0].id, first.nodes[0].id);
+    }
+
+    #[tokio::test]
+    async fn import_updates_omitted_fields_and_skip_mode() {
+        let service = service().await;
+        let mut decision = import_node(None, "decision", "use sqlite");
+        decision.description = Some("first".to_string());
+        decision.content = Some("keep me".to_string());
+        decision.tags = Some(vec!["one".to_string()]);
+        let created = service
+            .import_graph(&import_draft(vec![decision], vec![]))
+            .await
+            .unwrap();
+
+        let mut update = import_node(None, "decision", "use sqlite");
+        update.description = Some("second".to_string());
+        update.tags = Some(vec!["two".to_string()]);
+        let updated = service
+            .import_graph(&import_draft(vec![update], vec![]))
+            .await
+            .unwrap();
+        assert_eq!(updated.nodes_updated(), 1);
+        let stored = service.get_node(created.nodes[0].id).await.unwrap();
+        assert_eq!(stored.description, "second");
+        assert_eq!(stored.content, "keep me");
+        assert_eq!(
+            service.node_tags(created.nodes[0].id).await.unwrap(),
+            vec!["two"]
+        );
+
+        let mut skipped = import_node(None, "decision", "use sqlite");
+        skipped.description = Some("third".to_string());
+        let report = service
+            .import_graph(&ImportDraft {
+                on_conflict: ImportConflict::Skip,
+                nodes: vec![skipped],
+                edges: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.nodes_skipped(), 1);
+        assert_eq!(
+            service
+                .get_node(created.nodes[0].id)
+                .await
+                .unwrap()
+                .description,
+            "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_rejects_invalid_drafts() {
+        let service = service().await;
+        let cases = vec![
+            import_draft(
+                vec![
+                    import_node(Some("dup"), "task", "a"),
+                    import_node(Some("dup"), "task", "b"),
+                ],
+                vec![],
+            ),
+            import_draft(
+                vec![
+                    import_node(None, "task", "same"),
+                    import_node(None, "task", "same"),
+                ],
+                vec![],
+            ),
+            import_draft(vec![import_node(None, "task", "   ")], vec![]),
+            import_draft(vec![import_node(None, "ghost", "x")], vec![]),
+            import_draft(
+                vec![import_node(Some("a"), "task", "x")],
+                vec![ImportEdge {
+                    source: ImportRef::Ref("a".to_string()),
+                    destination: ImportRef::Ref("a".to_string()),
+                    edge_type: "ghost".to_string(),
+                }],
+            ),
+            import_draft(
+                vec![import_node(Some("a"), "task", "x")],
+                vec![ImportEdge {
+                    source: ImportRef::Ref("missing".to_string()),
+                    destination: ImportRef::Ref("a".to_string()),
+                    edge_type: "part_of".to_string(),
+                }],
+            ),
+            import_draft(
+                vec![import_node(Some("a"), "task", "x")],
+                vec![ImportEdge {
+                    source: ImportRef::Ref("a".to_string()),
+                    destination: ImportRef::Id(999),
+                    edge_type: "part_of".to_string(),
+                }],
+            ),
+        ];
+        for draft in cases {
+            assert!(
+                matches!(
+                    service.import_graph(&draft).await,
+                    Err(ServiceError::UnprocessableEntity(_))
+                ),
+                "draft was accepted: {draft:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_contract_violation_rolls_back_the_batch() {
+        let service = service().await;
+        let before = service
+            .list_nodes(&NodeFilter::default())
+            .await
+            .unwrap()
+            .len();
+        let draft = import_draft(
+            vec![import_node(Some("d"), "decision", "should not persist")],
+            vec![ImportEdge {
+                source: ImportRef::Ref("d".to_string()),
+                destination: ImportRef::Id(1),
+                edge_type: "part_of".to_string(),
+            }],
+        );
+        let error = service.import_graph(&draft).await.unwrap_err();
+        assert!(rejection(error).contains("does not accept"));
+
+        let after = service
+            .list_nodes(&NodeFilter::default())
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_a_second_single_outgoing_edge() {
+        let service = service().await;
+        let goal_kind = seeded_kind(&service, "goal").await;
+        let repo_kind = seeded_kind(&service, "repo").await;
+        let goal = service
+            .create_node(&node(goal_kind, "anchored", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let first_repo = service
+            .create_node(&node(repo_kind, "acme/one", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let second_repo = service
+            .create_node(&node(repo_kind, "acme/two", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        service
+            .add_edge(&Edge {
+                source: goal.id,
+                destination: first_repo.id,
+                edge_type_id: seeded_edge_type(&service, "belongs_to").await,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let error = service
+            .import_graph(&import_draft(
+                vec![],
+                vec![ImportEdge {
+                    source: ImportRef::Id(goal.id),
+                    destination: ImportRef::Id(second_repo.id),
+                    edge_type: "belongs_to".to_string(),
+                }],
+            ))
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("one outgoing edge"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_node_creation_is_a_conflict() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        service
+            .create_node(&node(kind_id, "Ada", ""), &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            service.create_node(&node(kind_id, "Ada", ""), &[]).await,
+            Err(ServiceError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_imports_converge() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "memgraph-import-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let service = file_service(&path).await;
+        service
+            .create_node_kind(&node_kind("decision"))
+            .await
+            .unwrap();
+        let mut decision = import_node(Some("d"), "decision", "shared");
+        decision.description = Some("shared context".to_string());
+        let draft = import_draft(vec![decision], vec![]);
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let service = service.clone();
+            let draft = draft.clone();
+            handles.push(tokio::spawn(
+                async move { service.import_graph(&draft).await },
+            ));
+        }
+        let mut created = 0;
+        let mut unchanged = 0;
+        for handle in handles {
+            let report = handle.await.unwrap().expect("import succeeds");
+            created += report.nodes_created();
+            unchanged += report.nodes_unchanged();
+        }
+        assert_eq!(created, 1);
+        assert_eq!(unchanged, 7);
+
+        drop(service);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_task_names_in_a_plan() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let mut first = plan_task("a", None, &[]);
+        let mut second = plan_task("b", None, &[]);
+        first.name = "write tests".to_string();
+        second.name = "write tests".to_string();
+
+        let error = service
+            .create_plan(&PlanDraft {
+                goal: Some(PlanGoalDraft {
+                    id: 0,
+                    name: "ship widgets".to_string(),
+                    description: String::new(),
+                    content: String::new(),
+                }),
+                goal_id: None,
+                anchor: Some(PlanAnchorDraft {
+                    node_id: repo,
+                    edge_type: "belongs_to".to_string(),
+                }),
+                tasks: vec![first, second],
+            })
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("share the name"));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_task_name_that_already_exists() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let mut first = plan_task("a", None, &[]);
+        first.name = "shared task".to_string();
+        service
+            .create_plan(&PlanDraft {
+                goal: Some(PlanGoalDraft {
+                    id: 0,
+                    name: "first goal".to_string(),
+                    description: String::new(),
+                    content: String::new(),
+                }),
+                goal_id: None,
+                anchor: Some(PlanAnchorDraft {
+                    node_id: repo,
+                    edge_type: "belongs_to".to_string(),
+                }),
+                tasks: vec![first],
+            })
+            .await
+            .unwrap();
+
+        let mut second = plan_task("b", None, &[]);
+        second.name = "shared task".to_string();
+        let error = service
+            .create_plan(&PlanDraft {
+                goal: Some(PlanGoalDraft {
+                    id: 0,
+                    name: "second goal".to_string(),
+                    description: String::new(),
+                    content: String::new(),
+                }),
+                goal_id: None,
+                anchor: Some(PlanAnchorDraft {
+                    node_id: repo,
+                    edge_type: "belongs_to".to_string(),
+                }),
+                tasks: vec![second],
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Conflict(_)));
+        assert!(error.to_string().contains("unique per kind"));
+    }
+
+    #[tokio::test]
+    async fn import_accepts_natural_key_edge_endpoints() {
+        let service = service().await;
+        service
+            .import_graph(&import_draft(
+                vec![import_node(None, "goal", "anchor goal")],
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let task = import_node(Some("t"), "task", "child");
+        let report = service
+            .import_graph(&import_draft(
+                vec![task],
+                vec![ImportEdge {
+                    source: ImportRef::Ref("t".to_string()),
+                    destination: ImportRef::NaturalKey {
+                        kind: "goal".to_string(),
+                        name: "anchor goal".to_string(),
+                    },
+                    edge_type: "part_of".to_string(),
+                }],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(report.nodes_created(), 1);
+        assert_eq!(report.edges_created(), 1);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_an_unknown_natural_key() {
+        let service = service().await;
+        let error = service
+            .import_graph(&import_draft(
+                vec![import_node(Some("t"), "task", "child")],
+                vec![ImportEdge {
+                    source: ImportRef::Ref("t".to_string()),
+                    destination: ImportRef::NaturalKey {
+                        kind: "goal".to_string(),
+                        name: "missing".to_string(),
+                    },
+                    edge_type: "part_of".to_string(),
+                }],
+            ))
+            .await
+            .unwrap_err();
+        assert!(rejection(error).contains("no node with kind"));
+    }
+
+    #[tokio::test]
+    async fn import_trims_references() {
+        let service = service().await;
+        let report = service
+            .import_graph(&import_draft(
+                vec![
+                    import_node(Some("g"), "goal", "trim goal"),
+                    import_node(Some("t"), "task", "trim task"),
+                ],
+                vec![ImportEdge {
+                    source: ImportRef::Ref("  t  ".to_string()),
+                    destination: ImportRef::Ref(" g ".to_string()),
+                    edge_type: "part_of".to_string(),
+                }],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(report.edges_created(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_node_names() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        for name in ["", "   ", "a\nb"] {
+            assert!(
+                matches!(
+                    service.create_node(&node(kind_id, name, ""), &[]).await,
+                    Err(ServiceError::UnprocessableEntity(_))
+                ),
+                "{name:?} must be rejected"
+            );
+        }
+        let long = "n".repeat(MAX_NODE_NAME_LENGTH + 1);
+        assert!(matches!(
+            service.create_node(&node(kind_id, &long, ""), &[]).await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+        assert!(matches!(
+            service
+                .import_graph(&import_draft(
+                    vec![import_node(None, "person", &long)],
+                    vec![]
+                ))
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
     }
 }
