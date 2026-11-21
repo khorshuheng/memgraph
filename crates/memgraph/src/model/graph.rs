@@ -124,6 +124,7 @@ pub struct Neighbor {
     pub direction: RelationDirection,
     pub edge: Edge,
     pub node: Node,
+    pub edge_properties: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -210,11 +211,12 @@ pub enum ImportRef {
     NaturalKey { kind: String, name: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ImportEdge {
     pub source: ImportRef,
     pub destination: ImportRef,
     pub edge_type: String,
+    pub properties: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

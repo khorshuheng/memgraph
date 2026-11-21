@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use async_trait::async_trait;
 use sqlx::sqlite::Sqlite;
-use sqlx::{FromRow, QueryBuilder, SqliteConnection, SqlitePool};
+use sqlx::{FromRow, QueryBuilder, Row, SqliteConnection, SqlitePool};
 
 use crate::model::{
     Edge, EdgeType, EdgeTypeUsage, ImportConflict, ImportDraft, ImportEdgeResult, ImportNodeResult,
@@ -19,12 +19,14 @@ const EDGE_TYPE_COLUMNS: &str = "id, name, description, resolves, single_outgoin
      updated_at";
 const NODE_COLUMNS: &str = "id, kind_id, name, description, content, updated_at";
 const OUTGOING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
+    e.properties AS edge_properties, \
     n.id, n.kind_id, n.name, n.description, n.content, n.updated_at \
     FROM edge e JOIN node n ON n.id = e.destination \
     WHERE e.source = ? \
       AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
     ORDER BY e.edge_type_id, e.destination";
 const INCOMING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
+    e.properties AS edge_properties, \
     n.id, n.kind_id, n.name, n.description, n.content, n.updated_at \
     FROM edge e JOIN node n ON n.id = e.source \
     WHERE e.destination = ? \
@@ -115,6 +117,11 @@ pub trait GraphRepository: Send + Sync {
     async fn list_tags(&self) -> Result<Vec<TagUsage>, RepositoryError>;
 
     async fn add_edge(&self, edge: &Edge) -> Result<(), RepositoryError>;
+    async fn add_edge_with_properties(
+        &self,
+        edge: &Edge,
+        properties: Option<&str>,
+    ) -> Result<(), RepositoryError>;
     async fn remove_edge(&self, edge: &Edge) -> Result<bool, RepositoryError>;
     async fn neighbors(
         &self,
@@ -494,13 +501,22 @@ impl GraphRepository for SqliteGraphRepository {
     }
 
     async fn add_edge(&self, edge: &Edge) -> Result<(), RepositoryError> {
+        self.add_edge_with_properties(edge, None).await
+    }
+
+    async fn add_edge_with_properties(
+        &self,
+        edge: &Edge,
+        properties: Option<&str>,
+    ) -> Result<(), RepositoryError> {
         sqlx::query(
-            "INSERT INTO edge (source, destination, edge_type_id) VALUES (?, ?, ?) \
-             ON CONFLICT DO NOTHING",
+            "INSERT INTO edge (source, destination, edge_type_id, properties) \
+             VALUES (?, ?, ?, coalesce(?, '{}')) ON CONFLICT DO NOTHING",
         )
         .bind(edge.source)
         .bind(edge.destination)
         .bind(edge.edge_type_id)
+        .bind(properties)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -551,6 +567,7 @@ impl GraphRepository for SqliteGraphRepository {
                     direction: row_direction,
                     edge: Edge::from_row(row)?,
                     node: Node::from_row(row)?,
+                    edge_properties: row.try_get("edge_properties")?,
                 });
             }
         }
@@ -1197,24 +1214,44 @@ async fn import_graph_items(
             ))
         })?;
         validate_import_edge(connection, edge_type, source, destination).await?;
+        let encoded = edge
+            .properties
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| RepositoryError::SqlExecutionError(error.to_string()))?;
         let result = sqlx::query(
-            "INSERT INTO edge (source, destination, edge_type_id) VALUES (?, ?, ?) \
-             ON CONFLICT DO NOTHING",
+            "INSERT INTO edge (source, destination, edge_type_id, properties) \
+             VALUES (?, ?, ?, coalesce(?, '{}')) ON CONFLICT DO NOTHING",
         )
         .bind(source)
         .bind(destination)
         .bind(edge_type.id)
+        .bind(encoded.clone())
         .execute(&mut *connection)
         .await?;
+        let status = if result.rows_affected() == 1 {
+            ImportStatus::Created
+        } else {
+            if let Some(encoded) = &encoded {
+                sqlx::query(
+                    "UPDATE edge SET properties = ? \
+                     WHERE source = ? AND destination = ? AND edge_type_id = ?",
+                )
+                .bind(encoded)
+                .bind(source)
+                .bind(destination)
+                .bind(edge_type.id)
+                .execute(&mut *connection)
+                .await?;
+            }
+            ImportStatus::Existing
+        };
         edges.push(ImportEdgeResult {
             source,
             destination,
             edge_type: edge.edge_type.clone(),
-            status: if result.rows_affected() == 1 {
-                ImportStatus::Created
-            } else {
-                ImportStatus::Existing
-            },
+            status,
         });
     }
 

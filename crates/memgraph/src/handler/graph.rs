@@ -427,8 +427,12 @@ pub async fn add_edge(
     State(state): State<AppState>,
     Json(params): Json<CreateEdgeParameters>,
 ) -> Result<StatusCode, ApiError> {
+    let properties = params.properties.clone();
     let edge: Edge = params.into();
-    state.graph_service.add_edge(&edge).await?;
+    state
+        .graph_service
+        .add_edge_with_properties(&edge, properties.as_ref())
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -527,7 +531,7 @@ mod tests {
     use super::*;
     use crate::config::{AppConfig, DatabaseConfig, SearchConfig, ServerConfig};
     use crate::dto::graph::{
-        ImportConflictParameters, ImportNodeParameters, PackEdgeTypeParameters,
+        ImportConflictParameters, ImportNodeParameters, NeighborDirection, PackEdgeTypeParameters,
         PackNodeKindParameters,
     };
 
@@ -1109,5 +1113,56 @@ mod tests {
         .await
         .expect_err("non-object filter");
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn edge_properties_round_trip_over_http() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "decision").await;
+        let first = new_node(&state, kind, "first", "", "", &[]).await;
+        let second = new_node(&state, kind, "second", "", "", &[]).await;
+        let edge_type = state
+            .graph_service
+            .create_edge_type(&EdgeType {
+                id: 0,
+                name: "relates".to_string(),
+                description: "decision -> decision".to_string(),
+                resolves: false,
+                single_outgoing: false,
+                acyclic: false,
+                source_kinds: Some("decision".to_string()),
+                destination_kinds: Some("decision".to_string()),
+                updated_at: String::new(),
+            })
+            .await
+            .expect("edge type");
+
+        add_edge(
+            State(state.clone()),
+            Json(CreateEdgeParameters {
+                source: first.id,
+                destination: second.id,
+                edge_type_id: edge_type.id,
+                properties: Some(serde_json::json!({"weight": 2})),
+            }),
+        )
+        .await
+        .expect("add edge");
+
+        let neighbors = list_neighbors(
+            State(state.clone()),
+            Path(first.id),
+            Query(NeighborParameters {
+                direction: NeighborDirection::Outgoing,
+                edge_type: Some("relates".to_string()),
+            }),
+        )
+        .await
+        .expect("neighbors");
+        assert_eq!(neighbors.items.len(), 1);
+        assert_eq!(
+            neighbors.items[0].edge.properties,
+            serde_json::json!({"weight": 2})
+        );
     }
 }

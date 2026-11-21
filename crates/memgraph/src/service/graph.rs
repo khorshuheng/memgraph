@@ -195,10 +195,20 @@ impl GraphService {
                     "edge type must not be empty".to_string(),
                 ));
             }
+            let properties = match &edge.properties {
+                Some(properties) if properties.is_object() => Some(properties.clone()),
+                Some(_) => {
+                    return Err(ServiceError::UnprocessableEntity(
+                        "properties must be a JSON object".to_string(),
+                    ));
+                }
+                None => None,
+            };
             edges.push(ImportEdge {
                 source: normalize_import_ref(&edge.source)?,
                 destination: normalize_import_ref(&edge.destination)?,
                 edge_type,
+                properties,
             });
         }
 
@@ -343,6 +353,15 @@ impl GraphService {
     }
 
     pub async fn add_edge(&self, edge: &Edge) -> Result<(), ServiceError> {
+        self.add_edge_with_properties(edge, None).await
+    }
+
+    pub async fn add_edge_with_properties(
+        &self,
+        edge: &Edge,
+        properties: Option<&serde_json::Value>,
+    ) -> Result<(), ServiceError> {
+        let encoded = encode_properties(properties)?;
         let edge_types = self.repository.list_edge_types().await?;
         let edge_type = edge_types
             .iter()
@@ -371,7 +390,7 @@ impl GraphService {
         self.require_single_outgoing(edge.source, edge.destination, edge_type)
             .await?;
         self.repository
-            .add_edge(edge)
+            .add_edge_with_properties(edge, encoded.as_deref())
             .await
             .map_err(ServiceError::from)
     }
@@ -3837,6 +3856,7 @@ mod tests {
                 source: ImportRef::Ref("t1".to_string()),
                 destination: ImportRef::Id(goal.id),
                 edge_type: "part_of".to_string(),
+                properties: None,
             }],
         );
 
@@ -3945,6 +3965,7 @@ mod tests {
                     source: ImportRef::Ref("a".to_string()),
                     destination: ImportRef::Ref("a".to_string()),
                     edge_type: "ghost".to_string(),
+                    properties: None,
                 }],
             ),
             import_draft(
@@ -3953,6 +3974,7 @@ mod tests {
                     source: ImportRef::Ref("missing".to_string()),
                     destination: ImportRef::Ref("a".to_string()),
                     edge_type: "part_of".to_string(),
+                    properties: None,
                 }],
             ),
             import_draft(
@@ -3961,6 +3983,7 @@ mod tests {
                     source: ImportRef::Ref("a".to_string()),
                     destination: ImportRef::Id(999),
                     edge_type: "part_of".to_string(),
+                    properties: None,
                 }],
             ),
         ];
@@ -3989,6 +4012,7 @@ mod tests {
                 source: ImportRef::Ref("d".to_string()),
                 destination: ImportRef::Id(1),
                 edge_type: "part_of".to_string(),
+                properties: None,
             }],
         );
         let error = service.import_graph(&draft).await.unwrap_err();
@@ -4039,6 +4063,7 @@ mod tests {
                     source: ImportRef::Id(goal.id),
                     destination: ImportRef::Id(second_repo.id),
                     edge_type: "belongs_to".to_string(),
+                    properties: None,
                 }],
             ))
             .await
@@ -4195,6 +4220,7 @@ mod tests {
                         name: "anchor goal".to_string(),
                     },
                     edge_type: "part_of".to_string(),
+                    properties: None,
                 }],
             ))
             .await
@@ -4216,6 +4242,7 @@ mod tests {
                         name: "missing".to_string(),
                     },
                     edge_type: "part_of".to_string(),
+                    properties: None,
                 }],
             ))
             .await
@@ -4236,6 +4263,7 @@ mod tests {
                     source: ImportRef::Ref("  t  ".to_string()),
                     destination: ImportRef::Ref(" g ".to_string()),
                     edge_type: "part_of".to_string(),
+                    properties: None,
                 }],
             ))
             .await
@@ -4876,5 +4904,216 @@ mod tests {
             .unwrap();
         assert_eq!(found.total, 1);
         assert_eq!(found.hits[0].node.id, second.id);
+    }
+
+    async fn relates_edge_type(service: &GraphService, kind_id: i64) -> i64 {
+        let kind_name = service
+            .list_node_kinds()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|kind| kind.id == kind_id)
+            .expect("kind")
+            .name;
+        service
+            .create_edge_type(&EdgeType {
+                id: 0,
+                name: "relates".to_string(),
+                description: "person -> person".to_string(),
+                resolves: false,
+                single_outgoing: false,
+                acyclic: false,
+                source_kinds: Some(kind_name.clone()),
+                destination_kinds: Some(kind_name),
+                updated_at: String::new(),
+            })
+            .await
+            .unwrap()
+            .id
+    }
+
+    #[tokio::test]
+    async fn edge_properties_are_stored_and_returned() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let relates = relates_edge_type(&service, kind_id).await;
+        let first = service
+            .create_node(&node(kind_id, "first", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let second = service
+            .create_node(&node(kind_id, "second", ""), &[])
+            .await
+            .unwrap()
+            .0;
+
+        service
+            .add_edge_with_properties(
+                &Edge {
+                    source: first.id,
+                    destination: second.id,
+                    edge_type_id: relates,
+                    created_at: String::new(),
+                },
+                Some(&serde_json::json!({"weight": 2})),
+            )
+            .await
+            .unwrap();
+        let neighbors = service
+            .neighbors(first.id, NeighborDirection::Outgoing, Some("relates"))
+            .await
+            .unwrap();
+        assert_eq!(neighbors[0].edge_properties, r#"{"weight":2}"#);
+
+        let third = service
+            .create_node(&node(kind_id, "third", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        service
+            .add_edge_with_properties(
+                &Edge {
+                    source: first.id,
+                    destination: third.id,
+                    edge_type_id: relates,
+                    created_at: String::new(),
+                },
+                Some(&serde_json::json!({"weight": 9})),
+            )
+            .await
+            .unwrap();
+        let neighbors = service
+            .neighbors(first.id, NeighborDirection::Outgoing, Some("relates"))
+            .await
+            .unwrap();
+        let second_edge = neighbors
+            .iter()
+            .find(|neighbor| neighbor.node.id == second.id)
+            .expect("edge kept");
+        assert_eq!(second_edge.edge_properties, r#"{"weight":2}"#);
+    }
+
+    #[tokio::test]
+    async fn edge_properties_default_to_an_empty_object() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let relates = relates_edge_type(&service, kind_id).await;
+        let first = service
+            .create_node(&node(kind_id, "first", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let second = service
+            .create_node(&node(kind_id, "second", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        service
+            .add_edge(&Edge {
+                source: first.id,
+                destination: second.id,
+                edge_type_id: relates,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+        let neighbors = service
+            .neighbors(first.id, NeighborDirection::Outgoing, Some("relates"))
+            .await
+            .unwrap();
+        assert_eq!(neighbors[0].edge_properties, "{}");
+    }
+
+    #[tokio::test]
+    async fn import_replaces_edge_properties_on_an_existing_edge() {
+        let service = service().await;
+        let mut edge = ImportEdge {
+            source: ImportRef::Ref("t".to_string()),
+            destination: ImportRef::Ref("g".to_string()),
+            edge_type: "part_of".to_string(),
+            properties: Some(serde_json::json!({"weight": 1})),
+        };
+        let draft = import_draft(
+            vec![
+                import_node(Some("t"), "task", "child"),
+                import_node(Some("g"), "goal", "parent"),
+            ],
+            vec![edge.clone()],
+        );
+        let report = service.import_graph(&draft).await.unwrap();
+        assert_eq!(report.edges_created(), 1);
+        let task_id = report.nodes[0].id;
+        let neighbors = service
+            .neighbors(task_id, NeighborDirection::Outgoing, Some("part_of"))
+            .await
+            .unwrap();
+        assert_eq!(neighbors[0].edge_properties, r#"{"weight":1}"#);
+
+        edge.properties = Some(serde_json::json!({"weight": 2}));
+        let report = service
+            .import_graph(&import_draft(
+                vec![
+                    import_node(Some("t"), "task", "child"),
+                    import_node(Some("g"), "goal", "parent"),
+                ],
+                vec![edge],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(report.edges_existing(), 1);
+        let neighbors = service
+            .neighbors(task_id, NeighborDirection::Outgoing, Some("part_of"))
+            .await
+            .unwrap();
+        assert_eq!(neighbors[0].edge_properties, r#"{"weight":2}"#);
+    }
+
+    #[tokio::test]
+    async fn rejects_non_object_edge_properties() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let relates = relates_edge_type(&service, kind_id).await;
+        let first = service
+            .create_node(&node(kind_id, "first", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let second = service
+            .create_node(&node(kind_id, "second", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        assert!(matches!(
+            service
+                .add_edge_with_properties(
+                    &Edge {
+                        source: first.id,
+                        destination: second.id,
+                        edge_type_id: relates,
+                        created_at: String::new(),
+                    },
+                    Some(&serde_json::json!([1])),
+                )
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+
+        let edge = ImportEdge {
+            source: ImportRef::Ref("a".to_string()),
+            destination: ImportRef::Ref("b".to_string()),
+            edge_type: "relates".to_string(),
+            properties: Some(serde_json::json!("nope")),
+        };
+        let report = service
+            .import_graph(&import_draft(
+                vec![
+                    import_node(Some("a"), "person", "a"),
+                    import_node(Some("b"), "person", "b"),
+                ],
+                vec![edge],
+            ))
+            .await;
+        assert!(matches!(report, Err(ServiceError::UnprocessableEntity(_))));
     }
 }

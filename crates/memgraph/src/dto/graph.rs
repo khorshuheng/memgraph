@@ -208,6 +208,8 @@ pub struct CreateEdgeParameters {
     pub source: i64,
     pub destination: i64,
     pub edge_type_id: i64,
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -215,6 +217,7 @@ pub struct EdgeResponse {
     pub source: i64,
     pub destination: i64,
     pub edge_type_id: i64,
+    pub properties: serde_json::Value,
     pub created_at: String,
 }
 
@@ -235,6 +238,7 @@ impl From<EdgeModel> for EdgeResponse {
             source: edge.source,
             destination: edge.destination,
             edge_type_id: edge.edge_type_id,
+            properties: serde_json::json!({}),
             created_at: edge.created_at,
         }
     }
@@ -299,12 +303,17 @@ impl NeighborResponse {
         tags: Vec<String>,
         properties: serde_json::Value,
     ) -> Self {
+        let edge_properties = serde_json::from_str(&neighbor.edge_properties)
+            .unwrap_or_else(|_| serde_json::json!({}));
         NeighborResponse {
             direction: match neighbor.direction {
                 RelationDirectionModel::Outgoing => "outgoing".to_string(),
                 RelationDirectionModel::Ingoing => "incoming".to_string(),
             },
-            edge: neighbor.edge.into(),
+            edge: EdgeResponse {
+                properties: edge_properties,
+                ..neighbor.edge.into()
+            },
             node: NodeResponse::with_tags_and_properties(neighbor.node, tags, properties),
         }
     }
@@ -556,6 +565,8 @@ pub struct ImportEdgeParameters {
     pub destination: ImportNodeRefParameters,
     #[serde(rename = "type")]
     pub edge_type: String,
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
 }
 
 impl From<ImportEdgeParameters> for ImportEdge {
@@ -564,6 +575,7 @@ impl From<ImportEdgeParameters> for ImportEdge {
             source: params.source.into(),
             destination: params.destination.into(),
             edge_type: params.edge_type,
+            properties: params.properties,
         }
     }
 }
