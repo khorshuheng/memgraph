@@ -1,12 +1,13 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
-use sqlx::{FromRow, Row, SqlitePool};
+use sqlx::sqlite::Sqlite;
+use sqlx::{FromRow, QueryBuilder, SqliteConnection, SqlitePool};
 
 use crate::model::{
-    AccessAction, Edge, EdgeType, EdgeTypeUsage, IsolatedNode, KindUsage, Neighbor,
-    NeighborDirection, Node, NodeFilter, NodeKind, NodeRef, PendingEdge, ReachFilter,
-    RelationDirection, RelationSummary, SearchScope,
+    Edge, EdgeType, EdgeTypeUsage, IsolatedNode, KindUsage, Neighbor, NeighborDirection, Node,
+    NodeFilter, NodeKind, NodeRef, PendingEdge, RelationDirection, SearchHit, SearchPage,
+    SearchScope, TagUsage,
 };
 
 use super::error::RepositoryError;
@@ -80,6 +81,11 @@ pub trait GraphRepository: Send + Sync {
     async fn list_edge_types(&self) -> Result<Vec<EdgeType>, RepositoryError>;
 
     async fn upsert_node(&self, node: &Node) -> Result<Node, RepositoryError>;
+    async fn upsert_node_with_tags(
+        &self,
+        node: &Node,
+        tags: &[String],
+    ) -> Result<Node, RepositoryError>;
     async fn insert_nodes_with_edges(
         &self,
         nodes: &[Node],
@@ -90,6 +96,14 @@ pub trait GraphRepository: Send + Sync {
     async fn list_nodes(&self, filter: &NodeFilter) -> Result<Vec<Node>, RepositoryError>;
     async fn node_kinds_for_ids(&self, ids: &[i64]) -> Result<Vec<(i64, String)>, RepositoryError>;
 
+    async fn set_node_tags(&self, node_id: i64, tags: &[String]) -> Result<(), RepositoryError>;
+    async fn node_tags(&self, node_id: i64) -> Result<Vec<String>, RepositoryError>;
+    async fn node_tags_for_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<String>>, RepositoryError>;
+    async fn list_tags(&self) -> Result<Vec<TagUsage>, RepositoryError>;
+
     async fn add_edge(&self, edge: &Edge) -> Result<(), RepositoryError>;
     async fn remove_edge(&self, edge: &Edge) -> Result<bool, RepositoryError>;
     async fn neighbors(
@@ -99,19 +113,13 @@ pub trait GraphRepository: Send + Sync {
         edge_type: Option<&str>,
     ) -> Result<Vec<Neighbor>, RepositoryError>;
 
-    async fn count_nodes(&self) -> Result<i64, RepositoryError>;
-    async fn term_document_frequency(&self, term: &str) -> Result<i64, RepositoryError>;
-    async fn terms_with_prefix(&self, prefix: &str) -> Result<Vec<String>, RepositoryError>;
-    async fn term_exists(&self, term: &str) -> Result<bool, RepositoryError>;
-    async fn search_descriptions(
+    async fn search_nodes(
         &self,
-        fts_query: &str,
-        reach: &ReachFilter,
-    ) -> Result<Vec<(Node, bool)>, RepositoryError>;
-    async fn relation_summaries(
-        &self,
-        node_id: i64,
-    ) -> Result<Vec<RelationSummary>, RepositoryError>;
+        query: Option<&str>,
+        tags: &[String],
+        limit: i64,
+        offset: i64,
+    ) -> Result<SearchPage, RepositoryError>;
 
     async fn kind_usage(&self) -> Result<Vec<KindUsage>, RepositoryError>;
     async fn edge_type_usage(&self) -> Result<Vec<EdgeTypeUsage>, RepositoryError>;
@@ -127,21 +135,6 @@ pub trait GraphRepository: Send + Sync {
     ) -> Result<Vec<i64>, RepositoryError>;
     async fn unanchored_work_count(&self) -> Result<i64, RepositoryError>;
     async fn unanchored_work(&self, limit: i64) -> Result<Vec<IsolatedNode>, RepositoryError>;
-    async fn record_node_accesses(
-        &self,
-        session_id: &str,
-        node_ids: &[i64],
-        action: AccessAction,
-        query_term: Option<&str>,
-    ) -> Result<Vec<NodeAccessRecord>, RepositoryError>;
-    async fn accessed_node_ids(&self, session_id: &str) -> Result<HashSet<i64>, RepositoryError>;
-    async fn set_node_access_relevance(
-        &self,
-        session_id: &str,
-        access_id: i64,
-        relevant: bool,
-    ) -> Result<bool, RepositoryError>;
-    async fn prune_node_access(&self, retention_days: u64) -> Result<u64, RepositoryError>;
 }
 
 #[derive(Clone)]
@@ -203,37 +196,19 @@ impl GraphRepository for SqliteGraphRepository {
     }
 
     async fn upsert_node(&self, node: &Node) -> Result<Node, RepositoryError> {
-        if node.id == 0 {
-            let row = sqlx::query_as::<_, Node>(&format!(
-                "INSERT INTO node (kind_id, name, description, content) VALUES (?, ?, ?, ?) \
-                 RETURNING {NODE_COLUMNS}"
-            ))
-            .bind(node.kind_id)
-            .bind(&node.name)
-            .bind(&node.description)
-            .bind(&node.content)
-            .fetch_one(&self.pool)
-            .await?;
-            Ok(row)
-        } else {
-            let row = sqlx::query_as::<_, Node>(&format!(
-                "INSERT INTO node (id, kind_id, name, description, content) VALUES (?, ?, ?, ?, ?) \
-                 ON CONFLICT(id) DO UPDATE SET kind_id = excluded.kind_id, name = excluded.name, \
-                 description = excluded.description, content = excluded.content, \
-                 updated_at = CASE WHEN node.kind_id = excluded.kind_id \
-                   AND node.name = excluded.name AND node.description = excluded.description \
-                   AND node.content = excluded.content THEN node.updated_at ELSE excluded.updated_at END \
-                 RETURNING {NODE_COLUMNS}"
-            ))
-            .bind(node.id)
-            .bind(node.kind_id)
-            .bind(&node.name)
-            .bind(&node.description)
-            .bind(&node.content)
-            .fetch_one(&self.pool)
-            .await?;
-            Ok(row)
-        }
+        insert_node(&self.pool, node).await.map_err(Into::into)
+    }
+
+    async fn upsert_node_with_tags(
+        &self,
+        node: &Node,
+        tags: &[String],
+    ) -> Result<Node, RepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = insert_node(&mut *transaction, node).await?;
+        replace_tags(&mut transaction, row.id, tags).await?;
+        transaction.commit().await?;
+        Ok(row)
     }
 
     async fn insert_nodes_with_edges(
@@ -435,115 +410,131 @@ impl GraphRepository for SqliteGraphRepository {
         Ok(neighbors)
     }
 
-    async fn count_nodes(&self) -> Result<i64, RepositoryError> {
-        let count = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM node")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(count)
+    async fn set_node_tags(&self, node_id: i64, tags: &[String]) -> Result<(), RepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        replace_tags(&mut transaction, node_id, tags).await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
-    async fn term_document_frequency(&self, term: &str) -> Result<i64, RepositoryError> {
-        let frequency =
-            sqlx::query_scalar::<_, i64>("SELECT doc FROM node_fts_vocab WHERE term = ?")
-                .bind(term)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(frequency.unwrap_or(0))
-    }
-
-    async fn terms_with_prefix(&self, prefix: &str) -> Result<Vec<String>, RepositoryError> {
-        let pattern = format!("{}%", escape_like_pattern(prefix));
+    async fn node_tags(&self, node_id: i64) -> Result<Vec<String>, RepositoryError> {
         let rows = sqlx::query_scalar::<_, String>(
-            "SELECT term FROM node_fts_vocab WHERE term LIKE ? ESCAPE '\\' ORDER BY term",
+            "SELECT tag FROM node_tag WHERE node_id = ? ORDER BY tag",
         )
-        .bind(pattern)
+        .bind(node_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
     }
 
-    async fn term_exists(&self, term: &str) -> Result<bool, RepositoryError> {
-        let exists =
-            sqlx::query_scalar::<_, i64>("SELECT 1 FROM node_fts_vocab WHERE term = ? LIMIT 1")
-                .bind(term)
-                .fetch_optional(&self.pool)
-                .await?
-                .is_some();
-        Ok(exists)
+    async fn node_tags_for_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<String>>, RepositoryError> {
+        let mut by_node: HashMap<i64, Vec<String>> = HashMap::new();
+        if ids.is_empty() {
+            return Ok(by_node);
+        }
+        let mut builder = QueryBuilder::new("SELECT node_id, tag FROM node_tag WHERE node_id IN (");
+        let mut separated = builder.separated(", ");
+        for id in ids {
+            separated.push_bind(*id);
+        }
+        builder.push(") ORDER BY node_id, tag");
+        let rows = builder
+            .build_query_as::<(i64, String)>()
+            .fetch_all(&self.pool)
+            .await?;
+        for (node_id, tag) in rows {
+            by_node.entry(node_id).or_default().push(tag);
+        }
+        Ok(by_node)
     }
 
-    async fn search_descriptions(
+    async fn list_tags(&self) -> Result<Vec<TagUsage>, RepositoryError> {
+        let rows = sqlx::query_as::<_, TagUsage>(
+            "SELECT tag, count(*) AS node_count FROM node_tag \
+             GROUP BY tag ORDER BY node_count DESC, tag ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn search_nodes(
         &self,
-        fts_query: &str,
-        reach: &ReachFilter,
-    ) -> Result<Vec<(Node, bool)>, RepositoryError> {
-        let select = "SELECT n.id, n.kind_id, n.name, n.description, n.content, n.updated_at, \
-             EXISTS(SELECT 1 FROM edge e JOIN edge_type t ON t.id = e.edge_type_id \
-                    WHERE e.destination = n.id AND t.resolves = 1) AS resolved \
-             FROM node_fts JOIN node n ON n.id = node_fts.rowid";
-        let rows = if reach.within.is_some() {
-            let sql = format!(
-                "{REACH_CTE}{select} WHERE node_fts MATCH ? \
-                   AND n.id IN (SELECT id FROM reach) \
-                 ORDER BY bm25(node_fts), n.id"
+        query: Option<&str>,
+        tags: &[String],
+        limit: i64,
+        offset: i64,
+    ) -> Result<SearchPage, RepositoryError> {
+        let total = if let Some(fts_query) = query {
+            let mut builder = QueryBuilder::new(
+                "SELECT count(*) FROM node_fts JOIN node n ON n.id = node_fts.rowid \
+                 WHERE node_fts MATCH ",
             );
-            sqlx::query(&sql)
-                .bind(reach.within)
-                .bind(reach.via.clone())
-                .bind(reach.via.clone())
-                .bind(reach.within)
-                .bind(reach.via.clone())
-                .bind(reach.via.clone())
-                .bind(reach.descend.clone())
-                .bind(fts_query)
+            builder.push_bind(fts_query);
+            push_tag_filter(&mut builder, tags);
+            builder
+                .build_query_scalar::<i64>()
+                .fetch_one(&self.pool)
+                .await?
+        } else {
+            let mut builder = QueryBuilder::new("SELECT count(*) FROM node n WHERE 1 = 1");
+            push_tag_filter(&mut builder, tags);
+            builder
+                .build_query_scalar::<i64>()
+                .fetch_one(&self.pool)
+                .await?
+        };
+
+        let rows = if let Some(fts_query) = query {
+            let mut builder = QueryBuilder::new(
+                "SELECT n.id, n.kind_id, n.name, n.description, n.content, n.updated_at, \
+                 bm25(node_fts) AS score FROM node_fts \
+                 JOIN node n ON n.id = node_fts.rowid WHERE node_fts MATCH ",
+            );
+            builder.push_bind(fts_query);
+            push_tag_filter(&mut builder, tags);
+            builder.push(" ORDER BY score, n.id LIMIT ");
+            builder.push_bind(limit);
+            builder.push(" OFFSET ");
+            builder.push_bind(offset);
+            builder
+                .build_query_as::<SearchRow>()
                 .fetch_all(&self.pool)
                 .await?
         } else {
-            let sql = format!("{select} WHERE node_fts MATCH ? ORDER BY bm25(node_fts), n.id");
-            sqlx::query(&sql)
-                .bind(fts_query)
+            let mut builder = QueryBuilder::new(
+                "SELECT n.id, n.kind_id, n.name, n.description, n.content, n.updated_at, \
+                 0.0 AS score FROM node n WHERE 1 = 1",
+            );
+            push_tag_filter(&mut builder, tags);
+            builder.push(" ORDER BY n.updated_at DESC, n.id DESC LIMIT ");
+            builder.push_bind(limit);
+            builder.push(" OFFSET ");
+            builder.push_bind(offset);
+            builder
+                .build_query_as::<SearchRow>()
                 .fetch_all(&self.pool)
                 .await?
         };
-        rows.iter()
-            .map(|row| Ok((Node::from_row(row)?, row.try_get::<bool, _>("resolved")?)))
-            .collect::<Result<_, sqlx::Error>>()
-            .map_err(Into::into)
-    }
 
-    async fn relation_summaries(
-        &self,
-        node_id: i64,
-    ) -> Result<Vec<RelationSummary>, RepositoryError> {
-        let rows = sqlx::query_as::<_, (i64, i64, String, i64)>(
-            "SELECT 0 AS direction, e.edge_type_id, t.name, count(*) AS count \
-             FROM edge e JOIN edge_type t ON t.id = e.edge_type_id \
-             WHERE e.source = ? GROUP BY e.edge_type_id, t.name \
-             UNION ALL \
-             SELECT 1, e.edge_type_id, t.name, count(*) \
-             FROM edge e JOIN edge_type t ON t.id = e.edge_type_id \
-             WHERE e.destination = ? GROUP BY e.edge_type_id, t.name \
-             ORDER BY direction, edge_type_id",
-        )
-        .bind(node_id)
-        .bind(node_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        let mut tags_by_node = self.node_tags_for_ids(&ids).await?;
+        let hits = rows
             .into_iter()
-            .map(
-                |(direction, edge_type_id, edge_type, count)| RelationSummary {
-                    direction: if direction == 0 {
-                        RelationDirection::Outgoing
-                    } else {
-                        RelationDirection::Ingoing
-                    },
-                    edge_type_id,
-                    edge_type,
-                    count,
-                },
-            )
-            .collect())
+            .map(|row| {
+                let tags = tags_by_node.remove(&row.id).unwrap_or_default();
+                row.into_hit(tags)
+            })
+            .collect();
+        Ok(SearchPage {
+            hits,
+            total,
+            limit,
+            offset,
+        })
     }
 
     async fn kind_usage(&self) -> Result<Vec<KindUsage>, RepositoryError> {
@@ -661,78 +652,6 @@ impl GraphRepository for SqliteGraphRepository {
             .await?;
         Ok(rows)
     }
-
-    async fn record_node_accesses(
-        &self,
-        session_id: &str,
-        node_ids: &[i64],
-        action: AccessAction,
-        query_term: Option<&str>,
-    ) -> Result<Vec<NodeAccessRecord>, RepositoryError> {
-        if node_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut transaction = self.pool.begin().await?;
-        let mut recorded = Vec::with_capacity(node_ids.len());
-        for node_id in node_ids {
-            let row = sqlx::query_as::<_, NodeAccessRecord>(
-                "INSERT INTO node_access (session_id, node_id, node_name, node_kind, action, query_term) \
-                 SELECT ?, n.id, n.name, k.name, ?, ? \
-                 FROM node n JOIN node_kind k ON k.id = n.kind_id \
-                 WHERE n.id = ? \
-                 RETURNING id AS access_id, node_id",
-            )
-            .bind(session_id)
-            .bind(action.as_str())
-            .bind(query_term)
-            .bind(node_id)
-            .fetch_optional(&mut *transaction)
-            .await?;
-            if let Some(record) = row {
-                recorded.push(record);
-            }
-        }
-        transaction.commit().await?;
-        Ok(recorded)
-    }
-
-    async fn accessed_node_ids(&self, session_id: &str) -> Result<HashSet<i64>, RepositoryError> {
-        let rows = sqlx::query_scalar::<_, i64>(
-            "SELECT DISTINCT node_id FROM node_access WHERE session_id = ?",
-        )
-        .bind(session_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().collect())
-    }
-
-    async fn set_node_access_relevance(
-        &self,
-        session_id: &str,
-        access_id: i64,
-        relevant: bool,
-    ) -> Result<bool, RepositoryError> {
-        let result =
-            sqlx::query("UPDATE node_access SET relevant = ? WHERE id = ? AND session_id = ?")
-                .bind(relevant)
-                .bind(access_id)
-                .bind(session_id)
-                .execute(&self.pool)
-                .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    async fn prune_node_access(&self, retention_days: u64) -> Result<u64, RepositoryError> {
-        let modifier = format!("-{retention_days} days");
-        let result = sqlx::query(
-            "DELETE FROM node_access \
-             WHERE accessed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
-        )
-        .bind(modifier)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
 }
 
 fn resolve_node_ref(
@@ -755,9 +674,98 @@ fn resolve_node_ref(
     }
 }
 
-fn escape_like_pattern(input: &str) -> String {
-    input
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
+#[derive(FromRow)]
+struct SearchRow {
+    id: i64,
+    kind_id: i64,
+    name: String,
+    description: String,
+    content: String,
+    updated_at: String,
+    score: f64,
+}
+
+impl SearchRow {
+    fn into_hit(self, tags: Vec<String>) -> SearchHit {
+        SearchHit {
+            node: Node {
+                id: self.id,
+                kind_id: self.kind_id,
+                name: self.name,
+                description: self.description,
+                content: self.content,
+                updated_at: self.updated_at,
+            },
+            score: self.score.abs(),
+            tags,
+        }
+    }
+}
+
+fn push_tag_filter(builder: &mut QueryBuilder<Sqlite>, tags: &[String]) {
+    if tags.is_empty() {
+        return;
+    }
+    builder.push(" AND n.id IN (SELECT node_id FROM node_tag WHERE tag IN (");
+    let mut separated = builder.separated(", ");
+    for tag in tags {
+        separated.push_bind(tag.clone());
+    }
+    builder.push(") GROUP BY node_id HAVING COUNT(DISTINCT tag) = ");
+    builder.push_bind(tags.len() as i64);
+    builder.push(")");
+}
+
+async fn insert_node<'e, E>(executor: E, node: &Node) -> Result<Node, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    if node.id == 0 {
+        sqlx::query_as::<_, Node>(&format!(
+            "INSERT INTO node (kind_id, name, description, content) VALUES (?, ?, ?, ?) \
+             RETURNING {NODE_COLUMNS}"
+        ))
+        .bind(node.kind_id)
+        .bind(&node.name)
+        .bind(&node.description)
+        .bind(&node.content)
+        .fetch_one(executor)
+        .await
+    } else {
+        sqlx::query_as::<_, Node>(&format!(
+            "INSERT INTO node (id, kind_id, name, description, content) VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET kind_id = excluded.kind_id, name = excluded.name, \
+             description = excluded.description, content = excluded.content, \
+             updated_at = CASE WHEN node.kind_id = excluded.kind_id \
+               AND node.name = excluded.name AND node.description = excluded.description \
+               AND node.content = excluded.content THEN node.updated_at ELSE excluded.updated_at END \
+             RETURNING {NODE_COLUMNS}"
+        ))
+        .bind(node.id)
+        .bind(node.kind_id)
+        .bind(&node.name)
+        .bind(&node.description)
+        .bind(&node.content)
+        .fetch_one(executor)
+        .await
+    }
+}
+
+async fn replace_tags(
+    connection: &mut SqliteConnection,
+    node_id: i64,
+    tags: &[String],
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM node_tag WHERE node_id = ?")
+        .bind(node_id)
+        .execute(&mut *connection)
+        .await?;
+    for tag in tags {
+        sqlx::query("INSERT OR IGNORE INTO node_tag (node_id, tag) VALUES (?, ?)")
+            .bind(node_id)
+            .bind(tag)
+            .execute(&mut *connection)
+            .await?;
+    }
+    Ok(())
 }

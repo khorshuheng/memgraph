@@ -1,13 +1,12 @@
-use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
     config::SearchConfig,
     model::{
         Edge, EdgeType, Neighbor, NeighborDirection, Node, NodeFilter, NodeKind, NodeRef,
-        PendingEdge, Plan, PlanDraft, PlanTask, PlanTaskDraft, ReachFilter, SearchHit, SearchScope,
-        SegmentMatches, TaskDraft, TaskPatch,
+        PendingEdge, Plan, PlanDraft, PlanTask, PlanTaskDraft, ReachFilter, SearchPage, TagUsage,
+        TaskDraft, TaskPatch,
     },
     repository::graph::GraphRepository,
 };
@@ -482,205 +481,72 @@ impl GraphService {
 
     pub async fn search(
         &self,
-        query: &str,
-        scope: SearchScope,
-        reach: &ReachFilter,
-        exclude: &HashSet<i64>,
-    ) -> Result<Vec<SegmentMatches>, ServiceError> {
-        let reach = self.normalize_reach(reach).await?;
-        let mut segments = Vec::new();
-        for segment in split_segments(query, &self.search_config.split_characters()) {
-            let score = self.score_segment(&segment, scope, &reach).await?;
-            if score.hits.is_empty() && score.excluded_resolved == 0 {
-                continue;
-            }
-            let total_matches = score.hits.len();
-            let available = score
-                .hits
-                .iter()
-                .filter(|hit| !exclude.contains(&hit.node.id))
-                .count();
-            let mut matches: Vec<SearchHit> = score
-                .hits
-                .into_iter()
-                .filter(|hit| !exclude.contains(&hit.node.id))
-                .take(self.search_config.per_segment_limit)
-                .collect();
-            self.attach_relations(&mut matches).await?;
-            segments.push(SegmentMatches {
-                segment,
-                matches,
-                total_matches,
-                available,
-                excluded_resolved: score.excluded_resolved,
-            });
+        query: Option<&str>,
+        tags: &[String],
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<SearchPage, ServiceError> {
+        let query = query.map(str::trim).filter(|query| !query.is_empty());
+        let tags = normalize_tags(tags)?;
+        if query.is_none() && tags.is_empty() {
+            return Err(ServiceError::UnprocessableEntity(
+                "provide q or at least one tag".to_string(),
+            ));
         }
-        Ok(segments)
+        let fts_query = query.and_then(fts_query);
+        if fts_query.is_none() && tags.is_empty() {
+            return Err(ServiceError::UnprocessableEntity(
+                "q does not contain any searchable term".to_string(),
+            ));
+        }
+        let limit = limit
+            .unwrap_or(self.search_config.default_limit)
+            .clamp(1, self.search_config.max_limit);
+        let offset = offset.unwrap_or(0).max(0);
+        self.repository
+            .search_nodes(fts_query.as_deref(), &tags, limit, offset)
+            .await
+            .map_err(ServiceError::from)
     }
 
-    pub async fn search_segment(
+    pub async fn create_node(
         &self,
-        segment: &str,
-        scope: SearchScope,
-        reach: &ReachFilter,
-        limit: usize,
-        offset: usize,
-        exclude: &HashSet<i64>,
-    ) -> Result<Vec<SearchHit>, ServiceError> {
-        let reach = self.normalize_reach(reach).await?;
-        let score = self.score_segment(segment, scope, &reach).await?;
-        let mut hits: Vec<SearchHit> = score
-            .hits
-            .into_iter()
-            .filter(|hit| !exclude.contains(&hit.node.id))
-            .skip(offset)
-            .take(limit)
-            .collect();
-        self.attach_relations(&mut hits).await?;
-        Ok(hits)
+        node: &Node,
+        tags: &[String],
+    ) -> Result<(Node, Vec<String>), ServiceError> {
+        let tags = normalize_tags(tags)?;
+        let created = self.repository.upsert_node_with_tags(node, &tags).await?;
+        Ok((created, tags))
     }
 
-    pub fn summary_chars(&self) -> usize {
-        self.search_config.summary_chars
+    pub async fn node_tags(&self, node_id: i64) -> Result<Vec<String>, ServiceError> {
+        self.get_node(node_id).await?;
+        self.repository.node_tags(node_id).await.map_err(Into::into)
     }
 
-    pub fn default_segment_limit(&self) -> usize {
-        self.search_config.per_segment_limit
-    }
-
-    async fn score_segment(
+    pub async fn node_tags_for_ids(
         &self,
-        segment: &str,
-        scope: SearchScope,
-        reach: &ReachFilter,
-    ) -> Result<SegmentScore, ServiceError> {
-        let considered = self.considered_terms(segment).await?;
-        if considered.is_empty() {
-            return Ok(SegmentScore::default());
-        }
-        let denominator = token_denominator(&considered);
-        let terms: Vec<&str> = considered
-            .iter()
-            .map(|considered_term| considered_term.term.as_str())
-            .collect();
-        let fts_query = build_fts_query(&terms);
-        let candidates = self
-            .repository
-            .search_descriptions(&fts_query, reach)
-            .await?;
-
-        let mut hits = Vec::new();
-        let mut excluded_resolved = 0;
-        for (node, resolved) in candidates {
-            let score = score_candidate(&considered, &node.description, denominator);
-            if !self.clears_thresholds(&score) {
-                continue;
-            }
-            match scope {
-                SearchScope::Active if resolved => {
-                    excluded_resolved += 1;
-                    continue;
-                }
-                SearchScope::Resolved if !resolved => continue,
-                _ => {}
-            }
-            hits.push(SearchHit {
-                relations: Vec::new(),
-                node,
-                confidence: score.confidence,
-                matched_terms: score.matched_terms,
-                resolved,
-            });
-        }
-        hits.sort_by(|left, right| {
-            right
-                .confidence
-                .partial_cmp(&left.confidence)
-                .unwrap_or(Ordering::Equal)
-                .then(left.node.id.cmp(&right.node.id))
-        });
-        Ok(SegmentScore {
-            hits,
-            excluded_resolved,
-        })
+        ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<String>>, ServiceError> {
+        self.repository
+            .node_tags_for_ids(ids)
+            .await
+            .map_err(Into::into)
     }
 
-    fn clears_thresholds(&self, score: &CandidateScore) -> bool {
-        score.matched_token_count >= self.search_config.min_matched_terms
-            && score.mass >= self.search_config.min_matched_idf
-            && score.confidence >= self.search_config.confidence_threshold
+    pub async fn replace_node_tags(
+        &self,
+        node_id: i64,
+        tags: &[String],
+    ) -> Result<Vec<String>, ServiceError> {
+        self.get_node(node_id).await?;
+        let tags = normalize_tags(tags)?;
+        self.repository.set_node_tags(node_id, &tags).await?;
+        Ok(tags)
     }
 
-    async fn attach_relations(&self, hits: &mut [SearchHit]) -> Result<(), ServiceError> {
-        for hit in hits.iter_mut() {
-            hit.relations = self.repository.relation_summaries(hit.node.id).await?;
-        }
-        Ok(())
-    }
-
-    async fn considered_terms(&self, segment: &str) -> Result<Vec<ConsideredTerm>, ServiceError> {
-        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut assigned: HashSet<String> = HashSet::new();
-        for token in tokenize(segment) {
-            if !seen.insert(token.clone()) {
-                continue;
-            }
-            let terms: Vec<String> = self
-                .resolve_token(&token)
-                .await?
-                .into_iter()
-                .filter(|term| assigned.insert(term.clone()))
-                .collect();
-            if !terms.is_empty() {
-                groups.push((token, terms));
-            }
-        }
-        if groups.is_empty() {
-            return Ok(Vec::new());
-        }
-        let node_count = self.repository.count_nodes().await? as f64;
-        let mut weighted = Vec::new();
-        for (token, terms) in groups {
-            for term in terms {
-                let frequency = self.repository.term_document_frequency(&term).await? as f64;
-                weighted.push(ConsideredTerm {
-                    token: token.clone(),
-                    term,
-                    weight: inverse_document_frequency(node_count, frequency),
-                });
-            }
-        }
-        weighted.sort_by(|left, right| {
-            right
-                .weight
-                .partial_cmp(&left.weight)
-                .unwrap_or(Ordering::Equal)
-                .then(left.term.cmp(&right.term))
-        });
-        weighted.truncate(self.search_config.max_terms);
-        Ok(weighted)
-    }
-
-    async fn resolve_token(&self, token: &str) -> Result<Vec<String>, ServiceError> {
-        let min_length = self.search_config.prefix_min_length;
-        let characters: Vec<char> = token.chars().collect();
-        let mut terms: BTreeSet<String> = BTreeSet::new();
-        if self.repository.term_exists(token).await? {
-            terms.insert(token.to_string());
-        }
-        if characters.len() >= min_length {
-            for term in self.repository.terms_with_prefix(token).await? {
-                terms.insert(term);
-            }
-        }
-        for length in min_length..characters.len() {
-            let candidate: String = characters[..length].iter().collect();
-            if self.repository.term_exists(&candidate).await? {
-                terms.insert(candidate);
-            }
-        }
-        Ok(terms.into_iter().collect())
+    pub async fn list_tags(&self) -> Result<Vec<TagUsage>, ServiceError> {
+        self.repository.list_tags().await.map_err(Into::into)
     }
 }
 
@@ -1035,100 +901,41 @@ fn visit_dependencies<'a>(
     Ok(())
 }
 
-struct ConsideredTerm {
-    token: String,
-    term: String,
-    weight: f64,
-}
+const MAX_TAG_LENGTH: usize = 128;
 
-#[derive(Default)]
-struct SegmentScore {
-    hits: Vec<SearchHit>,
-    excluded_resolved: usize,
-}
-
-struct CandidateScore {
-    confidence: f64,
-    mass: f64,
-    matched_terms: Vec<String>,
-    matched_token_count: usize,
-}
-
-fn token_denominator(considered: &[ConsideredTerm]) -> f64 {
-    let mut seen_tokens: Vec<&str> = Vec::new();
-    let mut denominator = 0.0;
-    for considered_term in considered {
-        if !seen_tokens.contains(&considered_term.token.as_str()) {
-            seen_tokens.push(considered_term.token.as_str());
-            denominator += considered_term.weight;
-        }
-    }
-    denominator
-}
-
-fn score_candidate(
-    considered: &[ConsideredTerm],
-    description: &str,
-    denominator: f64,
-) -> CandidateScore {
-    let tokens: HashSet<String> = tokenize(description).into_iter().collect();
-    let mut matched_terms: Vec<String> = Vec::new();
-    let mut matched_tokens: Vec<&str> = Vec::new();
-    let mut mass = 0.0;
-    for considered_term in considered {
-        if !tokens.contains(&considered_term.term) {
+fn normalize_tags(tags: &[String]) -> Result<Vec<String>, ServiceError> {
+    let mut normalized: Vec<String> = Vec::new();
+    for tag in tags {
+        let tag = tag.trim().to_lowercase();
+        if tag.is_empty() {
             continue;
         }
-        matched_terms.push(considered_term.term.clone());
-        if !matched_tokens.contains(&considered_term.token.as_str()) {
-            matched_tokens.push(considered_term.token.as_str());
-            mass += considered_term.weight;
+        if tag.chars().count() > MAX_TAG_LENGTH {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "tag exceeds {MAX_TAG_LENGTH} characters"
+            )));
+        }
+        if !normalized.contains(&tag) {
+            normalized.push(tag);
         }
     }
-    CandidateScore {
-        confidence: if denominator > 0.0 {
-            mass / denominator
-        } else {
-            0.0
-        },
-        mass,
-        matched_terms,
-        matched_token_count: matched_tokens.len(),
-    }
+    Ok(normalized)
 }
 
-fn tokenize(text: &str) -> Vec<String> {
-    text.split(|character: char| !character.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(|token| token.to_lowercase())
-        .collect()
-}
-
-fn inverse_document_frequency(node_count: f64, document_frequency: f64) -> f64 {
-    (1.0 + node_count / document_frequency).ln()
-}
-
-fn split_segments(text: &str, separators: &[char]) -> Vec<String> {
-    text.split(|character| separators.contains(&character))
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn build_fts_query(terms: &[&str]) -> String {
-    terms
-        .iter()
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-        .collect::<Vec<String>>()
-        .join(" OR ")
+fn fts_query(text: &str) -> Option<String> {
+    let terms: Vec<String> = text
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(|term| format!("\"{}\"", term.to_lowercase()))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" OR "))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
         database::{create_sqlite_pool, migrate},
-        model::{PlanAnchorDraft, PlanGoalDraft, RelationDirection},
+        model::{PlanAnchorDraft, PlanGoalDraft, RelationDirection, SearchScope},
         repository::graph::SqliteGraphRepository,
     };
 
@@ -1143,17 +950,9 @@ mod tests {
             .await
             .expect("failed to create database connection pool");
         migrate(&pool).await.expect("failed to migrate database");
-        GraphService::new(
-            Arc::new(SqliteGraphRepository::new(pool)),
-            test_search_config(),
-        )
-    }
-
-    fn test_search_config() -> crate::config::SearchConfig {
-        crate::config::SearchConfig {
-            min_matched_idf: 0.0,
-            ..crate::config::SearchConfig::default()
-        }
+        let repository: Arc<dyn GraphRepository> = Arc::new(SqliteGraphRepository::new(pool));
+        crate::test_support::seed_vocabulary(&repository).await;
+        GraphService::new(repository, crate::config::SearchConfig::default())
     }
 
     fn node_kind(name: &str) -> NodeKind {
@@ -1326,14 +1125,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             service
-                .search(
-                    "ada lovelace",
-                    SearchScope::All,
-                    &ReachFilter::default(),
-                    &HashSet::new()
-                )
+                .search(Some("ada lovelace"), &[], None, None)
                 .await
                 .unwrap()
+                .hits
                 .len(),
             1
         );
@@ -1344,14 +1139,10 @@ mod tests {
         );
         assert!(
             service
-                .search(
-                    "ada lovelace",
-                    SearchScope::All,
-                    &ReachFilter::default(),
-                    &HashSet::new()
-                )
+                .search(Some("ada lovelace"), &[], None, None)
                 .await
                 .unwrap()
+                .hits
                 .is_empty()
         );
     }
@@ -1409,213 +1200,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-    }
-
-    #[tokio::test]
-    async fn search_matches_and_reflects_updates() {
-        let service = service().await;
-        let kind_id = seed_person(&service).await;
-        let ada = service
-            .upsert_node(&described_node(
-                kind_id,
-                "Ada Lovelace",
-                "pioneer of computing",
-            ))
-            .await
-            .unwrap();
-        let segments = service
-            .search(
-                "pioneer computing",
-                SearchScope::All,
-                &ReachFilter::default(),
-                &HashSet::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].matches.len(), 1);
-        assert_eq!(segments[0].matches[0].node.id, ada.id);
-        assert!(segments[0].matches[0].confidence >= 0.99);
-
-        let mut changed = ada.clone();
-        changed.description = "mathematician and logician".to_string();
-        service.upsert_node(&changed).await.unwrap();
-        assert!(
-            service
-                .search(
-                    "pioneer computing",
-                    SearchScope::All,
-                    &ReachFilter::default(),
-                    &HashSet::new(),
-                )
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        let segments = service
-            .search(
-                "mathematician logician",
-                SearchScope::All,
-                &ReachFilter::default(),
-                &HashSet::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].matches[0].node.id, ada.id);
-    }
-
-    #[tokio::test]
-    async fn gates_out_single_term_overlap() {
-        let service = service().await;
-        let kind_id = seed_person(&service).await;
-        service
-            .upsert_node(&described_node(kind_id, "Ledger", "owned debt record"))
-            .await
-            .unwrap();
-        assert!(
-            service
-                .search(
-                    "debt repayment",
-                    SearchScope::All,
-                    &ReachFilter::default(),
-                    &HashSet::new()
-                )
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn prefix_variants_do_not_deflate_confidence() {
-        let service = service().await;
-        let kind_id = seed_person(&service).await;
-        for (name, description) in [
-            ("schema", "add refresh token table with rotation"),
-            ("endpoint", "post auth refresh issues rotated token pairs"),
-            ("client", "cli retries once after refreshing"),
-            ("session", "users stay signed in across access token expiry"),
-        ] {
-            service
-                .upsert_node(&described_node(kind_id, name, description))
-                .await
-                .unwrap();
-        }
-        let segments = service
-            .search(
-                "refresh rotation",
-                SearchScope::All,
-                &ReachFilter::default(),
-                &HashSet::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].matches.len(), 1);
-        assert_eq!(segments[0].matches[0].node.name, "schema");
-        let confidence = segments[0].matches[0].confidence;
-        assert!(confidence > 0.8);
-        assert!(confidence < 0.9);
-    }
-
-    #[tokio::test]
-    async fn prefix_variants_of_one_token_count_as_one_match() {
-        let service = service().await;
-        let kind_id = seed_person(&service).await;
-        service
-            .upsert_node(&described_node(kind_id, "Ledger", "refresh refreshing"))
-            .await
-            .unwrap();
-        assert!(
-            service
-                .search(
-                    "refresh",
-                    SearchScope::All,
-                    &ReachFilter::default(),
-                    &HashSet::new()
-                )
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn splits_multi_topic_prompt() {
-        let service = service().await;
-        let kind_id = seed_person(&service).await;
-        let composer = service
-            .upsert_node(&described_node(kind_id, "Composer", "musical composition"))
-            .await
-            .unwrap();
-        let database = service
-            .upsert_node(&described_node(kind_id, "Database", "query storage engine"))
-            .await
-            .unwrap();
-        let segments = service
-            .search(
-                "musical composition? query storage engine",
-                SearchScope::All,
-                &ReachFilter::default(),
-                &HashSet::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].matches[0].node.id, composer.id);
-        assert_eq!(segments[1].matches[0].node.id, database.id);
-    }
-
-    #[tokio::test]
-    async fn search_hit_includes_topology_probe() {
-        let service = service().await;
-        let kind_id = seed_person(&service).await;
-        let ada = service
-            .upsert_node(&described_node(kind_id, "Ada", "ada lovelace"))
-            .await
-            .unwrap();
-        let bob = service
-            .upsert_node(&described_node(kind_id, "Bob", "ada lovelace"))
-            .await
-            .unwrap();
-        let knows = service
-            .create_edge_type(&edge_type("knows", ""))
-            .await
-            .unwrap();
-        service
-            .add_edge(&Edge {
-                source: ada.id,
-                destination: bob.id,
-                edge_type_id: knows.id,
-                created_at: String::new(),
-            })
-            .await
-            .unwrap();
-        let segments = service
-            .search(
-                "ada lovelace",
-                SearchScope::All,
-                &ReachFilter::default(),
-                &HashSet::new(),
-            )
-            .await
-            .unwrap();
-        let ada_hit = segments[0]
-            .matches
-            .iter()
-            .find(|hit| hit.node.id == ada.id)
-            .unwrap();
-        assert_eq!(ada_hit.relations.len(), 1);
-        assert_eq!(ada_hit.relations[0].direction, RelationDirection::Outgoing);
-        assert_eq!(ada_hit.relations[0].edge_type, "knows");
-        assert_eq!(ada_hit.relations[0].count, 1);
-        let bob_hit = segments[0]
-            .matches
-            .iter()
-            .find(|hit| hit.node.id == bob.id)
-            .unwrap();
-        assert_eq!(bob_hit.relations[0].direction, RelationDirection::Ingoing);
     }
 
     async fn seeded_kind(service: &GraphService, name: &str) -> i64 {
@@ -2254,16 +1838,11 @@ mod tests {
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].node.id, goal);
 
-        let segments = service
-            .search(
-                "recalibrated widget",
-                SearchScope::All,
-                &ReachFilter::default(),
-                &HashSet::new(),
-            )
+        let page = service
+            .search(Some("recalibrated widget"), &[], None, None)
             .await
             .unwrap();
-        assert_eq!(segments[0].matches[0].node.id, created.id);
+        assert_eq!(page.hits[0].node.id, created.id);
     }
 
     #[tokio::test]
@@ -2365,94 +1944,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-    }
-
-    #[tokio::test]
-    async fn scopes_search_by_resolving_edges() {
-        let service = service().await;
-        let repo = seeded_repo(&service).await;
-        let goal = anchored_goal(&service, repo).await;
-        let change_kind = seeded_kind(&service, "change").await;
-        let implements = seeded_edge_type(&service, "implements").await;
-
-        let mut draft = new_task("audited");
-        draft.description = "recalibrated widget".to_string();
-        draft.parent = Some(goal);
-        let task = service.create_task(&draft).await.unwrap();
-        let change = service
-            .upsert_node(&Node {
-                id: 0,
-                kind_id: change_kind,
-                name: "commit".to_string(),
-                description: String::new(),
-                content: String::new(),
-                updated_at: String::new(),
-            })
-            .await
-            .unwrap();
-
-        let active = service
-            .search(
-                "recalibrated widget",
-                SearchScope::Active,
-                &ReachFilter::default(),
-                &HashSet::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].matches[0].node.id, task.id);
-        assert!(!active[0].matches[0].resolved);
-        assert_eq!(active[0].excluded_resolved, 0);
-
-        service
-            .add_edge(&Edge {
-                source: change.id,
-                destination: task.id,
-                edge_type_id: implements,
-                created_at: String::new(),
-            })
-            .await
-            .unwrap();
-
-        let active = service
-            .search(
-                "recalibrated widget",
-                SearchScope::Active,
-                &ReachFilter::default(),
-                &HashSet::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(active.len(), 1);
-        assert!(active[0].matches.is_empty());
-        assert_eq!(active[0].total_matches, 0);
-        assert_eq!(active[0].excluded_resolved, 1);
-
-        let all = service
-            .search(
-                "recalibrated widget",
-                SearchScope::All,
-                &ReachFilter::default(),
-                &HashSet::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(all[0].matches.len(), 1);
-        assert!(all[0].matches[0].resolved);
-        assert_eq!(all[0].excluded_resolved, 0);
-
-        let resolved = service
-            .search(
-                "recalibrated widget",
-                SearchScope::Resolved,
-                &ReachFilter::default(),
-                &HashSet::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resolved[0].matches.len(), 1);
-        assert_eq!(resolved[0].matches[0].node.id, task.id);
     }
 
     async fn repo_goal_task_graph(service: &GraphService) -> (i64, i64, i64, i64, i64) {
@@ -2768,153 +2259,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_respects_reach_filter() {
-        let service = service().await;
-        let repo_kind = seeded_kind(&service, "repo").await;
-        let goal_kind = seeded_kind(&service, "goal").await;
-        let task_kind = seeded_kind(&service, "task").await;
-        let belongs_to = seeded_edge_type(&service, "belongs_to").await;
-        let part_of = seeded_edge_type(&service, "part_of").await;
-
-        let repo = service
-            .upsert_node(&node(repo_kind, "acme/widget", ""))
-            .await
-            .unwrap();
-        let goal = service
-            .upsert_node(&node(goal_kind, "ship widget", ""))
-            .await
-            .unwrap();
-        let scoped = service
-            .upsert_node(&described_node(
-                task_kind,
-                "build widget",
-                "recalibrated widget",
-            ))
-            .await
-            .unwrap();
-        let loose = service
-            .upsert_node(&described_node(
-                task_kind,
-                "build gadget",
-                "recalibrated widget",
-            ))
-            .await
-            .unwrap();
-
-        service
-            .add_edge(&Edge {
-                source: goal.id,
-                destination: repo.id,
-                edge_type_id: belongs_to,
-                created_at: String::new(),
-            })
-            .await
-            .unwrap();
-        service
-            .add_edge(&Edge {
-                source: scoped.id,
-                destination: goal.id,
-                edge_type_id: part_of,
-                created_at: String::new(),
-            })
-            .await
-            .unwrap();
-
-        let all = service
-            .search(
-                "recalibrated widget",
-                SearchScope::All,
-                &ReachFilter::default(),
-                &HashSet::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(all[0].total_matches, 2);
-
-        let reach = ReachFilter {
-            within: Some(repo.id),
-            via: Some("belongs_to".to_string()),
-            descend: None,
-        };
-        let filtered = service
-            .search(
-                "recalibrated widget",
-                SearchScope::All,
-                &reach,
-                &HashSet::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(filtered[0].total_matches, 1);
-        assert_eq!(filtered[0].matches[0].node.id, scoped.id);
-        assert_ne!(filtered[0].matches[0].node.id, loose.id);
-    }
-
-    #[tokio::test]
-    async fn search_hides_nodes_already_accessed_by_the_session() {
-        let service = service().await;
-        let kind_id = seed_person(&service).await;
-        let first = service
-            .upsert_node(&described_node(kind_id, "Ada", "rotated token"))
-            .await
-            .unwrap();
-        let second = service
-            .upsert_node(&described_node(kind_id, "Bob", "rotated token"))
-            .await
-            .unwrap();
-        for index in 0..2 {
-            service
-                .upsert_node(&described_node(
-                    kind_id,
-                    &format!("decoy-{index}"),
-                    "unrelated filler",
-                ))
-                .await
-                .unwrap();
-        }
-
-        let visible = service
-            .search(
-                "rotated token",
-                SearchScope::All,
-                &ReachFilter::default(),
-                &HashSet::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(visible[0].matches.len(), 2);
-        assert_eq!(visible[0].total_matches, 2);
-
-        let exclude: HashSet<i64> = [first.id].into_iter().collect();
-        let suppressed = service
-            .search(
-                "rotated token",
-                SearchScope::All,
-                &ReachFilter::default(),
-                &exclude,
-            )
-            .await
-            .unwrap();
-        assert_eq!(suppressed[0].matches.len(), 1);
-        assert_eq!(suppressed[0].matches[0].node.id, second.id);
-        assert_eq!(suppressed[0].total_matches, 2);
-
-        let paged = service
-            .search_segment(
-                "rotated token",
-                SearchScope::All,
-                &ReachFilter::default(),
-                5,
-                0,
-                &exclude,
-            )
-            .await
-            .unwrap();
-        assert_eq!(paged.len(), 1);
-        assert_eq!(paged[0].node.id, second.id);
-    }
-
-    #[tokio::test]
     async fn plan_anchor_wires_the_goal_to_the_anchor_node() {
         let service = service().await;
         let repo_kind = seeded_kind(&service, "repo").await;
@@ -3188,5 +2532,187 @@ mod tests {
         draft.parent = Some(first.id);
         let error = service.create_task(&draft).await.unwrap_err();
         assert!(rejection(error).contains("is not attached to a repo"));
+    }
+
+    #[tokio::test]
+    async fn creates_node_with_normalized_tags() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let (created, tags) = service
+            .create_node(
+                &node(kind_id, "Ada", "pioneer of computing"),
+                &[" Math ".to_string(), "math".to_string(), "".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(tags, vec!["math"]);
+        assert_eq!(created.id, service.get_node(created.id).await.unwrap().id);
+        assert_eq!(service.node_tags(created.id).await.unwrap(), vec!["math"]);
+    }
+
+    #[tokio::test]
+    async fn replaces_tags_and_reports_usage() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let first = service
+            .create_node(&node(kind_id, "Ada", ""), &["math".to_string()])
+            .await
+            .unwrap()
+            .0;
+        let second = service
+            .create_node(
+                &node(kind_id, "Bob", ""),
+                &["math".to_string(), "logic".to_string()],
+            )
+            .await
+            .unwrap()
+            .0;
+
+        let replaced = service
+            .replace_node_tags(first.id, &["logic".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(replaced, vec!["logic"]);
+
+        let usage = service.list_tags().await.unwrap();
+        assert_eq!(
+            usage
+                .iter()
+                .map(|tag| (tag.tag.as_str(), tag.node_count))
+                .collect::<Vec<_>>(),
+            vec![("logic", 2), ("math", 1)]
+        );
+        assert_eq!(
+            service.node_tags(second.id).await.unwrap(),
+            vec!["logic", "math"]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_covers_description_and_content() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let described = service
+            .create_node(&described_node(kind_id, "Ada", "pioneer of computing"), &[])
+            .await
+            .unwrap()
+            .0;
+        let bodied = service
+            .create_node(&node(kind_id, "Notes", "pioneer of computing"), &[])
+            .await
+            .unwrap()
+            .0;
+
+        let page = service
+            .search(Some("pioneer computing"), &[], None, None)
+            .await
+            .unwrap();
+        let ids: Vec<i64> = page.hits.iter().map(|hit| hit.node.id).collect();
+        assert!(ids.contains(&described.id));
+        assert!(ids.contains(&bodied.id));
+        assert_eq!(page.total, 2);
+        assert!(page.hits.iter().all(|hit| hit.score >= 0.0));
+    }
+
+    #[tokio::test]
+    async fn search_requires_every_tag() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let both = service
+            .create_node(
+                &described_node(kind_id, "Both", "shared text"),
+                &["alpha".to_string(), "beta".to_string()],
+            )
+            .await
+            .unwrap()
+            .0;
+        service
+            .create_node(
+                &described_node(kind_id, "OnlyAlpha", "shared text"),
+                &["alpha".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let page = service
+            .search(None, &["alpha".to_string(), "beta".to_string()], None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.hits[0].node.id, both.id);
+        assert_eq!(page.hits[0].tags, vec!["alpha", "beta"]);
+
+        let combined = service
+            .search(Some("shared"), &["alpha".to_string()], Some(1), Some(0))
+            .await
+            .unwrap();
+        assert_eq!(combined.total, 2);
+        assert_eq!(combined.hits.len(), 1);
+        assert_eq!(combined.limit, 1);
+        assert_eq!(combined.offset, 0);
+    }
+
+    #[tokio::test]
+    async fn search_rejects_an_empty_query_without_tags() {
+        let service = service().await;
+        assert!(matches!(
+            service.search(Some("   "), &[], None, None).await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+        assert!(matches!(
+            service.search(None, &[], None, None).await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn node_tags_on_missing_node_is_not_found() {
+        let service = service().await;
+        assert!(matches!(
+            service.node_tags(999).await,
+            Err(ServiceError::EntityNotFound)
+        ));
+        assert!(matches!(
+            service.replace_node_tags(999, &[]).await,
+            Err(ServiceError::EntityNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn search_reflects_node_updates() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        let original = service
+            .create_node(&described_node(kind_id, "Ada", "pioneer of computing"), &[])
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            service
+                .search(Some("pioneer"), &[], None, None)
+                .await
+                .unwrap()
+                .total,
+            1
+        );
+
+        let mut changed = original.clone();
+        changed.description = "mathematician and logician".to_string();
+        service.upsert_node(&changed).await.unwrap();
+
+        assert_eq!(
+            service
+                .search(Some("pioneer"), &[], None, None)
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+        let page = service
+            .search(Some("logician"), &[], None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.hits[0].node.id, original.id);
     }
 }

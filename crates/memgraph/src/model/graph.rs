@@ -111,21 +111,25 @@ pub struct Neighbor {
     pub node: Node,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelationSummary {
-    pub direction: RelationDirection,
-    pub edge_type_id: i64,
-    pub edge_type: String,
-    pub count: i64,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {
     pub node: Node,
-    pub confidence: f64,
-    pub matched_terms: Vec<String>,
-    pub relations: Vec<RelationSummary>,
-    pub resolved: bool,
+    pub score: f64,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchPage {
+    pub hits: Vec<SearchHit>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct TagUsage {
+    pub tag: String,
+    pub node_count: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -192,30 +196,6 @@ impl GraphHealth {
             self.isolated_count,
             self.unanchored_count,
         )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SegmentMatches {
-    pub segment: String,
-    pub matches: Vec<SearchHit>,
-    pub total_matches: usize,
-    pub available: usize,
-    pub excluded_resolved: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessAction {
-    Read,
-    Write,
-}
-
-impl AccessAction {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AccessAction::Read => "read",
-            AccessAction::Write => "write",
-        }
     }
 }
 

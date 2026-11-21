@@ -95,6 +95,7 @@ mod tests {
             .expect("failed to create database connection pool");
         migrate(&pool).await.expect("failed to migrate database");
         let repository: Arc<dyn GraphRepository> = Arc::new(SqliteGraphRepository::new(pool));
+        crate::test_support::seed_vocabulary(&repository).await;
         (HealthService::new(repository.clone()), repository)
     }
 

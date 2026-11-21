@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -8,22 +6,17 @@ use axum::{
 
 use crate::{
     dto::{
-        audit::{SessionHeader, SessionId},
         graph::{
             CreateEdgeParameters, CreateEdgeTypeParameters, CreateNodeKindParameters,
             CreateNodeParameters, CreatePlanParameters, CreateTaskParameters, DeleteEdgeParameters,
             EdgeTypeResponse, ListNodesParameters, NeighborParameters, NeighborResponse,
-            NodeAccessFeedbackParameters, NodeKindResponse, NodeResponse, PlanResponse,
-            SearchHitResponse, SearchParameters, SearchResponse, SearchSegmentParameters,
-            SegmentResponse, UpdateTaskParameters,
+            NodeKindResponse, NodeResponse, PlanResponse, ReplaceTagsParameters, SearchHitResponse,
+            SearchParameters, SearchResponse, TagUsageResponse, UpdateTaskParameters,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
     },
-    model::{
-        AccessAction, Edge, EdgeType, Node, NodeFilter, NodeKind, PlanDraft, ReachFilter,
-        TaskDraft, TaskPatch,
-    },
+    model::{Edge, EdgeType, Node, NodeFilter, NodeKind, PlanDraft, TaskDraft, TaskPatch},
     state::AppState,
 };
 
@@ -102,23 +95,18 @@ pub async fn list_edge_types(
     post,
     path = "/nodes",
     request_body = CreateNodeParameters,
-    params(SessionHeader),
     responses((status = 201, description = "Node created", body = NodeResponse))
 )]
 pub async fn create_node(
     State(state): State<AppState>,
-    SessionId(session_id): SessionId,
     Json(params): Json<CreateNodeParameters>,
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
+    let tags = params.tags.clone();
     let node: Node = params.into();
-    let created = state.graph_service.upsert_node(&node).await?;
-    state
-        .audit_service
-        .record(&session_id, &[created.id], AccessAction::Write, None)
-        .await;
+    let (created, tags) = state.graph_service.create_node(&node, &tags).await?;
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
-        data: created.into(),
+        data: NodeResponse::with_tags(created, tags),
     })
 }
 
@@ -127,24 +115,14 @@ pub async fn create_node(
     post,
     path = "/tasks",
     request_body = CreateTaskParameters,
-    params(SessionHeader),
     responses((status = 201, description = "Task created", body = NodeResponse))
 )]
 pub async fn create_task(
     State(state): State<AppState>,
-    SessionId(session_id): SessionId,
     Json(params): Json<CreateTaskParameters>,
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let draft: TaskDraft = params.into();
     let created = state.graph_service.create_task(&draft).await?;
-    let mut accessed = vec![created.id];
-    accessed.extend(draft.parent);
-    accessed.extend(draft.depends_on.iter().copied());
-    accessed.extend(draft.affects.iter().copied());
-    state
-        .audit_service
-        .record(&session_id, &accessed, AccessAction::Write, None)
-        .await;
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
         data: created.into(),
@@ -156,34 +134,14 @@ pub async fn create_task(
     post,
     path = "/plans",
     request_body = CreatePlanParameters,
-    params(SessionHeader),
     responses((status = 201, description = "Plan created", body = PlanResponse))
 )]
 pub async fn create_plan(
     State(state): State<AppState>,
-    SessionId(session_id): SessionId,
     Json(params): Json<CreatePlanParameters>,
 ) -> Result<ApiSuccess<PlanResponse>, ApiError> {
     let draft: PlanDraft = params.into();
     let plan = state.graph_service.create_plan(&draft).await?;
-    let mut accessed: Vec<i64> = plan.goal.iter().map(|goal| goal.id).collect();
-    accessed.extend(plan.tasks.iter().map(|task| task.node.id));
-    if let Some(goal_id) = draft.goal_id {
-        accessed.push(goal_id);
-    }
-    if let Some(anchor) = &draft.anchor {
-        accessed.push(anchor.node_id);
-    }
-    accessed.extend(
-        draft
-            .tasks
-            .iter()
-            .flat_map(|task| task.affects.iter().copied()),
-    );
-    state
-        .audit_service
-        .record(&session_id, &accessed, AccessAction::Write, None)
-        .await;
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
         data: plan.into(),
@@ -203,9 +161,17 @@ pub async fn list_nodes(
 ) -> Result<ApiList<NodeResponse>, ApiError> {
     let filter: NodeFilter = params.into();
     let nodes = state.graph_service.list_nodes(&filter).await?;
+    let ids: Vec<i64> = nodes.iter().map(|node| node.id).collect();
+    let mut tags = state.graph_service.node_tags_for_ids(&ids).await?;
     Ok(ApiList {
         status: StatusCode::OK,
-        items: nodes.into_iter().map(Into::into).collect(),
+        items: nodes
+            .into_iter()
+            .map(|node| {
+                let node_tags = tags.remove(&node.id).unwrap_or_default();
+                NodeResponse::with_tags(node, node_tags)
+            })
+            .collect(),
     })
 }
 
@@ -214,21 +180,16 @@ pub async fn list_nodes(
     patch,
     path = "/tasks/{task_id}",
     request_body = UpdateTaskParameters,
-    params(SessionHeader, ("task_id" = i64, Path, description = "Task id")),
+    params(("task_id" = i64, Path, description = "Task id")),
     responses((status = 200, description = "Task updated", body = NodeResponse))
 )]
 pub async fn update_task(
     State(state): State<AppState>,
-    SessionId(session_id): SessionId,
     Path(task_id): Path<i64>,
     Json(params): Json<UpdateTaskParameters>,
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let patch: TaskPatch = params.into();
     let updated = state.graph_service.update_task(task_id, &patch).await?;
-    state
-        .audit_service
-        .record(&session_id, &[updated.id], AccessAction::Write, None)
-        .await;
     Ok(ApiSuccess {
         status: StatusCode::OK,
         data: updated.into(),
@@ -239,22 +200,18 @@ pub async fn update_task(
     tag = "Graph",
     get,
     path = "/nodes/{node_id}",
-    params(SessionHeader, ("node_id" = i64, Path, description = "Node id")),
+    params(("node_id" = i64, Path, description = "Node id")),
     responses((status = 200, description = "Node", body = NodeResponse))
 )]
 pub async fn get_node(
     State(state): State<AppState>,
-    SessionId(session_id): SessionId,
     Path(node_id): Path<i64>,
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let node = state.graph_service.get_node(node_id).await?;
-    state
-        .audit_service
-        .record(&session_id, &[node.id], AccessAction::Read, None)
-        .await;
+    let tags = state.graph_service.node_tags(node_id).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: node.into(),
+        data: NodeResponse::with_tags(node, tags),
     })
 }
 
@@ -262,18 +219,13 @@ pub async fn get_node(
     tag = "Graph",
     delete,
     path = "/nodes/{node_id}",
-    params(SessionHeader, ("node_id" = i64, Path, description = "Node id")),
+    params(("node_id" = i64, Path, description = "Node id")),
     responses((status = 204, description = "Node deleted"))
 )]
 pub async fn delete_node(
     State(state): State<AppState>,
-    SessionId(session_id): SessionId,
     Path(node_id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .audit_service
-        .record(&session_id, &[node_id], AccessAction::Write, None)
-        .await;
     state.graph_service.delete_node(node_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -281,13 +233,75 @@ pub async fn delete_node(
 #[utoipa::path(
     tag = "Graph",
     get,
+    path = "/nodes/{node_id}/tags",
+    params(("node_id" = i64, Path, description = "Node id")),
+    responses((status = 200, description = "Tags attached to a node", body = ApiList<String>))
+)]
+pub async fn get_node_tags(
+    State(state): State<AppState>,
+    Path(node_id): Path<i64>,
+) -> Result<ApiList<String>, ApiError> {
+    let tags = state.graph_service.node_tags(node_id).await?;
+    Ok(ApiList {
+        status: StatusCode::OK,
+        items: tags,
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    put,
+    path = "/nodes/{node_id}/tags",
+    request_body = ReplaceTagsParameters,
+    params(("node_id" = i64, Path, description = "Node id")),
+    responses((status = 200, description = "Tags replaced", body = ApiList<String>))
+)]
+pub async fn replace_node_tags(
+    State(state): State<AppState>,
+    Path(node_id): Path<i64>,
+    Json(params): Json<ReplaceTagsParameters>,
+) -> Result<ApiList<String>, ApiError> {
+    let tags = state
+        .graph_service
+        .replace_node_tags(node_id, &params.tags)
+        .await?;
+    Ok(ApiList {
+        status: StatusCode::OK,
+        items: tags,
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    get,
+    path = "/tags",
+    responses((status = 200, description = "Known tags with node counts", body = ApiList<TagUsageResponse>))
+)]
+pub async fn list_tags(
+    State(state): State<AppState>,
+) -> Result<ApiList<TagUsageResponse>, ApiError> {
+    let tags = state.graph_service.list_tags().await?;
+    Ok(ApiList {
+        status: StatusCode::OK,
+        items: tags
+            .into_iter()
+            .map(|usage| TagUsageResponse {
+                tag: usage.tag,
+                node_count: usage.node_count,
+            })
+            .collect(),
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    get,
     path = "/nodes/{node_id}/neighbors",
-    params(SessionHeader, NeighborParameters, ("node_id" = i64, Path, description = "Node id")),
+    params(NeighborParameters, ("node_id" = i64, Path, description = "Node id")),
     responses((status = 200, description = "Neighbors of a node", body = ApiList<NeighborResponse>))
 )]
 pub async fn list_neighbors(
     State(state): State<AppState>,
-    SessionId(session_id): SessionId,
     Path(node_id): Path<i64>,
     Query(params): Query<NeighborParameters>,
 ) -> Result<ApiList<NeighborResponse>, ApiError> {
@@ -299,15 +313,17 @@ pub async fn list_neighbors(
             params.edge_type.as_deref(),
         )
         .await?;
-    let mut accessed = vec![node_id];
-    accessed.extend(neighbors.iter().map(|neighbor| neighbor.node.id));
-    state
-        .audit_service
-        .record(&session_id, &accessed, AccessAction::Read, None)
-        .await;
+    let ids: Vec<i64> = neighbors.iter().map(|neighbor| neighbor.node.id).collect();
+    let mut tags = state.graph_service.node_tags_for_ids(&ids).await?;
     Ok(ApiList {
         status: StatusCode::OK,
-        items: neighbors.into_iter().map(Into::into).collect(),
+        items: neighbors
+            .into_iter()
+            .map(|neighbor| {
+                let node_tags = tags.remove(&neighbor.node.id).unwrap_or_default();
+                NeighborResponse::with_tags(neighbor, node_tags)
+            })
+            .collect(),
     })
 }
 
@@ -316,25 +332,14 @@ pub async fn list_neighbors(
     post,
     path = "/edges",
     request_body = CreateEdgeParameters,
-    params(SessionHeader),
     responses((status = 204, description = "Edge created"))
 )]
 pub async fn add_edge(
     State(state): State<AppState>,
-    SessionId(session_id): SessionId,
     Json(params): Json<CreateEdgeParameters>,
 ) -> Result<StatusCode, ApiError> {
     let edge: Edge = params.into();
     state.graph_service.add_edge(&edge).await?;
-    state
-        .audit_service
-        .record(
-            &session_id,
-            &[edge.source, edge.destination],
-            AccessAction::Write,
-            None,
-        )
-        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -342,25 +347,15 @@ pub async fn add_edge(
     tag = "Graph",
     delete,
     path = "/edges",
-    params(SessionHeader, DeleteEdgeParameters),
+    params(DeleteEdgeParameters),
     responses((status = 204, description = "Edge removed"))
 )]
 pub async fn remove_edge(
     State(state): State<AppState>,
-    SessionId(session_id): SessionId,
     Query(params): Query<DeleteEdgeParameters>,
 ) -> Result<StatusCode, ApiError> {
     let edge: Edge = params.into();
     state.graph_service.remove_edge(&edge).await?;
-    state
-        .audit_service
-        .record(
-            &session_id,
-            &[edge.source, edge.destination],
-            AccessAction::Write,
-            None,
-        )
-        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -368,144 +363,34 @@ pub async fn remove_edge(
     tag = "Graph",
     get,
     path = "/search",
-    params(SessionHeader, SearchParameters),
-    responses((status = 200, description = "Per-segment full-text search hits", body = SearchResponse))
+    params(SearchParameters),
+    responses((status = 200, description = "Full-text and tag search", body = SearchResponse))
 )]
 pub async fn search(
     State(state): State<AppState>,
-    SessionId(session_id): SessionId,
     Query(params): Query<SearchParameters>,
 ) -> Result<ApiSuccess<SearchResponse>, ApiError> {
-    let scope_value = params.scope.as_str();
-    let scope = params.scope.into();
-    let reach = params.reach();
-    let exclude = state.audit_service.accessed_node_ids(&session_id).await;
-    let segments = state
+    let tags = params.tag_list();
+    let page = state
         .graph_service
-        .search(&params.q, scope, &reach, &exclude)
+        .search(params.q.as_deref(), &tags, params.limit, params.offset)
         .await?;
-    let summary_chars = state.graph_service.summary_chars();
-    let page_limit = state.graph_service.default_segment_limit();
-    let mut responses = Vec::with_capacity(segments.len());
-    for segment in segments {
-        let node_ids: Vec<i64> = segment.matches.iter().map(|hit| hit.node.id).collect();
-        let recorded = state
-            .audit_service
-            .record(
-                &session_id,
-                &node_ids,
-                AccessAction::Read,
-                Some(&segment.segment),
-            )
-            .await;
-        let access_ids: HashMap<i64, i64> = recorded
-            .into_iter()
-            .map(|record| (record.node_id, record.access_id))
-            .collect();
-        let hidden = segment.total_matches.saturating_sub(segment.matches.len());
-        let remaining = segment.available.saturating_sub(segment.matches.len());
-        let probe = segment_probe(&segment.segment, scope_value, &reach, remaining, page_limit);
-        responses.push(SegmentResponse {
-            segment: segment.segment,
-            matches: segment
-                .matches
-                .into_iter()
-                .map(|hit| {
-                    let access_id = access_ids.get(&hit.node.id).copied();
-                    SearchHitResponse::new(hit, summary_chars, access_id)
-                })
-                .collect(),
-            total_matches: segment.total_matches,
-            hidden,
-            excluded_resolved: segment.excluded_resolved,
-            probe,
-        });
-    }
     Ok(ApiSuccess {
         status: StatusCode::OK,
         data: SearchResponse {
-            segments: responses,
+            items: page
+                .hits
+                .into_iter()
+                .map(|hit| SearchHitResponse {
+                    node: NodeResponse::with_tags(hit.node, hit.tags),
+                    score: hit.score,
+                })
+                .collect(),
+            total: page.total,
+            limit: page.limit,
+            offset: page.offset,
         },
     })
-}
-
-#[utoipa::path(
-    tag = "Graph",
-    get,
-    path = "/search/segment",
-    params(SessionHeader, SearchSegmentParameters),
-    responses((status = 200, description = "Additional matches for a single segment", body = ApiList<SearchHitResponse>))
-)]
-pub async fn search_segment(
-    State(state): State<AppState>,
-    SessionId(session_id): SessionId,
-    Query(params): Query<SearchSegmentParameters>,
-) -> Result<ApiList<SearchHitResponse>, ApiError> {
-    let limit = params
-        .limit
-        .unwrap_or_else(|| state.graph_service.default_segment_limit());
-    let offset = params.offset.unwrap_or(0);
-    let exclude = state.audit_service.accessed_node_ids(&session_id).await;
-    let hits = state
-        .graph_service
-        .search_segment(
-            &params.segment,
-            params.scope.into(),
-            &params.reach(),
-            limit,
-            offset,
-            &exclude,
-        )
-        .await?;
-    let node_ids: Vec<i64> = hits.iter().map(|hit| hit.node.id).collect();
-    let recorded = state
-        .audit_service
-        .record(
-            &session_id,
-            &node_ids,
-            AccessAction::Read,
-            Some(&params.segment),
-        )
-        .await;
-    let access_ids: HashMap<i64, i64> = recorded
-        .into_iter()
-        .map(|record| (record.node_id, record.access_id))
-        .collect();
-    let summary_chars = state.graph_service.summary_chars();
-    Ok(ApiList {
-        status: StatusCode::OK,
-        items: hits
-            .into_iter()
-            .map(|hit| {
-                let access_id = access_ids.get(&hit.node.id).copied();
-                SearchHitResponse::new(hit, summary_chars, access_id)
-            })
-            .collect(),
-    })
-}
-
-#[utoipa::path(
-    tag = "Graph",
-    patch,
-    path = "/node-access/{access_id}",
-    request_body = NodeAccessFeedbackParameters,
-    params(SessionHeader, ("access_id" = i64, Path, description = "Node access row id")),
-    responses(
-        (status = 204, description = "Relevance verdict recorded"),
-        (status = 404, description = "Node access row not found for this session")
-    )
-)]
-pub async fn set_node_access_relevance(
-    State(state): State<AppState>,
-    SessionId(session_id): SessionId,
-    Path(access_id): Path<i64>,
-    Json(params): Json<NodeAccessFeedbackParameters>,
-) -> Result<StatusCode, ApiError> {
-    state
-        .audit_service
-        .mark_relevance(&session_id, access_id, params.relevant)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
@@ -524,185 +409,12 @@ pub async fn graph_health(
     })
 }
 
-fn segment_probe(
-    segment: &str,
-    scope: &str,
-    reach: &ReachFilter,
-    remaining: usize,
-    limit: usize,
-) -> Option<String> {
-    (remaining > 0).then(|| {
-        let mut probe = format!(
-            "/api/search/segment?segment={}&scope={}",
-            percent_encode(segment),
-            scope
-        );
-        if let Some(within) = reach.within {
-            probe.push_str(&format!("&within={within}"));
-        }
-        if let Some(via) = &reach.via {
-            probe.push_str(&format!("&via={}", percent_encode(via)));
-        }
-        if let Some(descend) = &reach.descend {
-            probe.push_str(&format!("&descend={}", percent_encode(descend)));
-        }
-        probe.push_str(&format!("&limit={limit}&offset=0"));
-        probe
-    })
-}
-
-fn percent_encode(input: &str) -> String {
-    let mut encoded = String::new();
-    for byte in input.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char);
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        config::{AppConfig, AuditConfig, DatabaseConfig, SearchConfig, ServerConfig},
-        dto::graph::SearchScope,
-    };
-
-    #[test]
-    fn probe_preserves_scope_and_counts() {
-        assert_eq!(
-            segment_probe("a b", "all", &ReachFilter::default(), 7, 5).as_deref(),
-            Some("/api/search/segment?segment=a%20b&scope=all&limit=5&offset=0")
-        );
-        assert!(segment_probe("a", "active", &ReachFilter::default(), 0, 5).is_none());
-    }
-
-    #[test]
-    fn probe_preserves_the_reach_filter() {
-        let reach = ReachFilter {
-            within: Some(18),
-            via: Some("belongs_to".to_string()),
-            descend: Some("part_of".to_string()),
-        };
-        assert_eq!(
-            segment_probe("a b", "active", &reach, 7, 5).as_deref(),
-            Some(
-                "/api/search/segment?segment=a%20b&scope=active&within=18&via=belongs_to&descend=part_of&limit=5&offset=0"
-            )
-        );
-    }
-
-    fn probe_parameter(probe: &str, name: &str) -> usize {
-        probe
-            .split_once('?')
-            .expect("probe carries a query string")
-            .1
-            .split('&')
-            .find_map(|pair| {
-                let (key, value) = pair.split_once('=')?;
-                (key == name).then(|| value.parse().expect("probe parameter is a number"))
-            })
-            .unwrap_or_else(|| panic!("probe carries {name}"))
-    }
-
-    #[tokio::test]
-    async fn search_probe_returns_the_matches_beyond_the_first_page() {
-        let state = test_state_with_search(SearchConfig {
-            min_matched_idf: 0.0,
-            per_segment_limit: 2,
-            ..SearchConfig::default()
-        })
-        .await;
-        let kind = state
-            .graph_service
-            .create_node_kind(&NodeKind {
-                id: 0,
-                name: "widget".to_string(),
-                description: String::new(),
-                updated_at: String::new(),
-            })
-            .await
-            .expect("create node kind");
-        for index in 0..4 {
-            state
-                .graph_service
-                .upsert_node(&Node {
-                    id: 0,
-                    kind_id: kind.id,
-                    name: format!("node-{index}"),
-                    description: "rotated token filler".to_string(),
-                    content: String::new(),
-                    updated_at: String::new(),
-                })
-                .await
-                .expect("create node");
-        }
-        let params = || SearchParameters {
-            q: "rotated token".to_string(),
-            scope: SearchScope::All,
-            within: None,
-            via: None,
-            descend: None,
-        };
-
-        let first = search(
-            State(state.clone()),
-            SessionId("session-1".to_string()),
-            Query(params()),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("first search failed: {}", error.message));
-        let segment = &first.data.segments[0];
-        assert_eq!(segment.matches.len(), 2);
-        assert_eq!(segment.total_matches, 4);
-        assert_eq!(segment.hidden, 2);
-        let probe = segment.probe.clone().expect("probe offered for page two");
-
-        let page = search_segment(
-            State(state.clone()),
-            SessionId("session-1".to_string()),
-            Query(SearchSegmentParameters {
-                segment: "rotated token".to_string(),
-                scope: SearchScope::All,
-                within: None,
-                via: None,
-                descend: None,
-                limit: Some(probe_parameter(&probe, "limit")),
-                offset: Some(probe_parameter(&probe, "offset")),
-            }),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("probe follow failed: {}", error.message));
-        assert_eq!(
-            page.items.len(),
-            2,
-            "the probe must return the remaining matches"
-        );
-
-        let exhausted = search(
-            State(state.clone()),
-            SessionId("session-1".to_string()),
-            Query(params()),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("third search failed: {}", error.message));
-        assert!(exhausted.data.segments[0].matches.is_empty());
-        assert_eq!(exhausted.data.segments[0].total_matches, 4);
-        assert!(
-            exhausted.data.segments[0].probe.is_none(),
-            "no probe once every match is suppressed"
-        );
-    }
+    use crate::config::{AppConfig, DatabaseConfig, SearchConfig, ServerConfig};
 
     async fn test_state() -> AppState {
-        test_state_with_search(SearchConfig::default()).await
-    }
-
-    async fn test_state_with_search(search: SearchConfig) -> AppState {
         AppState::new(&AppConfig {
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
@@ -712,135 +424,277 @@ mod tests {
                 path: ":memory:".to_string(),
                 max_connections: 1,
             },
-            search,
-            audit: AuditConfig { retention_days: 0 },
+            search: SearchConfig::default(),
         })
         .await
     }
 
-    async fn seed_search_graph(state: &AppState) -> i64 {
-        let kind = state
+    async fn seed_kind(state: &AppState, name: &str) -> i64 {
+        state
             .graph_service
             .create_node_kind(&NodeKind {
                 id: 0,
-                name: "widget".to_string(),
+                name: name.to_string(),
                 description: String::new(),
                 updated_at: String::new(),
             })
             .await
-            .expect("create node kind");
-        let mut target = 0;
-        for index in 0..7 {
-            let description = if index == 0 {
-                "rotated token".to_string()
-            } else {
-                format!("decoy{index} filler")
-            };
-            let node = state
-                .graph_service
-                .upsert_node(&Node {
-                    id: 0,
-                    kind_id: kind.id,
-                    name: format!("node-{index}"),
-                    description,
-                    content: String::new(),
-                    updated_at: String::new(),
-                })
-                .await
-                .expect("create node");
-            if index == 0 {
-                target = node.id;
-            }
-        }
-        target
+            .expect("create node kind")
+            .id
+    }
+
+    async fn new_node(
+        state: &AppState,
+        kind_id: i64,
+        name: &str,
+        description: &str,
+        content: &str,
+        tags: &[&str],
+    ) -> NodeResponse {
+        create_node(
+            State(state.clone()),
+            Json(CreateNodeParameters {
+                kind_id,
+                name: name.to_string(),
+                description: description.to_string(),
+                content: content.to_string(),
+                tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            }),
+        )
+        .await
+        .expect("create node")
+        .data
+    }
+
+    async fn search_handler(
+        state: &AppState,
+        params: SearchParameters,
+    ) -> Result<ApiSuccess<SearchResponse>, ApiError> {
+        super::search(State(state.clone()), Query(params)).await
     }
 
     #[tokio::test]
-    async fn search_hits_expose_access_ids_and_accept_feedback() {
+    async fn create_node_normalizes_and_returns_tags() {
         let state = test_state().await;
-        let target = seed_search_graph(&state).await;
+        let kind = seed_kind(&state, "decision").await;
+        let created = new_node(
+            &state,
+            kind,
+            "use sqlite",
+            "single file store",
+            "content",
+            &[" Repo:X ", "repo:x", "TOPIC:storage"],
+        )
+        .await;
+        assert_eq!(created.tags, vec!["repo:x", "topic:storage"]);
+        assert_eq!(created.name, "use sqlite");
 
-        let response = search(
+        let fetched = get_node(State(state.clone()), Path(created.id))
+            .await
+            .expect("get node")
+            .data;
+        assert_eq!(fetched.tags, vec!["repo:x", "topic:storage"]);
+    }
+
+    #[tokio::test]
+    async fn list_nodes_and_tags_directory_expose_tags() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "decision").await;
+        new_node(&state, kind, "a", "first", "", &["alpha"]).await;
+        new_node(&state, kind, "b", "second", "", &["alpha", "beta"]).await;
+
+        let listed = list_nodes(
             State(state.clone()),
-            SessionId("session-1".to_string()),
-            Query(SearchParameters {
-                q: "rotated token. rotated token".to_string(),
-                scope: SearchScope::default(),
+            Query(ListNodesParameters {
+                kind: None,
+                scope: None,
                 within: None,
                 via: None,
                 descend: None,
             }),
         )
         .await
-        .unwrap_or_else(|error| panic!("search failed: {}", error.message));
-        assert_eq!(response.data.segments.len(), 2);
-        let first = &response.data.segments[0].matches[0];
-        let second = &response.data.segments[1].matches[0];
-        assert_eq!(first.id, target);
-        assert_eq!(second.id, target);
-        let first_access = first.access_id.expect("first access id recorded");
-        let access_id = second.access_id.expect("second access id recorded");
-        assert_ne!(first_access, access_id);
+        .expect("list nodes");
+        assert_eq!(listed.items.len(), 2);
+        assert!(listed.items.iter().all(|node| !node.tags.is_empty()));
 
-        let foreign = set_node_access_relevance(
-            State(state.clone()),
-            SessionId("session-2".to_string()),
-            Path(access_id),
-            Json(NodeAccessFeedbackParameters { relevant: true }),
-        )
-        .await;
-        assert!(foreign.is_err());
-
-        let accepted = set_node_access_relevance(
-            State(state.clone()),
-            SessionId("session-1".to_string()),
-            Path(access_id),
-            Json(NodeAccessFeedbackParameters { relevant: true }),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("owning session update failed: {}", error.message));
-        assert_eq!(accepted, StatusCode::NO_CONTENT);
+        let tags = list_tags(State(state.clone())).await.expect("list tags");
+        assert_eq!(tags.items[0].tag, "alpha");
+        assert_eq!(tags.items[0].node_count, 2);
     }
 
     #[tokio::test]
-    async fn search_hides_nodes_the_session_already_retrieved() {
+    async fn replace_node_tags_swaps_the_set() {
         let state = test_state().await;
-        let target = seed_search_graph(&state).await;
-        let params = || SearchParameters {
-            q: "rotated token".to_string(),
-            scope: SearchScope::default(),
-            within: None,
-            via: None,
-            descend: None,
-        };
+        let kind = seed_kind(&state, "decision").await;
+        let node = new_node(&state, kind, "a", "first", "", &["alpha"]).await;
 
-        let first = search(
+        let replaced = replace_node_tags(
             State(state.clone()),
-            SessionId("session-1".to_string()),
-            Query(params()),
+            Path(node.id),
+            Json(ReplaceTagsParameters {
+                tags: vec!["Beta".to_string()],
+            }),
         )
         .await
-        .unwrap_or_else(|error| panic!("first search failed: {}", error.message));
-        assert_eq!(first.data.segments[0].matches[0].id, target);
+        .expect("replace tags");
+        assert_eq!(replaced.items, vec!["beta"]);
 
-        let repeat = search(
-            State(state.clone()),
-            SessionId("session-1".to_string()),
-            Query(params()),
+        let fetched = get_node(State(state.clone()), Path(node.id))
+            .await
+            .expect("get node")
+            .data;
+        assert_eq!(fetched.tags, vec!["beta"]);
+    }
+
+    #[tokio::test]
+    async fn search_covers_description_and_content() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "decision").await;
+        let described =
+            new_node(&state, kind, "described", "refresh token rotation", "", &[]).await;
+        let bodied = new_node(
+            &state,
+            kind,
+            "bodied",
+            "unrelated",
+            "refresh token rotation",
+            &[],
+        )
+        .await;
+
+        let found = search_handler(
+            &state,
+            SearchParameters {
+                q: Some("refresh rotation".to_string()),
+                tags: None,
+                limit: None,
+                offset: None,
+            },
         )
         .await
-        .unwrap_or_else(|error| panic!("repeat search failed: {}", error.message));
-        assert!(repeat.data.segments[0].matches.is_empty());
-        assert_eq!(repeat.data.segments[0].total_matches, 1);
-        assert_eq!(repeat.data.segments[0].hidden, 1);
+        .expect("search");
+        let ids: Vec<i64> = found.data.items.iter().map(|hit| hit.node.id).collect();
+        assert!(ids.contains(&described.id));
+        assert!(ids.contains(&bodied.id));
+        assert_eq!(found.data.total, 2);
+    }
 
-        let other = search(
-            State(state.clone()),
-            SessionId("session-2".to_string()),
-            Query(params()),
+    #[tokio::test]
+    async fn search_requires_all_tags_and_accepts_tag_only_queries() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "decision").await;
+        let both = new_node(&state, kind, "both", "shared text", "", &["alpha", "beta"]).await;
+        new_node(&state, kind, "only-alpha", "shared text", "", &["alpha"]).await;
+
+        let tag_only = search_handler(
+            &state,
+            SearchParameters {
+                q: None,
+                tags: Some("alpha,beta".to_string()),
+                limit: None,
+                offset: None,
+            },
         )
         .await
-        .unwrap_or_else(|error| panic!("other session search failed: {}", error.message));
-        assert_eq!(other.data.segments[0].matches[0].id, target);
+        .expect("tag only search");
+        assert_eq!(tag_only.data.items.len(), 1);
+        assert_eq!(tag_only.data.items[0].node.id, both.id);
+
+        let combined = search_handler(
+            &state,
+            SearchParameters {
+                q: Some("shared".to_string()),
+                tags: Some("alpha".to_string()),
+                limit: None,
+                offset: None,
+            },
+        )
+        .await
+        .expect("combined search");
+        assert_eq!(combined.data.total, 2);
+    }
+
+    #[tokio::test]
+    async fn search_defaults_and_clamps_paging() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "decision").await;
+        for index in 0..3 {
+            new_node(&state, kind, &format!("n{index}"), "paged text", "", &[]).await;
+        }
+
+        let page = search_handler(
+            &state,
+            SearchParameters {
+                q: Some("paged".to_string()),
+                tags: None,
+                limit: Some(2),
+                offset: Some(1),
+            },
+        )
+        .await
+        .expect("paged search");
+        assert_eq!(page.data.items.len(), 2);
+        assert_eq!(page.data.total, 3);
+        assert_eq!(page.data.limit, 2);
+        assert_eq!(page.data.offset, 1);
+
+        let clamped = search_handler(
+            &state,
+            SearchParameters {
+                q: Some("paged".to_string()),
+                tags: None,
+                limit: Some(10_000),
+                offset: None,
+            },
+        )
+        .await
+        .expect("clamped search");
+        assert_eq!(clamped.data.limit, SearchConfig::default().max_limit);
+    }
+
+    #[tokio::test]
+    async fn search_rejects_an_empty_query_without_tags() {
+        let state = test_state().await;
+        let error = search_handler(
+            &state,
+            SearchParameters {
+                q: Some("   ".to_string()),
+                tags: None,
+                limit: None,
+                offset: None,
+            },
+        )
+        .await
+        .expect_err("empty search rejected");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn update_task_requires_a_task_node() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "decision").await;
+        let node = new_node(&state, kind, "a", "first", "", &[]).await;
+        let error = update_task(
+            State(state.clone()),
+            Path(node.id),
+            Json(UpdateTaskParameters {
+                name: Some("b".to_string()),
+                description: None,
+                content: None,
+            }),
+        )
+        .await
+        .expect_err("non-task rejected");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn unknown_node_tags_are_not_found() {
+        let state = test_state().await;
+        let error = get_node_tags(State(state.clone()), Path(999))
+            .await
+            .expect_err("missing node rejected");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
     }
 }

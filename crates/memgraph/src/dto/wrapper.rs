@@ -4,7 +4,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use utoipa::ToSchema;
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct ApiSuccess<T: Serialize> {
     #[serde(skip_serializing)]
     pub status: StatusCode,
@@ -18,7 +18,7 @@ impl<T: Serialize> IntoResponse for ApiSuccess<T> {
     }
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ApiList<T: Serialize> {
     #[serde(skip_serializing)]
     #[schema(ignore)]
@@ -32,7 +32,7 @@ impl<T: Serialize> IntoResponse for ApiList<T> {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct ApiError {
     #[serde(skip_serializing)]
     pub status: StatusCode,

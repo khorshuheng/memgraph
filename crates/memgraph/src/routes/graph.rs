@@ -11,11 +11,11 @@ pub(crate) fn routes(app_state: AppState) -> OpenApiRouter {
         .routes(routes!(create_plan))
         .routes(routes!(update_task))
         .routes(routes!(get_node, delete_node))
+        .routes(routes!(get_node_tags, replace_node_tags))
+        .routes(routes!(list_tags))
         .routes(routes!(list_neighbors))
         .routes(routes!(add_edge, remove_edge))
         .routes(routes!(search))
-        .routes(routes!(search_segment))
-        .routes(routes!(set_node_access_relevance))
         .routes(routes!(graph_health))
         .with_state(app_state)
 }

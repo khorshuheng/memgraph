@@ -6,8 +6,8 @@ use crate::model::{
     NeighborDirection as NeighborDirectionModel, Node as NodeModel, NodeFilter,
     NodeKind as NodeKindModel, Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft,
     PlanTask as PlanTaskModel, PlanTaskDraft, ReachFilter,
-    RelationDirection as RelationDirectionModel, RelationSummary as RelationSummaryModel,
-    SearchHit as SearchHitModel, SearchScope as SearchScopeModel, TaskDraft, TaskPatch,
+    RelationDirection as RelationDirectionModel, SearchScope as SearchScopeModel, TaskDraft,
+    TaskPatch,
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -129,16 +129,8 @@ pub struct CreateNodeParameters {
     pub name: String,
     pub description: String,
     pub content: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct NodeResponse {
-    pub id: i64,
-    pub kind_id: i64,
-    pub name: String,
-    pub description: String,
-    pub content: String,
-    pub updated_at: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 impl From<CreateNodeParameters> for NodeModel {
@@ -154,6 +146,31 @@ impl From<CreateNodeParameters> for NodeModel {
     }
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NodeResponse {
+    pub id: i64,
+    pub kind_id: i64,
+    pub name: String,
+    pub description: String,
+    pub content: String,
+    pub tags: Vec<String>,
+    pub updated_at: String,
+}
+
+impl NodeResponse {
+    pub fn with_tags(node: NodeModel, tags: Vec<String>) -> Self {
+        NodeResponse {
+            id: node.id,
+            kind_id: node.kind_id,
+            name: node.name,
+            description: node.description,
+            content: node.content,
+            tags,
+            updated_at: node.updated_at,
+        }
+    }
+}
+
 impl From<NodeModel> for NodeResponse {
     fn from(node: NodeModel) -> Self {
         NodeResponse {
@@ -162,6 +179,7 @@ impl From<NodeModel> for NodeResponse {
             name: node.name,
             description: node.description,
             content: node.content,
+            tags: Vec::new(),
             updated_at: node.updated_at,
         }
     }
@@ -257,92 +275,22 @@ pub struct NeighborResponse {
     pub node: NodeResponse,
 }
 
-impl From<NeighborModel> for NeighborResponse {
-    fn from(neighbor: NeighborModel) -> Self {
+impl NeighborResponse {
+    pub fn with_tags(neighbor: NeighborModel, tags: Vec<String>) -> Self {
         NeighborResponse {
             direction: match neighbor.direction {
                 RelationDirectionModel::Outgoing => "outgoing".to_string(),
                 RelationDirectionModel::Ingoing => "incoming".to_string(),
             },
             edge: neighbor.edge.into(),
-            node: neighbor.node.into(),
+            node: NodeResponse::with_tags(neighbor.node, tags),
         }
     }
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct RelationSummaryResponse {
-    pub direction: String,
-    pub edge_type_id: i64,
-    pub edge_type: String,
-    pub count: i64,
-}
-
-impl From<RelationSummaryModel> for RelationSummaryResponse {
-    fn from(summary: RelationSummaryModel) -> Self {
-        RelationSummaryResponse {
-            direction: match summary.direction {
-                RelationDirectionModel::Outgoing => "outgoing".to_string(),
-                RelationDirectionModel::Ingoing => "incoming".to_string(),
-            },
-            edge_type_id: summary.edge_type_id,
-            edge_type: summary.edge_type,
-            count: summary.count,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct SearchHitResponse {
-    pub id: i64,
-    pub kind_id: i64,
-    pub name: String,
-    pub summary: String,
-    pub confidence: f64,
-    pub matched_terms: Vec<String>,
-    pub relations: Vec<RelationSummaryResponse>,
-    pub resolved: bool,
-    pub access_id: Option<i64>,
-}
-
-impl SearchHitResponse {
-    pub fn new(hit: SearchHitModel, summary_chars: usize, access_id: Option<i64>) -> Self {
-        SearchHitResponse {
-            id: hit.node.id,
-            kind_id: hit.node.kind_id,
-            name: hit.node.name,
-            summary: truncate_summary(&hit.node.description, summary_chars),
-            confidence: hit.confidence,
-            matched_terms: hit.matched_terms,
-            relations: hit.relations.into_iter().map(Into::into).collect(),
-            resolved: hit.resolved,
-            access_id,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct SegmentResponse {
-    pub segment: String,
-    pub matches: Vec<SearchHitResponse>,
-    pub total_matches: usize,
-    pub hidden: usize,
-    pub excluded_resolved: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub probe: Option<String>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct SearchResponse {
-    pub segments: Vec<SegmentResponse>,
-}
-
-fn truncate_summary(text: &str, max_chars: usize) -> String {
-    let truncated: String = text.chars().take(max_chars).collect();
-    if text.chars().count() > max_chars {
-        format!("{truncated}…")
-    } else {
-        truncated
+impl From<NeighborModel> for NeighborResponse {
+    fn from(neighbor: NeighborModel) -> Self {
+        NeighborResponse::with_tags(neighbor, Vec::new())
     }
 }
 
@@ -361,60 +309,6 @@ impl From<SearchScope> for SearchScopeModel {
             SearchScope::Active => SearchScopeModel::Active,
             SearchScope::All => SearchScopeModel::All,
             SearchScope::Resolved => SearchScopeModel::Resolved,
-        }
-    }
-}
-
-impl SearchScope {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SearchScope::Active => "active",
-            SearchScope::All => "all",
-            SearchScope::Resolved => "resolved",
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct SearchParameters {
-    pub q: String,
-    #[serde(default)]
-    pub scope: SearchScope,
-    pub within: Option<i64>,
-    pub via: Option<String>,
-    pub descend: Option<String>,
-}
-
-impl SearchParameters {
-    pub fn reach(&self) -> ReachFilter {
-        ReachFilter {
-            within: self.within,
-            via: self.via.clone(),
-            descend: self.descend.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct SearchSegmentParameters {
-    pub segment: String,
-    #[serde(default)]
-    pub scope: SearchScope,
-    pub within: Option<i64>,
-    pub via: Option<String>,
-    pub descend: Option<String>,
-    pub limit: Option<usize>,
-    pub offset: Option<usize>,
-}
-
-impl SearchSegmentParameters {
-    pub fn reach(&self) -> ReachFilter {
-        ReachFilter {
-            within: self.within,
-            via: self.via.clone(),
-            descend: self.descend.clone(),
         }
     }
 }
@@ -443,9 +337,48 @@ impl From<ListNodesParameters> for NodeFilter {
     }
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SearchParameters {
+    pub q: Option<String>,
+    pub tags: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+impl SearchParameters {
+    pub fn tag_list(&self) -> Vec<String> {
+        self.tags
+            .as_deref()
+            .map(|tags| tags.split(',').map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SearchHitResponse {
+    pub node: NodeResponse,
+    pub score: f64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SearchResponse {
+    pub items: Vec<SearchHitResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TagUsageResponse {
+    pub tag: String,
+    pub node_count: i64,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct NodeAccessFeedbackParameters {
-    pub relevant: bool,
+pub struct ReplaceTagsParameters {
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

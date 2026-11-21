@@ -7,3 +7,5 @@ pub mod repository;
 pub mod routes;
 pub mod service;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod test_support;
