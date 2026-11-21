@@ -417,6 +417,16 @@ pub struct ListNodesParameters {
     pub via: Option<String>,
     pub descend: Option<String>,
     pub properties: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ListNodesResponse {
+    pub items: Vec<NodeResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
 }
 
 impl ListNodesParameters {

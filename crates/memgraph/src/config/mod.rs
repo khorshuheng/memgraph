@@ -15,7 +15,7 @@ port = 7373
 path = "memgraph.sqlite"
 max_connections = 5
 
-[search]
+[paging]
 default_limit = 20
 max_limit = 100
 "#;
@@ -39,12 +39,12 @@ pub struct DatabaseConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct SearchConfig {
+pub struct PagingConfig {
     pub default_limit: i64,
     pub max_limit: i64,
 }
 
-impl Default for SearchConfig {
+impl Default for PagingConfig {
     fn default() -> Self {
         Self {
             default_limit: 20,
@@ -57,7 +57,7 @@ impl Default for SearchConfig {
 pub struct AppConfig {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
-    pub search: SearchConfig,
+    pub paging: PagingConfig,
 }
 
 impl AppConfig {
@@ -134,7 +134,7 @@ mod tests {
             .expect("default config deserializes");
         assert_eq!(config.server.listener_address(), "127.0.0.1:7373");
         assert_eq!(config.database.max_connections, 5);
-        assert_eq!(config.search, SearchConfig::default());
+        assert_eq!(config.paging, PagingConfig::default());
     }
 
     #[test]

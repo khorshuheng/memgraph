@@ -121,6 +121,14 @@ impl Default for NodeFilter {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodePage {
+    pub items: Vec<Node>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Neighbor {
     pub direction: RelationDirection,

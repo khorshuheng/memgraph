@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
-    config::SearchConfig,
+    config::PagingConfig,
     model::{
         Edge, EdgeType, ImportDraft, ImportEdge, ImportNode, ImportRef, ImportReport, Neighbor,
-        NeighborDirection, Node, NodeFilter, NodeKind, NodeKindProperty, NodePatch, NodeRef,
-        PackDraft, PackEdgeType, PackNodeKind, PackProperty, PackReport, PendingEdge, PendingNode,
-        Plan, PlanDraft, PlanTask, PlanTaskDraft, PropertyType, ReachFilter, SearchPage, TagUsage,
-        TaskDraft, TaskPatch,
+        NeighborDirection, Node, NodeFilter, NodeKind, NodeKindProperty, NodePage, NodePatch,
+        NodeRef, PackDraft, PackEdgeType, PackNodeKind, PackProperty, PackReport, PendingEdge,
+        PendingNode, Plan, PlanDraft, PlanTask, PlanTaskDraft, PropertyType, ReachFilter,
+        SearchPage, TagUsage, TaskDraft, TaskPatch,
     },
     repository::graph::GraphRepository,
 };
@@ -21,15 +21,12 @@ const DESCEND_NONE: &str = "none";
 #[derive(Clone)]
 pub struct GraphService {
     repository: Arc<dyn GraphRepository>,
-    search_config: SearchConfig,
+    paging: PagingConfig,
 }
 
 impl GraphService {
-    pub fn new(repository: Arc<dyn GraphRepository>, search_config: SearchConfig) -> Self {
-        Self {
-            repository,
-            search_config,
-        }
+    pub fn new(repository: Arc<dyn GraphRepository>, paging: PagingConfig) -> Self {
+        Self { repository, paging }
     }
 
     pub async fn create_node_kind(&self, node_kind: &NodeKind) -> Result<NodeKind, ServiceError> {
@@ -306,6 +303,29 @@ impl GraphService {
             .list_nodes(&filter)
             .await
             .map_err(ServiceError::from)
+    }
+
+    pub async fn list_nodes_page(
+        &self,
+        filter: &NodeFilter,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<NodePage, ServiceError> {
+        let filter = self.normalize_node_filter(filter).await?;
+        let limit = limit
+            .unwrap_or(self.paging.default_limit)
+            .clamp(1, self.paging.max_limit);
+        let offset = offset.unwrap_or(0).max(0);
+        let (items, total) = self
+            .repository
+            .list_nodes_page(&filter, limit, offset)
+            .await?;
+        Ok(NodePage {
+            items,
+            total,
+            limit,
+            offset,
+        })
     }
 
     async fn normalize_node_filter(&self, filter: &NodeFilter) -> Result<NodeFilter, ServiceError> {
@@ -809,8 +829,8 @@ impl GraphService {
             ));
         }
         let limit = limit
-            .unwrap_or(self.search_config.default_limit)
-            .clamp(1, self.search_config.max_limit);
+            .unwrap_or(self.paging.default_limit)
+            .clamp(1, self.paging.max_limit);
         let offset = offset.unwrap_or(0).max(0);
         self.repository
             .search_nodes(fts_query.as_deref(), &tags, properties, limit, offset)
@@ -1492,7 +1512,7 @@ mod tests {
         migrate(&pool).await.expect("failed to migrate database");
         let repository: Arc<dyn GraphRepository> = Arc::new(SqliteGraphRepository::new(pool));
         crate::test_support::seed_vocabulary(&repository).await;
-        GraphService::new(repository, crate::config::SearchConfig::default())
+        GraphService::new(repository, crate::config::PagingConfig::default())
     }
 
     async fn service_with_pool() -> (GraphService, SqlitePool) {
@@ -1508,7 +1528,7 @@ mod tests {
             Arc::new(SqliteGraphRepository::new(pool.clone()));
         crate::test_support::seed_vocabulary(&repository).await;
         (
-            GraphService::new(repository, crate::config::SearchConfig::default()),
+            GraphService::new(repository, crate::config::PagingConfig::default()),
             pool,
         )
     }
@@ -3921,7 +3941,7 @@ mod tests {
         migrate(&pool).await.expect("failed to migrate database");
         let repository: Arc<dyn GraphRepository> = Arc::new(SqliteGraphRepository::new(pool));
         crate::test_support::seed_vocabulary(&repository).await;
-        GraphService::new(repository, crate::config::SearchConfig::default())
+        GraphService::new(repository, crate::config::PagingConfig::default())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6357,5 +6377,49 @@ mod tests {
             .find(|kind| kind.name == "widget")
             .unwrap();
         assert!(!kind.strict_properties);
+    }
+
+    #[tokio::test]
+    async fn list_nodes_page_slices_and_counts() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+        for index in 0..5 {
+            service
+                .create_node(&node(kind_id, &format!("p{index}"), ""), &[])
+                .await
+                .unwrap();
+        }
+
+        let page = service
+            .list_nodes_page(
+                &NodeFilter {
+                    kind: Some("person".to_string()),
+                    ..NodeFilter::default()
+                },
+                Some(2),
+                Some(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.total, 5);
+        assert_eq!(page.limit, 2);
+        assert_eq!(page.offset, 1);
+
+        let clamped = service
+            .list_nodes_page(&NodeFilter::default(), Some(10_000), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            clamped.limit,
+            crate::config::PagingConfig::default().max_limit
+        );
+
+        let beyond = service
+            .list_nodes_page(&NodeFilter::default(), Some(10), Some(100))
+            .await
+            .unwrap();
+        assert!(beyond.items.is_empty());
+        assert_eq!(beyond.total, 5);
     }
 }

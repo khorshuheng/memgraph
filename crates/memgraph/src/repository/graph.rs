@@ -98,6 +98,12 @@ pub trait GraphRepository: Send + Sync {
     async fn get_node(&self, id: i64) -> Result<Option<Node>, RepositoryError>;
     async fn delete_node(&self, id: i64) -> Result<bool, RepositoryError>;
     async fn list_nodes(&self, filter: &NodeFilter) -> Result<Vec<Node>, RepositoryError>;
+    async fn list_nodes_page(
+        &self,
+        filter: &NodeFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Node>, i64), RepositoryError>;
     async fn node_kinds_for_ids(&self, ids: &[i64]) -> Result<Vec<(i64, String)>, RepositoryError>;
     async fn node_id_by_natural_key(
         &self,
@@ -506,28 +512,46 @@ impl GraphRepository for SqliteGraphRepository {
     }
 
     async fn list_nodes(&self, filter: &NodeFilter) -> Result<Vec<Node>, RepositoryError> {
-        let scope = scope_clause(filter.scope);
-        let mut builder = QueryBuilder::new("");
+        self.list_nodes_page(filter, -1, 0)
+            .await
+            .map(|(items, _)| items)
+    }
+
+    async fn list_nodes_page(
+        &self,
+        filter: &NodeFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Node>, i64), RepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+
+        let mut count = QueryBuilder::new("");
         if filter.reach.within.is_some() {
-            push_reach_cte(&mut builder, &filter.reach);
+            push_reach_cte(&mut count, &filter.reach);
         }
-        builder.push(format!("SELECT {NODE_COLUMNS} FROM node n WHERE "));
-        if filter.reach.within.is_some() {
-            builder.push("n.id IN (SELECT id FROM reach) AND ");
-        }
-        builder.push("(");
-        builder.push_bind(filter.kind.clone());
-        builder.push(" IS NULL OR n.kind_id = (SELECT id FROM node_kind WHERE name = ");
-        builder.push_bind(filter.kind.clone());
-        builder.push("))");
-        builder.push(scope);
-        push_property_filters(&mut builder, &filter.properties);
-        builder.push(" ORDER BY n.id");
-        let rows = builder
-            .build_query_as::<Node>()
-            .fetch_all(&self.pool)
+        count.push("SELECT count(*) FROM node n WHERE 1 = 1");
+        push_node_conditions(&mut count, filter);
+        let total = count
+            .build_query_scalar::<i64>()
+            .fetch_one(&mut *transaction)
             .await?;
-        Ok(rows)
+
+        let mut page = QueryBuilder::new("");
+        if filter.reach.within.is_some() {
+            push_reach_cte(&mut page, &filter.reach);
+        }
+        page.push(format!("SELECT {NODE_COLUMNS} FROM node n WHERE 1 = 1"));
+        push_node_conditions(&mut page, filter);
+        page.push(" ORDER BY n.id LIMIT ");
+        page.push_bind(limit);
+        page.push(" OFFSET ");
+        page.push_bind(offset);
+        let items = page
+            .build_query_as::<Node>()
+            .fetch_all(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok((items, total))
     }
 
     async fn node_kinds_for_ids(&self, ids: &[i64]) -> Result<Vec<(i64, String)>, RepositoryError> {
@@ -2050,6 +2074,19 @@ fn push_reach_cte(builder: &mut QueryBuilder<Sqlite>, reach: &ReachFilter) {
     );
     builder.push_bind(reach.descend.clone());
     builder.push(")) ");
+}
+
+fn push_node_conditions(builder: &mut QueryBuilder<Sqlite>, filter: &NodeFilter) {
+    if filter.reach.within.is_some() {
+        builder.push(" AND n.id IN (SELECT id FROM reach)");
+    }
+    builder.push(" AND (");
+    builder.push_bind(filter.kind.clone());
+    builder.push(" IS NULL OR n.kind_id = (SELECT id FROM node_kind WHERE name = ");
+    builder.push_bind(filter.kind.clone());
+    builder.push("))");
+    builder.push(scope_clause(filter.scope));
+    push_property_filters(builder, &filter.properties);
 }
 
 fn push_property_filters(

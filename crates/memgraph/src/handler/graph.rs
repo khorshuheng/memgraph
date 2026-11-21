@@ -10,10 +10,11 @@ use crate::{
             ApplyPackParameters, CreateEdgeParameters, CreateEdgeTypeParameters,
             CreateNodeKindParameters, CreateNodeParameters, CreatePlanParameters,
             CreateTaskParameters, DeleteEdgeParameters, EdgeTypeResponse, ImportParameters,
-            ImportReportResponse, ListNodesParameters, NeighborParameters, NeighborResponse,
-            NodeKindResponse, NodeResponse, PackReportResponse, PlanResponse, PlanTaskResponse,
-            ReplaceTagsParameters, SearchHitResponse, SearchParameters, SearchResponse,
-            TagUsageResponse, UpdateEdgeParameters, UpdateNodeParameters, UpdateTaskParameters,
+            ImportReportResponse, ListNodesParameters, ListNodesResponse, NeighborParameters,
+            NeighborResponse, NodeKindResponse, NodeResponse, PackReportResponse, PlanResponse,
+            PlanTaskResponse, ReplaceTagsParameters, SearchHitResponse, SearchParameters,
+            SearchResponse, TagUsageResponse, UpdateEdgeParameters, UpdateNodeParameters,
+            UpdateTaskParameters,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
@@ -244,34 +245,45 @@ pub async fn import_graph(
     get,
     path = "/nodes",
     params(ListNodesParameters),
-    responses((status = 200, description = "List nodes", body = ApiList<NodeResponse>))
+    responses((status = 200, description = "List nodes", body = ListNodesResponse))
 )]
 pub async fn list_nodes(
     State(state): State<AppState>,
     Query(params): Query<ListNodesParameters>,
-) -> Result<ApiList<NodeResponse>, ApiError> {
+) -> Result<ApiSuccess<ListNodesResponse>, ApiError> {
+    let limit = params.limit;
+    let offset = params.offset;
     let properties = params.property_filter().map_err(|message| ApiError {
         status: StatusCode::UNPROCESSABLE_ENTITY,
         message,
     })?;
     let mut filter: NodeFilter = params.into();
     filter.properties = properties;
-    let nodes = state.graph_service.list_nodes(&filter).await?;
-    let ids: Vec<i64> = nodes.iter().map(|node| node.id).collect();
+    let page = state
+        .graph_service
+        .list_nodes_page(&filter, limit, offset)
+        .await?;
+    let ids: Vec<i64> = page.items.iter().map(|node| node.id).collect();
     let mut tags = state.graph_service.node_tags_for_ids(&ids).await?;
     let mut properties = state.graph_service.node_properties_for_ids(&ids).await?;
-    Ok(ApiList {
+    Ok(ApiSuccess {
         status: StatusCode::OK,
-        items: nodes
-            .into_iter()
-            .map(|node| {
-                let node_tags = tags.remove(&node.id).unwrap_or_default();
-                let node_properties = properties
-                    .remove(&node.id)
-                    .unwrap_or_else(|| serde_json::json!({}));
-                NodeResponse::with_tags_and_properties(node, node_tags, node_properties)
-            })
-            .collect(),
+        data: ListNodesResponse {
+            items: page
+                .items
+                .into_iter()
+                .map(|node| {
+                    let node_tags = tags.remove(&node.id).unwrap_or_default();
+                    let node_properties = properties
+                        .remove(&node.id)
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    NodeResponse::with_tags_and_properties(node, node_tags, node_properties)
+                })
+                .collect(),
+            total: page.total,
+            limit: page.limit,
+            offset: page.offset,
+        },
     })
 }
 
@@ -601,7 +613,7 @@ pub async fn graph_health(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, DatabaseConfig, SearchConfig, ServerConfig};
+    use crate::config::{AppConfig, DatabaseConfig, PagingConfig, ServerConfig};
     use crate::dto::graph::{
         CreatePlanGoalParameters, CreatePlanTaskParameters, ImportConflictParameters,
         ImportNodeParameters, NeighborDirection, PackEdgeTypeParameters, PackNodeKindParameters,
@@ -619,7 +631,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 max_connections: 1,
             },
-            search: SearchConfig::default(),
+            paging: PagingConfig::default(),
         })
         .await
     }
@@ -711,12 +723,15 @@ mod tests {
                 via: None,
                 descend: None,
                 properties: None,
+                limit: None,
+                offset: None,
             }),
         )
         .await
         .expect("list nodes");
-        assert_eq!(listed.items.len(), 2);
-        assert!(listed.items.iter().all(|node| !node.tags.is_empty()));
+        assert_eq!(listed.data.items.len(), 2);
+        assert!(listed.data.items.iter().all(|node| !node.tags.is_empty()));
+        assert_eq!(listed.data.total, 2);
 
         let tags = list_tags(State(state.clone())).await.expect("list tags");
         assert_eq!(tags.items[0].tag, "alpha");
@@ -855,7 +870,7 @@ mod tests {
         )
         .await
         .expect("clamped search");
-        assert_eq!(clamped.data.limit, SearchConfig::default().max_limit);
+        assert_eq!(clamped.data.limit, PagingConfig::default().max_limit);
     }
 
     #[tokio::test]
@@ -1091,12 +1106,14 @@ mod tests {
                 via: None,
                 descend: None,
                 properties: None,
+                limit: None,
+                offset: None,
             }),
         )
         .await
         .expect("list");
         assert_eq!(
-            listed.items[0].properties,
+            listed.data.items[0].properties,
             serde_json::json!({"status": "verified"})
         );
 
@@ -1158,12 +1175,14 @@ mod tests {
                 via: None,
                 descend: None,
                 properties: Some(r#"{"status":"verified"}"#.to_string()),
+                limit: None,
+                offset: None,
             }),
         )
         .await
         .expect("filtered list");
-        assert_eq!(listed.items.len(), 1);
-        assert_eq!(listed.items[0].name, "verified");
+        assert_eq!(listed.data.items.len(), 1);
+        assert_eq!(listed.data.items[0].name, "verified");
 
         let found = search(
             State(state.clone()),
@@ -1189,6 +1208,8 @@ mod tests {
                 via: None,
                 descend: None,
                 properties: Some("[1]".to_string()),
+                limit: None,
+                offset: None,
             }),
         )
         .await
@@ -1534,10 +1555,61 @@ mod tests {
                 via: None,
                 descend: None,
                 properties: Some(r#"{"a\"b":1}"#.to_string()),
+                limit: None,
+                offset: None,
             }),
         )
         .await
         .expect_err("quote key rejected");
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn list_nodes_paginates() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "decision").await;
+        for index in 0..5 {
+            new_node(&state, kind, &format!("p{index}"), "", "", &[]).await;
+        }
+
+        let page = list_nodes(
+            State(state.clone()),
+            Query(ListNodesParameters {
+                kind: None,
+                scope: None,
+                within: None,
+                via: None,
+                descend: None,
+                properties: None,
+                limit: Some(2),
+                offset: Some(1),
+            }),
+        )
+        .await
+        .expect("page");
+        assert_eq!(page.data.items.len(), 2);
+        assert_eq!(page.data.total, 5);
+        assert_eq!(page.data.limit, 2);
+        assert_eq!(page.data.offset, 1);
+
+        let clamped = list_nodes(
+            State(state.clone()),
+            Query(ListNodesParameters {
+                kind: None,
+                scope: None,
+                within: None,
+                via: None,
+                descend: None,
+                properties: None,
+                limit: Some(10_000),
+                offset: None,
+            }),
+        )
+        .await
+        .expect("clamped");
+        assert_eq!(
+            clamped.data.limit,
+            crate::config::PagingConfig::default().max_limit
+        );
     }
 }
