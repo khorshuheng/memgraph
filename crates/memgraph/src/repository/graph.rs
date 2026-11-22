@@ -2688,6 +2688,7 @@ fn push_node_query_order(builder: &mut QueryBuilder<Sqlite>, order: &[crate::mod
             SortDirection::Desc => " DESC",
         });
     }
+    builder.push(", n.id ASC");
 }
 
 fn push_edge_query_conditions(builder: &mut QueryBuilder<Sqlite>, query: &QueryRequest) {
@@ -2712,7 +2713,7 @@ fn push_edge_query_conditions(builder: &mut QueryBuilder<Sqlite>, query: &QueryR
 fn push_edge_query_order(builder: &mut QueryBuilder<Sqlite>, order: &[crate::model::QueryOrder]) {
     builder.push(" ORDER BY ");
     if order.is_empty() {
-        builder.push("e.source ASC");
+        builder.push("e.source ASC, e.edge_type_id ASC, e.destination ASC");
         return;
     }
     for (index, entry) in order.iter().enumerate() {
@@ -2731,6 +2732,7 @@ fn push_edge_query_order(builder: &mut QueryBuilder<Sqlite>, order: &[crate::mod
             SortDirection::Desc => " DESC",
         });
     }
+    builder.push(", e.source ASC, e.edge_type_id ASC, e.destination ASC");
 }
 
 async fn node_tag_map(

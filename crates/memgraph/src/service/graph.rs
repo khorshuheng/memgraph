@@ -1218,16 +1218,13 @@ impl GraphService {
             .unwrap_or(self.paging.default_limit)
             .clamp(1, self.paging.max_limit);
         let offset = request.offset.unwrap_or(0).max(0);
-        if let Some(since) = &request.since
-            && since.trim().is_empty()
-        {
-            return Err(ServiceError::UnprocessableEntity(
-                "since must not be blank".to_string(),
-            ));
+        let mut request = request.clone();
+        if let Some(since) = &request.since {
+            request.since = Some(validate_since(since)?);
         }
         match request.select {
-            QuerySelect::Nodes => self.query_nodes(request, limit, offset).await,
-            QuerySelect::Edges => self.query_edges(request, limit, offset).await,
+            QuerySelect::Nodes => self.query_nodes(&request, limit, offset).await,
+            QuerySelect::Edges => self.query_edges(&request, limit, offset).await,
         }
     }
 
@@ -1518,6 +1515,85 @@ fn assemble_work_page(snapshot: WorkSnapshot) -> WorkPage {
         limit: snapshot.limit,
         offset: snapshot.offset,
     }
+}
+
+fn validate_since(raw: &str) -> Result<String, ServiceError> {
+    let since = raw.trim();
+    if since.is_empty() {
+        return Err(ServiceError::UnprocessableEntity(
+            "since must not be blank".to_string(),
+        ));
+    }
+    let (date, time) = match since.split_once('T').or_else(|| since.split_once(' ')) {
+        Some((date, time)) => (date, Some(time)),
+        None => (since, None),
+    };
+    if !valid_date(date) || time.is_some_and(|time| !valid_time(time)) {
+        return Err(ServiceError::UnprocessableEntity(
+            "since must be YYYY-MM-DD or an RFC 3339 timestamp".to_string(),
+        ));
+    }
+    Ok(since.to_string())
+}
+
+fn valid_date(date: &str) -> bool {
+    let bytes = date.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if bytes
+        .iter()
+        .enumerate()
+        .any(|(index, byte)| index != 4 && index != 7 && !byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let month = u32::from(bytes[5] - b'0') * 10 + u32::from(bytes[6] - b'0');
+    let day = u32::from(bytes[8] - b'0') * 10 + u32::from(bytes[9] - b'0');
+    (1..=12).contains(&month) && (1..=31).contains(&day)
+}
+
+fn valid_time(time: &str) -> bool {
+    let bytes = time.as_bytes();
+    if bytes.len() < 8 || bytes[2] != b':' || bytes[5] != b':' {
+        return false;
+    }
+    if [0, 1, 3, 4, 6, 7]
+        .iter()
+        .any(|index| !bytes[*index].is_ascii_digit())
+    {
+        return false;
+    }
+    let hour = u32::from(bytes[0] - b'0') * 10 + u32::from(bytes[1] - b'0');
+    let minute = u32::from(bytes[3] - b'0') * 10 + u32::from(bytes[4] - b'0');
+    let second = u32::from(bytes[6] - b'0') * 10 + u32::from(bytes[7] - b'0');
+    if hour > 23 || minute > 59 || second > 59 {
+        return false;
+    }
+    let mut rest = &time[8..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        rest = &fraction[digits..];
+    }
+    if rest.is_empty() || rest == "Z" || rest == "z" {
+        return true;
+    }
+    let rest = rest.as_bytes();
+    if rest.len() != 6
+        || (rest[0] != b'+' && rest[0] != b'-')
+        || rest[3] != b':'
+        || [1, 2, 4, 5]
+            .iter()
+            .any(|index| !rest[*index].is_ascii_digit())
+    {
+        return false;
+    }
+    let offset_hour = u32::from(rest[1] - b'0') * 10 + u32::from(rest[2] - b'0');
+    let offset_minute = u32::from(rest[4] - b'0') * 10 + u32::from(rest[5] - b'0');
+    offset_hour <= 23 && offset_minute <= 59
 }
 
 fn query_fields(
@@ -7968,6 +8044,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(service.query(&future).await.unwrap().total, 0);
+
+        let mut paged = Vec::new();
+        for offset in 0..2 {
+            let page = service
+                .query(&QueryRequest {
+                    kind: Some("task".to_string()),
+                    order: vec![QueryOrder {
+                        field: "updated_at".to_string(),
+                        direction: SortDirection::Desc,
+                    }],
+                    fields: vec!["id".to_string()],
+                    limit: Some(1),
+                    offset: Some(offset),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            paged.extend(page.items.iter().map(|item| item["id"].clone()));
+        }
+        assert_eq!(paged.len(), 2);
+        assert_ne!(
+            paged[0], paged[1],
+            "tied timestamps must page deterministically"
+        );
     }
 
     #[tokio::test]
@@ -8098,6 +8198,38 @@ mod tests {
             blank_since,
             ServiceError::UnprocessableEntity(message) if message.contains("since")
         ));
+
+        for bad in [
+            "zzz",
+            "2026-13-01",
+            "2026-11-22T99:00:00Z",
+            "2026-11-22T10:00:00+99:00",
+        ] {
+            let error = service
+                .query(&QueryRequest {
+                    since: Some(bad.to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ServiceError::UnprocessableEntity(message) if message.contains("RFC 3339")
+            ));
+        }
+        for good in [
+            "2026-11-22",
+            "2026-11-22T10:00:00Z",
+            "2026-11-22T10:00:00.123+08:00",
+        ] {
+            service
+                .query(&QueryRequest {
+                    since: Some(good.to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
 
         let unknown_edge = service
             .query(&QueryRequest {

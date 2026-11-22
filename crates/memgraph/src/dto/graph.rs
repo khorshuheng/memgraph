@@ -1529,7 +1529,10 @@ pub struct QueryWhereParameters {
 #[schema(
     description = "A read-only query. select=nodes supports kind, name, name_contains, tags, \
                    properties, has_edge, not_has_edge, within/via/descend and since; \
-                   select=edges supports edge_type, source, destination and since."
+                   select=edges supports edge_type, source, destination and since. since accepts \
+                   YYYY-MM-DD or an RFC 3339 timestamp. within walks every edge type in both \
+                   directions from the node unless via is set, then descends via descend \
+                   (default part_of)."
 )]
 pub struct QueryParameters {
     #[serde(default)]
