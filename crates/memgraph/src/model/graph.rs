@@ -259,6 +259,13 @@ pub struct GraphExport {
     pub edges: Vec<GraphExportEdge>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeWithMetadata {
+    pub node: Node,
+    pub tags: Vec<String>,
+    pub properties: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackStatus {
     Created,

@@ -15,6 +15,8 @@ pub enum ServiceError {
     UnprocessableEntity(String),
     #[error("service unavailable: {0}")]
     Unavailable(String),
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
 }
 
 impl From<RepositoryError> for ServiceError {
@@ -25,6 +27,7 @@ impl From<RepositoryError> for ServiceError {
             RepositoryError::ForeignKeyViolation(err) => ServiceError::UnprocessableEntity(err),
             RepositoryError::ContractViolation(err) => ServiceError::UnprocessableEntity(err),
             RepositoryError::Busy(err) => ServiceError::Unavailable(err),
+            RepositoryError::LimitExceeded(err) => ServiceError::PayloadTooLarge(err),
             err => ServiceError::InternalError(err.to_string()),
         }
     }
@@ -51,6 +54,10 @@ impl From<ServiceError> for ApiError {
             },
             ServiceError::Unavailable(_) => ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
+                message: error.to_string(),
+            },
+            ServiceError::PayloadTooLarge(_) => ApiError {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
                 message: error.to_string(),
             },
         }

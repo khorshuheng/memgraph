@@ -21,6 +21,8 @@ pub enum RepositoryError {
     ContractViolation(String),
     #[error("database busy: {0}")]
     Busy(String),
+    #[error("limit exceeded: {0}")]
+    LimitExceeded(String),
 }
 
 impl From<sqlx::Error> for RepositoryError {

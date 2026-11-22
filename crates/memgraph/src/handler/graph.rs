@@ -288,22 +288,33 @@ pub async fn list_nodes(
         message,
     })?;
     if let Some(ids) = ids {
+        if params.kind.is_some()
+            || params.scope.is_some()
+            || params.within.is_some()
+            || params.via.is_some()
+            || params.descend.is_some()
+            || params.properties.is_some()
+            || params.limit.is_some()
+            || params.offset.is_some()
+        {
+            return Err(ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                message: "ids cannot be combined with other node filters".to_string(),
+            });
+        }
         let nodes = state.graph_service.nodes_by_ids(&ids).await?;
-        let found: Vec<i64> = nodes.iter().map(|node| node.id).collect();
-        let mut tags = state.graph_service.node_tags_for_ids(&found).await?;
-        let mut properties = state.graph_service.node_properties_for_ids(&found).await?;
         let total = nodes.len() as i64;
         return Ok(ApiSuccess {
             status: StatusCode::OK,
             data: ListNodesResponse {
                 items: nodes
                     .into_iter()
-                    .map(|node| {
-                        let node_tags = tags.remove(&node.id).unwrap_or_default();
-                        let node_properties = properties
-                            .remove(&node.id)
-                            .unwrap_or_else(|| serde_json::json!({}));
-                        NodeResponse::with_tags_and_properties(node, node_tags, node_properties)
+                    .map(|item| {
+                        NodeResponse::with_tags_and_properties(
+                            item.node,
+                            item.tags,
+                            item.properties,
+                        )
                     })
                     .collect(),
                 total,
@@ -782,7 +793,10 @@ pub async fn search(
     tag = "Graph",
     get,
     path = "/graph/export",
-    responses((status = 200, description = "Compact node and edge snapshot", body = GraphExportResponse))
+    responses(
+        (status = 200, description = "Compact node and edge snapshot", body = GraphExportResponse),
+        (status = 413, description = "Graph exceeds the export limits")
+    )
 )]
 pub async fn graph_export(
     State(state): State<AppState>,
@@ -2172,6 +2186,25 @@ mod tests {
             vec![second.id, first.id]
         );
         assert_eq!(batch.total, 2);
+        assert_eq!(batch.items[1].tags, vec!["math"]);
+
+        let error = list_nodes(
+            State(state.clone()),
+            Query(ListNodesParameters {
+                kind: Some("person".to_string()),
+                scope: None,
+                within: None,
+                via: None,
+                descend: None,
+                ids: Some(first.id.to_string()),
+                properties: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect_err("ids cannot be combined with filters");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
 
         let edges = list_edges(
             State(state.clone()),

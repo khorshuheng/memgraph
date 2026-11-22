@@ -6,10 +6,10 @@ use crate::{
     model::{
         ChangeDraft, Edge, EdgeFilter, EdgePage, EdgeType, GraphExport, ImportDraft, ImportEdge,
         ImportNode, ImportRef, ImportReport, Neighbor, NeighborDirection, Node, NodeFilter,
-        NodeKind, NodeKindProperty, NodePage, NodePatch, NodeRef, PackDraft, PackEdgeType,
-        PackNodeKind, PackProperty, PackReport, PendingEdge, PendingNode, Plan, PlanDraft,
-        PlanTask, PlanTaskDraft, PropertyType, ReachFilter, SearchPage, TagUsage, TaskDraft,
-        TaskPatch, WorkDependency, WorkFilter, WorkPage, WorkRef, WorkStatus, WorkTask,
+        NodeKind, NodeKindProperty, NodePage, NodePatch, NodeRef, NodeWithMetadata, PackDraft,
+        PackEdgeType, PackNodeKind, PackProperty, PackReport, PendingEdge, PendingNode, Plan,
+        PlanDraft, PlanTask, PlanTaskDraft, PropertyType, ReachFilter, SearchPage, TagUsage,
+        TaskDraft, TaskPatch, WorkDependency, WorkFilter, WorkPage, WorkRef, WorkStatus, WorkTask,
     },
     repository::graph::{GraphRepository, WorkSnapshot},
 };
@@ -1044,7 +1044,7 @@ impl GraphService {
         self.repository.list_tags().await.map_err(Into::into)
     }
 
-    pub async fn nodes_by_ids(&self, ids: &[i64]) -> Result<Vec<Node>, ServiceError> {
+    pub async fn nodes_by_ids(&self, ids: &[i64]) -> Result<Vec<NodeWithMetadata>, ServiceError> {
         let mut unique = Vec::new();
         let mut seen = HashSet::new();
         for id in ids {
@@ -1057,16 +1057,28 @@ impl GraphService {
                 "at most {MAX_BATCH_IDS} ids are allowed"
             )));
         }
-        let mut by_id: HashMap<i64, Node> = self
-            .repository
-            .nodes_by_ids(&unique)
-            .await?
+        let snapshot = self.repository.nodes_snapshot(&unique).await?;
+        let mut by_id: HashMap<i64, Node> = snapshot
+            .nodes
             .into_iter()
             .map(|node| (node.id, node))
             .collect();
+        let mut tags = snapshot.tags;
+        let mut properties = snapshot.properties;
         Ok(unique
             .into_iter()
-            .filter_map(|id| by_id.remove(&id))
+            .filter_map(|id| {
+                let node = by_id.remove(&id)?;
+                let tags = tags.remove(&id).unwrap_or_default();
+                let raw = properties.remove(&id).unwrap_or_else(|| "{}".to_string());
+                let properties =
+                    serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+                Some(NodeWithMetadata {
+                    node,
+                    tags,
+                    properties,
+                })
+            })
             .collect())
     }
 
@@ -7478,7 +7490,11 @@ mod tests {
     async fn nodes_by_ids_preserve_request_order_and_dedupe() {
         let service = service().await;
         let kind = seed_person(&service).await;
-        let first = service.upsert_node(&node(kind, "first", "")).await.unwrap();
+        let first = service
+            .create_node(&node(kind, "first", ""), &["Math".to_string()])
+            .await
+            .unwrap()
+            .0;
         let second = service
             .upsert_node(&node(kind, "second", ""))
             .await
@@ -7489,14 +7505,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+            nodes.iter().map(|item| item.node.id).collect::<Vec<_>>(),
             vec![second.id, first.id]
         );
+        assert!(nodes[0].tags.is_empty());
+        assert_eq!(nodes[1].tags, vec!["math"]);
+        assert_eq!(nodes[1].properties, serde_json::json!({}));
 
         let too_many: Vec<i64> = (0..201).collect();
         assert!(matches!(
             service.nodes_by_ids(&too_many).await,
             Err(ServiceError::UnprocessableEntity(message)) if message.contains("at most 200")
+        ));
+    }
+
+    #[tokio::test]
+    async fn export_rejects_graphs_over_the_limit() {
+        let (service, pool) = service_with_pool().await;
+        let task_kind = seeded_kind(&service, "task").await;
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 50001) \
+             INSERT INTO node (kind_id, name, description, content) \
+             SELECT ?, 'bulk export ' || i, '', '' FROM n",
+        )
+        .bind(task_kind)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            service.export_graph().await,
+            Err(ServiceError::PayloadTooLarge(message)) if message.contains("50001")
         ));
     }
 

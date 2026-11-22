@@ -21,6 +21,8 @@ const NODE_KIND_COLUMNS: &str =
 const EDGE_TYPE_COLUMNS: &str = "id, name, description, resolves, single_outgoing, acyclic, source_kinds, destination_kinds, \
      updated_at";
 const NODE_COLUMNS: &str = "id, kind_id, name, description, content, updated_at";
+const MAX_EXPORT_NODES: i64 = 50_000;
+const MAX_EXPORT_EDGES: i64 = 200_000;
 const OUTGOING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
     e.properties AS edge_properties, \
     n.id, n.kind_id, n.name, n.description, n.content, n.updated_at \
@@ -105,6 +107,13 @@ pub struct WorkSnapshot {
     pub offset: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct NodeBatchSnapshot {
+    pub nodes: Vec<Node>,
+    pub tags: HashMap<i64, Vec<String>>,
+    pub properties: HashMap<i64, String>,
+}
+
 #[async_trait]
 pub trait GraphRepository: Send + Sync {
     async fn create_node_kind(&self, node_kind: &NodeKind) -> Result<NodeKind, RepositoryError>;
@@ -169,7 +178,7 @@ pub trait GraphRepository: Send + Sync {
         ids: &[i64],
     ) -> Result<HashMap<i64, Vec<NodeKindProperty>>, RepositoryError>;
     async fn list_tags(&self) -> Result<Vec<TagUsage>, RepositoryError>;
-    async fn nodes_by_ids(&self, ids: &[i64]) -> Result<Vec<Node>, RepositoryError>;
+    async fn nodes_snapshot(&self, ids: &[i64]) -> Result<NodeBatchSnapshot, RepositoryError>;
     async fn list_edges(
         &self,
         filter: &EdgeFilter,
@@ -853,22 +862,33 @@ impl GraphRepository for SqliteGraphRepository {
         }
     }
 
-    async fn nodes_by_ids(&self, ids: &[i64]) -> Result<Vec<Node>, RepositoryError> {
+    async fn nodes_snapshot(&self, ids: &[i64]) -> Result<NodeBatchSnapshot, RepositoryError> {
         if ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(NodeBatchSnapshot {
+                nodes: Vec::new(),
+                tags: HashMap::new(),
+                properties: HashMap::new(),
+            });
         }
-        let mut builder =
-            QueryBuilder::new(format!("SELECT {NODE_COLUMNS} FROM node WHERE id IN ("));
-        let mut separated = builder.separated(", ");
-        for id in ids {
-            separated.push_bind(*id);
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN")
+            .execute(&mut *connection)
+            .await
+            .map_err(RepositoryError::from)?;
+        let result = node_batch_items(&mut connection, ids).await;
+        match result {
+            Ok(snapshot) => {
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(RepositoryError::from(error));
+                }
+                Ok(snapshot)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
         }
-        builder.push(") ORDER BY id");
-        let rows = builder
-            .build_query_as::<Node>()
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows)
     }
 
     async fn list_edges(
@@ -907,6 +927,19 @@ impl GraphRepository for SqliteGraphRepository {
             .execute(&mut *connection)
             .await
             .map_err(RepositoryError::from)?;
+        let node_count = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM node")
+            .fetch_one(&mut *connection)
+            .await?;
+        let edge_count = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM edge")
+            .fetch_one(&mut *connection)
+            .await?;
+        if node_count > MAX_EXPORT_NODES || edge_count > MAX_EXPORT_EDGES {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+            return Err(RepositoryError::LimitExceeded(format!(
+                "graph has {node_count} nodes and {edge_count} edges; export is limited to \
+                 {MAX_EXPORT_NODES} nodes and {MAX_EXPORT_EDGES} edges"
+            )));
+        }
         match graph_export_items(&mut connection).await {
             Ok(export) => {
                 if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
@@ -2457,6 +2490,63 @@ async fn graph_export_items(
         })
         .collect();
     Ok(GraphExport { nodes, edges })
+}
+
+async fn node_batch_items(
+    connection: &mut SqliteConnection,
+    ids: &[i64],
+) -> Result<NodeBatchSnapshot, RepositoryError> {
+    let mut node_query =
+        QueryBuilder::new(format!("SELECT {NODE_COLUMNS} FROM node WHERE id IN ("));
+    {
+        let mut separated = node_query.separated(", ");
+        for id in ids {
+            separated.push_bind(*id);
+        }
+    }
+    node_query.push(") ORDER BY id");
+    let nodes = node_query
+        .build_query_as::<Node>()
+        .fetch_all(&mut *connection)
+        .await?;
+
+    let mut tag_query = QueryBuilder::new("SELECT node_id, tag FROM node_tag WHERE node_id IN (");
+    {
+        let mut separated = tag_query.separated(", ");
+        for id in ids {
+            separated.push_bind(*id);
+        }
+    }
+    tag_query.push(") ORDER BY node_id, tag");
+    let tag_rows = tag_query
+        .build_query_as::<(i64, String)>()
+        .fetch_all(&mut *connection)
+        .await?;
+    let mut tags: HashMap<i64, Vec<String>> = HashMap::new();
+    for (node_id, tag) in tag_rows {
+        tags.entry(node_id).or_default().push(tag);
+    }
+
+    let mut property_query = QueryBuilder::new("SELECT id, properties FROM node WHERE id IN (");
+    {
+        let mut separated = property_query.separated(", ");
+        for id in ids {
+            separated.push_bind(*id);
+        }
+    }
+    property_query.push(") ORDER BY id");
+    let properties = property_query
+        .build_query_as::<(i64, String)>()
+        .fetch_all(&mut *connection)
+        .await?
+        .into_iter()
+        .collect();
+
+    Ok(NodeBatchSnapshot {
+        nodes,
+        tags,
+        properties,
+    })
 }
 
 async fn node_tags_in(
