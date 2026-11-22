@@ -4,12 +4,12 @@ use std::sync::Arc;
 use crate::{
     config::PagingConfig,
     model::{
-        Edge, EdgeType, ImportDraft, ImportEdge, ImportNode, ImportRef, ImportReport, Neighbor,
-        NeighborDirection, Node, NodeFilter, NodeKind, NodeKindProperty, NodePage, NodePatch,
-        NodeRef, PackDraft, PackEdgeType, PackNodeKind, PackProperty, PackReport, PendingEdge,
-        PendingNode, Plan, PlanDraft, PlanTask, PlanTaskDraft, PropertyType, ReachFilter,
-        SearchPage, TagUsage, TaskDraft, TaskPatch, WorkDependency, WorkFilter, WorkRef,
-        WorkStatus, WorkTask,
+        ChangeDraft, Edge, EdgeType, ImportDraft, ImportEdge, ImportNode, ImportRef, ImportReport,
+        Neighbor, NeighborDirection, Node, NodeFilter, NodeKind, NodeKindProperty, NodePage,
+        NodePatch, NodeRef, PackDraft, PackEdgeType, PackNodeKind, PackProperty, PackReport,
+        PendingEdge, PendingNode, Plan, PlanDraft, PlanTask, PlanTaskDraft, PropertyType,
+        ReachFilter, SearchPage, TagUsage, TaskDraft, TaskPatch, WorkDependency, WorkFilter,
+        WorkRef, WorkStatus, WorkTask,
     },
     repository::graph::{GraphRepository, WorkTaskRow},
 };
@@ -711,6 +711,117 @@ impl GraphService {
             .insert_nodes_with_edges(&nodes, &edges)
             .await?;
         Ok(assemble_plan(draft, created))
+    }
+
+    pub async fn create_change(&self, draft: &ChangeDraft) -> Result<Node, ServiceError> {
+        let commit = node_name(&draft.commit)?;
+        let title = draft.title.trim();
+        if title.is_empty() {
+            return Err(ServiceError::UnprocessableEntity(
+                "title must not be empty".to_string(),
+            ));
+        }
+        let mut tasks: Vec<i64> = Vec::new();
+        for task in &draft.tasks {
+            if !tasks.contains(task) {
+                tasks.push(*task);
+            }
+        }
+        let mut files: Vec<String> = Vec::new();
+        for file in &draft.files {
+            let file = file.trim();
+            if file.is_empty() {
+                return Err(ServiceError::UnprocessableEntity(
+                    "file name must not be empty".to_string(),
+                ));
+            }
+            if !files.iter().any(|existing| existing == file) {
+                files.push(file.to_string());
+            }
+        }
+        if tasks.is_empty() && files.is_empty() {
+            return Err(ServiceError::UnprocessableEntity(
+                "provide at least one task or file for the change".to_string(),
+            ));
+        }
+
+        let change_kind = self.kind_id("change").await?;
+        if let Some(existing) = self
+            .repository
+            .node_id_by_natural_key(change_kind, &commit)
+            .await?
+        {
+            return Err(ServiceError::Conflict(format!(
+                "a change named '{commit}' already exists with id {existing}"
+            )));
+        }
+
+        let kinds = self.node_kind_names(&tasks).await?;
+        for task in &tasks {
+            let kind = kinds.get(task).ok_or(ServiceError::EntityNotFound)?;
+            if kind != "task" {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "node {task} is not a task"
+                )));
+            }
+        }
+
+        let file_kind = self.kind_id("file").await?;
+        let mut file_ids = Vec::new();
+        for file in &files {
+            let id = self
+                .repository
+                .node_id_by_natural_key(file_kind, file)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::UnprocessableEntity(format!("file '{file}' is not in the graph"))
+                })?;
+            file_ids.push(id);
+        }
+
+        let edge_types = self.repository.list_edge_types().await?;
+        let implements = edge_type_ref(&edge_types, "implements")?;
+        let modifies = edge_type_ref(&edge_types, "modifies")?;
+
+        let tags = match &draft.tags {
+            Some(tags) => Some(normalize_tags(tags)?),
+            None => None,
+        };
+        let node = Node {
+            id: 0,
+            kind_id: change_kind,
+            name: commit,
+            description: title.to_string(),
+            content: draft.summary.clone(),
+            updated_at: String::new(),
+        };
+        let pending = PendingNode {
+            node,
+            properties: None,
+            tags,
+        };
+        let mut edges = Vec::new();
+        for task in &tasks {
+            edges.push(PendingEdge {
+                source: NodeRef::New(0),
+                destination: NodeRef::Existing(*task),
+                edge_type_id: implements.id,
+            });
+        }
+        for id in file_ids {
+            edges.push(PendingEdge {
+                source: NodeRef::New(0),
+                destination: NodeRef::Existing(id),
+                edge_type_id: modifies.id,
+            });
+        }
+        let mut created = self
+            .repository
+            .insert_nodes_with_edges(std::slice::from_ref(&pending), &edges)
+            .await?;
+        created.pop().ok_or_else(|| {
+            ServiceError::InternalError("change creation returned no node".to_string())
+        })
     }
 
     async fn validate_plan_references(
@@ -6962,5 +7073,95 @@ mod tests {
                 .await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn creates_a_change_with_task_and_file_edges() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+        let file_kind = seeded_kind(&service, "file").await;
+        service
+            .upsert_node(&node(file_kind, "src/lib.rs", ""))
+            .await
+            .unwrap();
+        service
+            .upsert_node(&node(file_kind, "src/main.rs", ""))
+            .await
+            .unwrap();
+        let mut task = new_task("change task");
+        task.parent = Some(goal);
+        let task = service.create_task(&task).await.unwrap();
+
+        let draft = ChangeDraft {
+            commit: "abc123".to_string(),
+            title: "do work".to_string(),
+            summary: "details".to_string(),
+            tasks: vec![task.id, task.id],
+            files: vec!["src/lib.rs".to_string(), " src/main.rs ".to_string()],
+            tags: Some(vec!["Repo:X".to_string()]),
+        };
+        let change = service.create_change(&draft).await.unwrap();
+        assert_eq!(change.name, "abc123");
+        assert_eq!(change.description, "do work");
+        assert_eq!(change.content, "details");
+        assert_eq!(service.node_tags(change.id).await.unwrap(), vec!["repo:x"]);
+        let outgoing = service
+            .neighbors(change.id, NeighborDirection::Outgoing, None)
+            .await
+            .unwrap();
+        assert_eq!(outgoing.len(), 3);
+        let tree = service.goal_tree(goal).await.unwrap().1;
+        assert_eq!(tree[0].status, WorkStatus::Done);
+        assert_eq!(tree[0].implemented_by[0].name, "abc123");
+
+        assert!(matches!(
+            service.create_change(&draft).await,
+            Err(ServiceError::Conflict(_))
+        ));
+
+        let mut bad_file = draft.clone();
+        bad_file.commit = "def456".to_string();
+        bad_file.files = vec!["missing.rs".to_string()];
+        assert!(matches!(
+            service.create_change(&bad_file).await,
+            Err(ServiceError::UnprocessableEntity(message)) if message.contains("missing.rs")
+        ));
+
+        let mut missing_task = draft.clone();
+        missing_task.commit = "def456".to_string();
+        missing_task.tasks = vec![999_999];
+        missing_task.files = vec![];
+        assert!(matches!(
+            service.create_change(&missing_task).await,
+            Err(ServiceError::EntityNotFound)
+        ));
+
+        let mut wrong_kind = draft.clone();
+        wrong_kind.commit = "def456".to_string();
+        wrong_kind.tasks = vec![goal];
+        wrong_kind.files = vec![];
+        assert!(matches!(
+            service.create_change(&wrong_kind).await,
+            Err(ServiceError::UnprocessableEntity(message)) if message.contains("not a task")
+        ));
+
+        let mut empty = draft.clone();
+        empty.commit = "def456".to_string();
+        empty.tasks = vec![];
+        empty.files = vec![];
+        assert!(matches!(
+            service.create_change(&empty).await,
+            Err(ServiceError::UnprocessableEntity(message)) if message.contains("at least one")
+        ));
+
+        let changes = service
+            .list_nodes(&NodeFilter {
+                kind: Some("change".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(changes.len(), 1);
     }
 }

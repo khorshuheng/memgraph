@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::model::{
-    Edge as EdgeModel, EdgeType as EdgeTypeModel, ImportConflict, ImportDraft, ImportEdge,
-    ImportNode, ImportRef, ImportReport, ImportStatus, Neighbor as NeighborModel,
+    ChangeDraft, Edge as EdgeModel, EdgeType as EdgeTypeModel, ImportConflict, ImportDraft,
+    ImportEdge, ImportNode, ImportRef, ImportReport, ImportStatus, Neighbor as NeighborModel,
     NeighborDirection as NeighborDirectionModel, Node as NodeModel, NodeFilter,
     NodeKind as NodeKindModel, NodeKindProperty, NodePatch, PackDraft, PackEdgeType, PackNodeKind,
     PackReport, Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft,
@@ -1214,4 +1214,37 @@ impl From<WorkTask> for WorkTaskResponse {
 pub struct GoalTreeResponse {
     pub goal: NodeResponse,
     pub tasks: Vec<WorkTaskResponse>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    description = "A landed change. Creates the change node plus its implements (task) and \
+                   modifies (file) edges in one transaction. Task refs are ids; file refs are \
+                   repo-relative natural-key names. Tags are trimmed, lowercased and \
+                   deduplicated; blank tags and more than 64 tags are rejected."
+)]
+pub struct CreateChangeParameters {
+    pub commit: String,
+    pub title: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub tasks: Vec<i64>,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+impl From<CreateChangeParameters> for ChangeDraft {
+    fn from(params: CreateChangeParameters) -> Self {
+        ChangeDraft {
+            commit: params.commit,
+            title: params.title,
+            summary: params.summary,
+            tasks: params.tasks,
+            files: params.files,
+            tags: params.tags,
+        }
+    }
 }

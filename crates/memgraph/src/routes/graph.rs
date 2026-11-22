@@ -10,6 +10,7 @@ pub(crate) fn routes(app_state: AppState) -> OpenApiRouter {
         .routes(routes!(import_graph))
         .routes(routes!(create_node, list_nodes))
         .routes(routes!(create_task))
+        .routes(routes!(create_change))
         .routes(routes!(create_plan))
         .routes(routes!(update_task))
         .routes(routes!(get_node, update_node, delete_node))

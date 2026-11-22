@@ -7,22 +7,22 @@ use axum::{
 use crate::{
     dto::{
         graph::{
-            ApplyPackParameters, CreateEdgeParameters, CreateEdgeTypeParameters,
-            CreateNodeKindParameters, CreateNodeParameters, CreatePlanParameters,
-            CreateTaskParameters, DeleteEdgeParameters, EdgeTypeResponse, GoalTreeResponse,
-            ImportParameters, ImportReportResponse, ListNodesParameters, ListNodesResponse,
-            NeighborParameters, NeighborResponse, NodeKindResponse, NodeResponse,
-            PackReportResponse, PlanResponse, PlanTaskResponse, ReplaceTagsParameters,
-            SearchHitResponse, SearchParameters, SearchResponse, TagUsageResponse,
-            UpdateEdgeParameters, UpdateNodeParameters, UpdateTaskParameters, WorkParameters,
-            WorkTaskResponse,
+            ApplyPackParameters, CreateChangeParameters, CreateEdgeParameters,
+            CreateEdgeTypeParameters, CreateNodeKindParameters, CreateNodeParameters,
+            CreatePlanParameters, CreateTaskParameters, DeleteEdgeParameters, EdgeTypeResponse,
+            GoalTreeResponse, ImportParameters, ImportReportResponse, ListNodesParameters,
+            ListNodesResponse, NeighborParameters, NeighborResponse, NodeKindResponse,
+            NodeResponse, PackReportResponse, PlanResponse, PlanTaskResponse,
+            ReplaceTagsParameters, SearchHitResponse, SearchParameters, SearchResponse,
+            TagUsageResponse, UpdateEdgeParameters, UpdateNodeParameters, UpdateTaskParameters,
+            WorkParameters, WorkTaskResponse,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
     },
     model::{
-        Edge, EdgeType, ImportDraft, Node, NodeFilter, NodeKind, NodePatch, PackDraft, PlanDraft,
-        TaskDraft, TaskPatch, WorkFilter,
+        ChangeDraft, Edge, EdgeType, ImportDraft, Node, NodeFilter, NodeKind, NodePatch, PackDraft,
+        PlanDraft, TaskDraft, TaskPatch, WorkFilter,
     },
     state::AppState,
 };
@@ -170,6 +170,27 @@ pub async fn create_task(
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let draft: TaskDraft = params.into();
     let created = state.graph_service.create_task(&draft).await?;
+    let tags = state.graph_service.node_tags(created.id).await?;
+    let properties = state.graph_service.node_properties(created.id).await?;
+    Ok(ApiSuccess {
+        status: StatusCode::CREATED,
+        data: NodeResponse::with_tags_and_properties(created, tags, properties),
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    post,
+    path = "/changes",
+    request_body = CreateChangeParameters,
+    responses((status = 201, description = "Change recorded", body = NodeResponse))
+)]
+pub async fn create_change(
+    State(state): State<AppState>,
+    Json(params): Json<CreateChangeParameters>,
+) -> Result<ApiSuccess<NodeResponse>, ApiError> {
+    let draft: ChangeDraft = params.into();
+    let created = state.graph_service.create_change(&draft).await?;
     let tags = state.graph_service.node_tags(created.id).await?;
     let properties = state.graph_service.node_properties(created.id).await?;
     Ok(ApiSuccess {
@@ -753,11 +774,14 @@ mod tests {
         seed_kind(state, "goal").await;
         seed_kind(state, "task").await;
         seed_kind(state, "file").await;
+        seed_kind(state, "change").await;
         for (name, source, destination) in [
             ("belongs_to", "goal", "repo"),
             ("part_of", "task", "task,goal"),
             ("depends_on", "task", "task"),
             ("affects", "task", "file"),
+            ("implements", "change", "task"),
+            ("modifies", "change", "file"),
         ] {
             state
                 .graph_service
@@ -1879,5 +1903,72 @@ mod tests {
             .await
             .expect_err("missing goal");
         assert_eq!(error.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn records_a_change_in_one_request() {
+        let state = test_state().await;
+        let goal = seed_anchored_goal(&state).await;
+        let file_kind = state
+            .graph_service
+            .list_node_kinds()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|kind| kind.name == "file")
+            .expect("file kind")
+            .id;
+        new_node(&state, file_kind, "src/lib.rs", "", "", &[]).await;
+        let task = create_task(
+            State(state.clone()),
+            Json(CreateTaskParameters {
+                id: None,
+                name: "change task".to_string(),
+                description: String::new(),
+                content: String::new(),
+                parent: Some(goal),
+                depends_on: vec![],
+                affects: vec![],
+                properties: None,
+                tags: None,
+            }),
+        )
+        .await
+        .expect("create task")
+        .data;
+
+        let change = create_change(
+            State(state.clone()),
+            Json(CreateChangeParameters {
+                commit: "feed42".to_string(),
+                title: "handler change".to_string(),
+                summary: "details".to_string(),
+                tasks: vec![task.id],
+                files: vec!["src/lib.rs".to_string()],
+                tags: Some(vec!["API".to_string()]),
+            }),
+        )
+        .await
+        .expect("record change")
+        .data;
+        assert_eq!(change.name, "feed42");
+        assert_eq!(change.tags, vec!["api"]);
+        let outgoing = state
+            .graph_service
+            .neighbors(change.id, crate::model::NeighborDirection::Outgoing, None)
+            .await
+            .unwrap();
+        assert_eq!(outgoing.len(), 2);
+
+        let pending = work_pending(
+            State(state.clone()),
+            Query(WorkParameters {
+                goal: Some(goal),
+                repo: None,
+            }),
+        )
+        .await
+        .expect("pending");
+        assert!(pending.items.is_empty());
     }
 }

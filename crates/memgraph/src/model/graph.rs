@@ -575,6 +575,16 @@ pub struct PendingEdge {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeDraft {
+    pub commit: String,
+    pub title: String,
+    pub summary: String,
+    pub tasks: Vec<i64>,
+    pub files: Vec<String>,
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskDraft {
     pub id: i64,
     pub name: String,
