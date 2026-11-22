@@ -214,6 +214,51 @@ pub struct WorkPage {
     pub offset: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EdgeFilter {
+    pub edge_type: Option<String>,
+    pub source: Option<i64>,
+    pub destination: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct EdgeRecord {
+    pub source: i64,
+    pub destination: i64,
+    pub edge_type_id: i64,
+    pub created_at: String,
+    pub properties: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgePage {
+    pub items: Vec<EdgeRecord>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphExportNode {
+    pub id: i64,
+    pub kind_id: i64,
+    pub name: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphExportEdge {
+    pub source: i64,
+    pub destination: i64,
+    pub edge_type_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphExport {
+    pub nodes: Vec<GraphExportNode>,
+    pub edges: Vec<GraphExportEdge>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackStatus {
     Created,

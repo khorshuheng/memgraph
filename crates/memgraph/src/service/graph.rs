@@ -4,12 +4,12 @@ use std::sync::Arc;
 use crate::{
     config::PagingConfig,
     model::{
-        ChangeDraft, Edge, EdgeType, ImportDraft, ImportEdge, ImportNode, ImportRef, ImportReport,
-        Neighbor, NeighborDirection, Node, NodeFilter, NodeKind, NodeKindProperty, NodePage,
-        NodePatch, NodeRef, PackDraft, PackEdgeType, PackNodeKind, PackProperty, PackReport,
-        PendingEdge, PendingNode, Plan, PlanDraft, PlanTask, PlanTaskDraft, PropertyType,
-        ReachFilter, SearchPage, TagUsage, TaskDraft, TaskPatch, WorkDependency, WorkFilter,
-        WorkPage, WorkRef, WorkStatus, WorkTask,
+        ChangeDraft, Edge, EdgeFilter, EdgePage, EdgeType, GraphExport, ImportDraft, ImportEdge,
+        ImportNode, ImportRef, ImportReport, Neighbor, NeighborDirection, Node, NodeFilter,
+        NodeKind, NodeKindProperty, NodePage, NodePatch, NodeRef, PackDraft, PackEdgeType,
+        PackNodeKind, PackProperty, PackReport, PendingEdge, PendingNode, Plan, PlanDraft,
+        PlanTask, PlanTaskDraft, PropertyType, ReachFilter, SearchPage, TagUsage, TaskDraft,
+        TaskPatch, WorkDependency, WorkFilter, WorkPage, WorkRef, WorkStatus, WorkTask,
     },
     repository::graph::{GraphRepository, WorkSnapshot},
 };
@@ -18,6 +18,7 @@ use super::error::ServiceError;
 
 const DEFAULT_DESCEND: &str = "part_of";
 const DESCEND_NONE: &str = "none";
+const MAX_BATCH_IDS: usize = 200;
 
 #[derive(Clone)]
 pub struct GraphService {
@@ -1041,6 +1042,68 @@ impl GraphService {
 
     pub async fn list_tags(&self) -> Result<Vec<TagUsage>, ServiceError> {
         self.repository.list_tags().await.map_err(Into::into)
+    }
+
+    pub async fn nodes_by_ids(&self, ids: &[i64]) -> Result<Vec<Node>, ServiceError> {
+        let mut unique = Vec::new();
+        let mut seen = HashSet::new();
+        for id in ids {
+            if seen.insert(*id) {
+                unique.push(*id);
+            }
+        }
+        if unique.len() > MAX_BATCH_IDS {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "at most {MAX_BATCH_IDS} ids are allowed"
+            )));
+        }
+        let mut by_id: HashMap<i64, Node> = self
+            .repository
+            .nodes_by_ids(&unique)
+            .await?
+            .into_iter()
+            .map(|node| (node.id, node))
+            .collect();
+        Ok(unique
+            .into_iter()
+            .filter_map(|id| by_id.remove(&id))
+            .collect())
+    }
+
+    pub async fn list_edges(
+        &self,
+        filter: &EdgeFilter,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<EdgePage, ServiceError> {
+        if let Some(name) = &filter.edge_type {
+            let exists = self
+                .repository
+                .list_edge_types()
+                .await?
+                .iter()
+                .any(|edge_type| &edge_type.name == name);
+            if !exists {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "edge type '{name}' is not defined"
+                )));
+            }
+        }
+        let limit = limit
+            .unwrap_or(self.paging.default_limit)
+            .clamp(1, self.paging.max_limit);
+        let offset = offset.unwrap_or(0).max(0);
+        let (items, total) = self.repository.list_edges(filter, limit, offset).await?;
+        Ok(EdgePage {
+            items,
+            total,
+            limit,
+            offset,
+        })
+    }
+
+    pub async fn export_graph(&self) -> Result<GraphExport, ServiceError> {
+        self.repository.graph_export().await.map_err(Into::into)
     }
 
     pub async fn work_report(
@@ -7409,5 +7472,178 @@ mod tests {
 
         drop(service);
         remove_sqlite(&path);
+    }
+
+    #[tokio::test]
+    async fn nodes_by_ids_preserve_request_order_and_dedupe() {
+        let service = service().await;
+        let kind = seed_person(&service).await;
+        let first = service.upsert_node(&node(kind, "first", "")).await.unwrap();
+        let second = service
+            .upsert_node(&node(kind, "second", ""))
+            .await
+            .unwrap();
+
+        let nodes = service
+            .nodes_by_ids(&[second.id, first.id, second.id, 999_999])
+            .await
+            .unwrap();
+        assert_eq!(
+            nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![second.id, first.id]
+        );
+
+        let too_many: Vec<i64> = (0..201).collect();
+        assert!(matches!(
+            service.nodes_by_ids(&too_many).await,
+            Err(ServiceError::UnprocessableEntity(message)) if message.contains("at most 200")
+        ));
+    }
+
+    #[tokio::test]
+    async fn lists_edges_with_filters_and_paging() {
+        let service = service().await;
+        let kind = seed_person(&service).await;
+        let first = service.upsert_node(&node(kind, "first", "")).await.unwrap();
+        let second = service
+            .upsert_node(&node(kind, "second", ""))
+            .await
+            .unwrap();
+        let knows = service
+            .create_edge_type(&edge_type("knows", ""))
+            .await
+            .unwrap();
+        let likes = service
+            .create_edge_type(&edge_type("likes", ""))
+            .await
+            .unwrap();
+        for (source, destination, edge_type_id) in [
+            (first.id, second.id, knows.id),
+            (second.id, first.id, knows.id),
+            (first.id, second.id, likes.id),
+        ] {
+            service
+                .add_edge(&Edge {
+                    source,
+                    destination,
+                    edge_type_id,
+                    created_at: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let all = service
+            .list_edges(&EdgeFilter::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(all.total, 3);
+        assert_eq!(all.items.len(), 3);
+
+        let typed = service
+            .list_edges(
+                &EdgeFilter {
+                    edge_type: Some("knows".to_string()),
+                    source: None,
+                    destination: None,
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(typed.total, 2);
+
+        let from_first = service
+            .list_edges(
+                &EdgeFilter {
+                    edge_type: None,
+                    source: Some(first.id),
+                    destination: None,
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(from_first.total, 2);
+
+        let to_second = service
+            .list_edges(
+                &EdgeFilter {
+                    edge_type: None,
+                    source: None,
+                    destination: Some(second.id),
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(to_second.total, 2);
+
+        let page = service
+            .list_edges(&EdgeFilter::default(), Some(1), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.limit, 1);
+        assert_eq!(page.offset, 1);
+
+        assert!(matches!(
+            service
+                .list_edges(
+                    &EdgeFilter {
+                        edge_type: Some("unknown".to_string()),
+                        source: None,
+                        destination: None,
+                    },
+                    None,
+                    None,
+                )
+                .await,
+            Err(ServiceError::UnprocessableEntity(message)) if message.contains("not defined")
+        ));
+    }
+
+    #[tokio::test]
+    async fn exports_a_compact_graph_snapshot() {
+        let service = service().await;
+        let kind = seed_person(&service).await;
+        let first = service
+            .create_node(&node(kind, "first", ""), &["Math".to_string()])
+            .await
+            .unwrap()
+            .0;
+        let second = service
+            .upsert_node(&node(kind, "second", ""))
+            .await
+            .unwrap();
+        let knows = service
+            .create_edge_type(&edge_type("knows", ""))
+            .await
+            .unwrap();
+        service
+            .add_edge(&Edge {
+                source: first.id,
+                destination: second.id,
+                edge_type_id: knows.id,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let export = service.export_graph().await.unwrap();
+        assert_eq!(export.nodes.len(), 2);
+        assert!(
+            export
+                .nodes
+                .iter()
+                .any(|node| node.name == "first" && node.tags == vec!["math"])
+        );
+        assert_eq!(export.edges.len(), 1);
+        assert_eq!(export.edges[0].source, first.id);
+        assert_eq!(export.edges[0].destination, second.id);
     }
 }

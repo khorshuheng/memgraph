@@ -9,10 +9,11 @@ use crate::{
         graph::{
             ApplyPackParameters, CreateChangeParameters, CreateEdgeParameters,
             CreateEdgeTypeParameters, CreateNodeKindParameters, CreateNodeParameters,
-            CreatePlanParameters, CreateTaskParameters, DeleteEdgeParameters, EdgeTypeResponse,
-            GoalTreeResponse, ImportParameters, ImportReportResponse, ListNodesParameters,
-            ListNodesResponse, NeighborParameters, NeighborResponse, NodeKindResponse,
-            NodeResponse, PackReportResponse, PageParameters, PlanResponse, PlanTaskResponse,
+            CreatePlanParameters, CreateTaskParameters, DeleteEdgeParameters, EdgeListParameters,
+            EdgeListResponse, EdgeTypeResponse, GoalTreeResponse, GraphExportResponse,
+            ImportParameters, ImportReportResponse, ListNodesParameters, ListNodesResponse,
+            NeighborParameters, NeighborResponse, NodeKindResponse, NodeResponse,
+            PackReportResponse, PageParameters, PlanResponse, PlanTaskResponse,
             ReplaceTagsParameters, SearchHitResponse, SearchParameters, SearchResponse,
             TagUsageResponse, UpdateEdgeParameters, UpdateNodeParameters, UpdateTaskParameters,
             WorkListResponse, WorkParameters,
@@ -21,8 +22,8 @@ use crate::{
         wrapper::{ApiError, ApiList, ApiSuccess},
     },
     model::{
-        ChangeDraft, Edge, EdgeType, ImportDraft, Node, NodeFilter, NodeKind, NodePatch, PackDraft,
-        PlanDraft, TaskDraft, TaskPatch, WorkFilter,
+        ChangeDraft, Edge, EdgeFilter, EdgeType, ImportDraft, Node, NodeFilter, NodeKind,
+        NodePatch, PackDraft, PlanDraft, TaskDraft, TaskPatch, WorkFilter,
     },
     state::AppState,
 };
@@ -282,6 +283,35 @@ pub async fn list_nodes(
     State(state): State<AppState>,
     Query(params): Query<ListNodesParameters>,
 ) -> Result<ApiSuccess<ListNodesResponse>, ApiError> {
+    let ids = params.id_list().map_err(|message| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        message,
+    })?;
+    if let Some(ids) = ids {
+        let nodes = state.graph_service.nodes_by_ids(&ids).await?;
+        let found: Vec<i64> = nodes.iter().map(|node| node.id).collect();
+        let mut tags = state.graph_service.node_tags_for_ids(&found).await?;
+        let mut properties = state.graph_service.node_properties_for_ids(&found).await?;
+        let total = nodes.len() as i64;
+        return Ok(ApiSuccess {
+            status: StatusCode::OK,
+            data: ListNodesResponse {
+                items: nodes
+                    .into_iter()
+                    .map(|node| {
+                        let node_tags = tags.remove(&node.id).unwrap_or_default();
+                        let node_properties = properties
+                            .remove(&node.id)
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        NodeResponse::with_tags_and_properties(node, node_tags, node_properties)
+                    })
+                    .collect(),
+                total,
+                limit: total,
+                offset: 0,
+            },
+        });
+    }
     let limit = params.limit;
     let offset = params.offset;
     let properties = params.property_filter().map_err(|message| ApiError {
@@ -596,6 +626,38 @@ pub async fn list_neighbors(
 
 #[utoipa::path(
     tag = "Graph",
+    get,
+    path = "/edges",
+    params(EdgeListParameters),
+    responses(
+        (status = 200, description = "Edges matching the filters", body = EdgeListResponse),
+        (status = 422, description = "Edge type filter is not defined")
+    )
+)]
+pub async fn list_edges(
+    State(state): State<AppState>,
+    Query(params): Query<EdgeListParameters>,
+) -> Result<ApiSuccess<EdgeListResponse>, ApiError> {
+    let limit = params.limit;
+    let offset = params.offset;
+    let filter: EdgeFilter = params.into();
+    let page = state
+        .graph_service
+        .list_edges(&filter, limit, offset)
+        .await?;
+    Ok(ApiSuccess {
+        status: StatusCode::OK,
+        data: EdgeListResponse {
+            items: page.items.into_iter().map(Into::into).collect(),
+            total: page.total,
+            limit: page.limit,
+            offset: page.offset,
+        },
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
     post,
     path = "/edges",
     request_body = CreateEdgeParameters,
@@ -713,6 +775,22 @@ pub async fn search(
             limit: page.limit,
             offset: page.offset,
         },
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    get,
+    path = "/graph/export",
+    responses((status = 200, description = "Compact node and edge snapshot", body = GraphExportResponse))
+)]
+pub async fn graph_export(
+    State(state): State<AppState>,
+) -> Result<ApiSuccess<GraphExportResponse>, ApiError> {
+    let export = state.graph_service.export_graph().await?;
+    Ok(ApiSuccess {
+        status: StatusCode::OK,
+        data: export.into(),
     })
 }
 
@@ -975,6 +1053,7 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                ids: None,
                 properties: None,
                 limit: None,
                 offset: None,
@@ -1359,6 +1438,7 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                ids: None,
                 properties: None,
                 limit: None,
                 offset: None,
@@ -1428,6 +1508,7 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                ids: None,
                 properties: Some(r#"{"status":"verified"}"#.to_string()),
                 limit: None,
                 offset: None,
@@ -1461,6 +1542,7 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                ids: None,
                 properties: Some("[1]".to_string()),
                 limit: None,
                 offset: None,
@@ -1810,6 +1892,7 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                ids: None,
                 properties: Some(r#"{"a\"b":1}"#.to_string()),
                 limit: None,
                 offset: None,
@@ -1836,6 +1919,7 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                ids: None,
                 properties: None,
                 limit: Some(2),
                 offset: Some(1),
@@ -1856,6 +1940,7 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                ids: None,
                 properties: None,
                 limit: Some(10_000),
                 offset: None,
@@ -2031,5 +2116,90 @@ mod tests {
         .await
         .expect("pending");
         assert!(pending.data.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_reads_and_export_work() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "person").await;
+        let first = new_node(&state, kind, "first", "", "", &["Math"]).await;
+        let second = new_node(&state, kind, "second", "", "", &[]).await;
+        let knows = state
+            .graph_service
+            .create_edge_type(&EdgeType {
+                id: 0,
+                name: "knows".to_string(),
+                description: String::new(),
+                resolves: false,
+                single_outgoing: false,
+                acyclic: false,
+                source_kinds: None,
+                destination_kinds: None,
+                updated_at: String::new(),
+            })
+            .await
+            .expect("edge type");
+        state
+            .graph_service
+            .add_edge(&Edge {
+                source: first.id,
+                destination: second.id,
+                edge_type_id: knows.id,
+                created_at: String::new(),
+            })
+            .await
+            .expect("edge");
+
+        let batch = list_nodes(
+            State(state.clone()),
+            Query(ListNodesParameters {
+                kind: None,
+                scope: None,
+                within: None,
+                via: None,
+                descend: None,
+                ids: Some(format!("{},{}", second.id, first.id)),
+                properties: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("batch")
+        .data;
+        assert_eq!(
+            batch.items.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![second.id, first.id]
+        );
+        assert_eq!(batch.total, 2);
+
+        let edges = list_edges(
+            State(state.clone()),
+            Query(EdgeListParameters {
+                edge_type: Some("knows".to_string()),
+                source: None,
+                destination: Some(second.id),
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("edges")
+        .data;
+        assert_eq!(edges.total, 1);
+        assert_eq!(edges.items[0].source, first.id);
+
+        let export = graph_export(State(state.clone()))
+            .await
+            .expect("export")
+            .data;
+        assert_eq!(export.node_count, 2);
+        assert_eq!(export.edge_count, 1);
+        assert!(
+            export
+                .nodes
+                .iter()
+                .any(|node| node.name == "first" && node.tags == vec!["math"])
+        );
     }
 }

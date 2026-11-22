@@ -5,12 +5,13 @@ use sqlx::sqlite::Sqlite;
 use sqlx::{FromRow, QueryBuilder, Row, SqliteConnection, SqlitePool};
 
 use crate::model::{
-    Edge, EdgeType, EdgeTypeUsage, ImportConflict, ImportDraft, ImportEdgeResult, ImportNodeResult,
-    ImportRef, ImportReport, ImportStatus, IsolatedNode, KindUsage, Neighbor, NeighborDirection,
-    Node, NodeFilter, NodeKind, NodeKindProperty, NodePatch, NodeRef, PackDraft, PackEdgeType,
-    PackItem, PackNodeKind, PackProperty, PackReport, PackStatus, PendingEdge, PendingNode,
-    PropertyType, ReachFilter, RelationDirection, SearchHit, SearchPage, SearchScope, TagUsage,
-    WorkFilter, encode_kind_list, split_kind_list, validate_declared_properties,
+    Edge, EdgeFilter, EdgeRecord, EdgeType, EdgeTypeUsage, GraphExport, GraphExportEdge,
+    GraphExportNode, ImportConflict, ImportDraft, ImportEdgeResult, ImportNodeResult, ImportRef,
+    ImportReport, ImportStatus, IsolatedNode, KindUsage, Neighbor, NeighborDirection, Node,
+    NodeFilter, NodeKind, NodeKindProperty, NodePatch, NodeRef, PackDraft, PackEdgeType, PackItem,
+    PackNodeKind, PackProperty, PackReport, PackStatus, PendingEdge, PendingNode, PropertyType,
+    ReachFilter, RelationDirection, SearchHit, SearchPage, SearchScope, TagUsage, WorkFilter,
+    encode_kind_list, split_kind_list, validate_declared_properties,
 };
 
 use super::error::RepositoryError;
@@ -168,6 +169,14 @@ pub trait GraphRepository: Send + Sync {
         ids: &[i64],
     ) -> Result<HashMap<i64, Vec<NodeKindProperty>>, RepositoryError>;
     async fn list_tags(&self) -> Result<Vec<TagUsage>, RepositoryError>;
+    async fn nodes_by_ids(&self, ids: &[i64]) -> Result<Vec<Node>, RepositoryError>;
+    async fn list_edges(
+        &self,
+        filter: &EdgeFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<EdgeRecord>, i64), RepositoryError>;
+    async fn graph_export(&self) -> Result<GraphExport, RepositoryError>;
     async fn work_snapshot(
         &self,
         filter: &WorkFilter,
@@ -836,6 +845,75 @@ impl GraphRepository for SqliteGraphRepository {
                     return Err(RepositoryError::from(error));
                 }
                 Ok(snapshot)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn nodes_by_ids(&self, ids: &[i64]) -> Result<Vec<Node>, RepositoryError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut builder =
+            QueryBuilder::new(format!("SELECT {NODE_COLUMNS} FROM node WHERE id IN ("));
+        let mut separated = builder.separated(", ");
+        for id in ids {
+            separated.push_bind(*id);
+        }
+        builder.push(") ORDER BY id");
+        let rows = builder
+            .build_query_as::<Node>()
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
+
+    async fn list_edges(
+        &self,
+        filter: &EdgeFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<EdgeRecord>, i64), RepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut count = QueryBuilder::new("SELECT count(*) FROM edge e WHERE 1 = 1");
+        push_edge_conditions(&mut count, filter);
+        let total = count
+            .build_query_scalar::<i64>()
+            .fetch_one(&mut *transaction)
+            .await?;
+        let mut page = QueryBuilder::new(
+            "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
+               e.properties AS properties FROM edge e WHERE 1 = 1",
+        );
+        push_edge_conditions(&mut page, filter);
+        page.push(" ORDER BY e.source, e.edge_type_id, e.destination LIMIT ");
+        page.push_bind(limit);
+        page.push(" OFFSET ");
+        page.push_bind(offset);
+        let items = page
+            .build_query_as::<EdgeRecord>()
+            .fetch_all(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok((items, total))
+    }
+
+    async fn graph_export(&self) -> Result<GraphExport, RepositoryError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN")
+            .execute(&mut *connection)
+            .await
+            .map_err(RepositoryError::from)?;
+        match graph_export_items(&mut connection).await {
+            Ok(export) => {
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(RepositoryError::from(error));
+                }
+                Ok(export)
             }
             Err(error) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
@@ -2320,6 +2398,65 @@ async fn work_implementation_rows(
         .fetch_all(&mut *connection)
         .await?;
     Ok(rows)
+}
+
+fn push_edge_conditions(builder: &mut QueryBuilder<Sqlite>, filter: &EdgeFilter) {
+    if let Some(edge_type) = &filter.edge_type {
+        builder.push(" AND e.edge_type_id = (SELECT id FROM edge_type WHERE name = ");
+        builder.push_bind(edge_type.clone());
+        builder.push(")");
+    }
+    if let Some(source) = filter.source {
+        builder.push(" AND e.source = ");
+        builder.push_bind(source);
+    }
+    if let Some(destination) = filter.destination {
+        builder.push(" AND e.destination = ");
+        builder.push_bind(destination);
+    }
+}
+
+async fn graph_export_items(
+    connection: &mut SqliteConnection,
+) -> Result<GraphExport, RepositoryError> {
+    let node_rows =
+        sqlx::query_as::<_, (i64, i64, String)>("SELECT id, kind_id, name FROM node ORDER BY id")
+            .fetch_all(&mut *connection)
+            .await?;
+    let tag_rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT node_id, tag FROM node_tag ORDER BY node_id, tag",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    let edge_rows = sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT source, destination, edge_type_id FROM edge \
+         ORDER BY source, edge_type_id, destination",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+
+    let mut tags_by_node: HashMap<i64, Vec<String>> = HashMap::new();
+    for (node_id, tag) in tag_rows {
+        tags_by_node.entry(node_id).or_default().push(tag);
+    }
+    let nodes = node_rows
+        .into_iter()
+        .map(|(id, kind_id, name)| GraphExportNode {
+            id,
+            kind_id,
+            name,
+            tags: tags_by_node.remove(&id).unwrap_or_default(),
+        })
+        .collect();
+    let edges = edge_rows
+        .into_iter()
+        .map(|(source, destination, edge_type_id)| GraphExportEdge {
+            source,
+            destination,
+            edge_type_id,
+        })
+        .collect();
+    Ok(GraphExport { nodes, edges })
 }
 
 async fn node_tags_in(

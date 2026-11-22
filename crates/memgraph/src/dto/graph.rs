@@ -2,11 +2,11 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::model::{
-    ChangeDraft, Edge as EdgeModel, EdgeType as EdgeTypeModel, ImportConflict, ImportDraft,
-    ImportEdge, ImportNode, ImportRef, ImportReport, ImportStatus, Neighbor as NeighborModel,
-    NeighborDirection as NeighborDirectionModel, Node as NodeModel, NodeFilter,
-    NodeKind as NodeKindModel, NodeKindProperty, NodePatch, PackDraft, PackEdgeType, PackNodeKind,
-    PackReport, Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft,
+    ChangeDraft, Edge as EdgeModel, EdgeFilter, EdgeRecord, EdgeType as EdgeTypeModel, GraphExport,
+    ImportConflict, ImportDraft, ImportEdge, ImportNode, ImportRef, ImportReport, ImportStatus,
+    Neighbor as NeighborModel, NeighborDirection as NeighborDirectionModel, Node as NodeModel,
+    NodeFilter, NodeKind as NodeKindModel, NodeKindProperty, NodePatch, PackDraft, PackEdgeType,
+    PackNodeKind, PackReport, Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft,
     PlanTask as PlanTaskModel, PlanTaskDraft, ReachFilter,
     RelationDirection as RelationDirectionModel, SearchScope as SearchScopeModel, TaskDraft,
     TaskPatch, WorkFilter, WorkPage, WorkTask,
@@ -304,6 +304,100 @@ impl From<EdgeModel> for EdgeResponse {
     }
 }
 
+impl From<EdgeRecord> for EdgeResponse {
+    fn from(edge: EdgeRecord) -> Self {
+        EdgeResponse {
+            source: edge.source,
+            destination: edge.destination,
+            edge_type_id: edge.edge_type_id,
+            properties: serde_json::from_str(&edge.properties)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            created_at: edge.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct EdgeListParameters {
+    pub edge_type: Option<String>,
+    pub source: Option<i64>,
+    pub destination: Option<i64>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+impl From<EdgeListParameters> for EdgeFilter {
+    fn from(params: EdgeListParameters) -> Self {
+        EdgeFilter {
+            edge_type: params.edge_type,
+            source: params.source,
+            destination: params.destination,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EdgeListResponse {
+    pub items: Vec<EdgeResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GraphExportNodeResponse {
+    pub id: i64,
+    pub kind_id: i64,
+    pub name: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GraphExportEdgeResponse {
+    pub source: i64,
+    pub destination: i64,
+    pub edge_type_id: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GraphExportResponse {
+    pub nodes: Vec<GraphExportNodeResponse>,
+    pub edges: Vec<GraphExportEdgeResponse>,
+    pub node_count: i64,
+    pub edge_count: i64,
+}
+
+impl From<GraphExport> for GraphExportResponse {
+    fn from(export: GraphExport) -> Self {
+        let node_count = export.nodes.len() as i64;
+        let edge_count = export.edges.len() as i64;
+        GraphExportResponse {
+            nodes: export
+                .nodes
+                .into_iter()
+                .map(|node| GraphExportNodeResponse {
+                    id: node.id,
+                    kind_id: node.kind_id,
+                    name: node.name,
+                    tags: node.tags,
+                })
+                .collect(),
+            edges: export
+                .edges
+                .into_iter()
+                .map(|edge| GraphExportEdgeResponse {
+                    source: edge.source,
+                    destination: edge.destination,
+                    edge_type_id: edge.edge_type_id,
+                })
+                .collect(),
+            node_count,
+            edge_count,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct DeleteEdgeParameters {
@@ -420,6 +514,7 @@ pub struct ListNodesParameters {
     pub within: Option<i64>,
     pub via: Option<String>,
     pub descend: Option<String>,
+    pub ids: Option<String>,
     pub properties: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
@@ -436,6 +531,24 @@ pub struct ListNodesResponse {
 impl ListNodesParameters {
     pub fn property_filter(&self) -> Result<serde_json::Map<String, serde_json::Value>, String> {
         parse_property_filter(self.properties.as_deref())
+    }
+
+    pub fn id_list(&self) -> Result<Option<Vec<i64>>, String> {
+        let Some(raw) = self.ids.as_deref() else {
+            return Ok(None);
+        };
+        let mut ids = Vec::new();
+        for value in raw.split(',') {
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            let id = value.parse::<i64>().map_err(|_| {
+                format!("ids must be a comma-separated list of integers: '{value}'")
+            })?;
+            ids.push(id);
+        }
+        Ok(Some(ids))
     }
 }
 
