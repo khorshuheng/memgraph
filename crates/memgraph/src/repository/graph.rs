@@ -25,14 +25,14 @@ const NODE_COLUMNS: &str = "id, kind_id, name, description, content, version, up
 const MAX_EXPORT_NODES: i64 = 50_000;
 const MAX_EXPORT_EDGES: i64 = 200_000;
 const OUTGOING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
-    e.properties AS edge_properties, \
+    e.properties AS edge_properties, e.version AS edge_version, \
     n.id, n.kind_id, n.name, n.description, n.content, n.version, n.updated_at \
     FROM edge e JOIN node n ON n.id = e.destination \
     WHERE e.source = ? \
       AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
     ORDER BY e.edge_type_id, e.destination";
 const INCOMING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
-    e.properties AS edge_properties, \
+    e.properties AS edge_properties, e.version AS edge_version, \
     n.id, n.kind_id, n.name, n.description, n.content, n.version, n.updated_at \
     FROM edge e JOIN node n ON n.id = e.source \
     WHERE e.destination = ? \
@@ -271,6 +271,7 @@ pub trait GraphRepository: Send + Sync {
         &self,
         edge: &Edge,
         properties: &str,
+        expected_version: Option<i64>,
     ) -> Result<bool, RepositoryError>;
     async fn remove_edge(&self, edge: &Edge) -> Result<bool, RepositoryError>;
     async fn neighbors(
@@ -734,18 +735,61 @@ impl GraphRepository for SqliteGraphRepository {
         &self,
         edge: &Edge,
         properties: &str,
+        expected_version: Option<i64>,
     ) -> Result<bool, RepositoryError> {
-        let result = sqlx::query(
-            "UPDATE edge SET properties = ? \
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .map_err(RepositoryError::from)?;
+        let existing = sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM edge \
              WHERE source = ? AND destination = ? AND edge_type_id = ?",
         )
-        .bind(properties)
         .bind(edge.source)
         .bind(edge.destination)
         .bind(edge.edge_type_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        .fetch_optional(&mut *connection)
+        .await;
+        let result = match existing {
+            Ok(Some(version)) => {
+                if let Some(expected) = expected_version
+                    && version != expected
+                {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(RepositoryError::PreconditionFailed(format!(
+                        "edge is at version {version}, not {expected}"
+                    )));
+                }
+                sqlx::query(
+                    "UPDATE edge SET properties = ?, version = version + 1 \
+                     WHERE source = ? AND destination = ? AND edge_type_id = ?",
+                )
+                .bind(properties)
+                .bind(edge.source)
+                .bind(edge.destination)
+                .bind(edge.edge_type_id)
+                .execute(&mut *connection)
+                .await
+                .map(|result| result.rows_affected() > 0)
+                .map_err(RepositoryError::from)
+            }
+            Ok(None) => Ok(false),
+            Err(error) => Err(RepositoryError::from(error)),
+        };
+        match result {
+            Ok(updated) => {
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(RepositoryError::from(error));
+                }
+                Ok(updated)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
     }
 
     async fn remove_edge(&self, edge: &Edge) -> Result<bool, RepositoryError> {
@@ -794,6 +838,7 @@ impl GraphRepository for SqliteGraphRepository {
                     edge: Edge::from_row(row)?,
                     node: Node::from_row(row)?,
                     edge_properties: row.try_get("edge_properties")?,
+                    edge_version: row.try_get("edge_version")?,
                 });
             }
         }
@@ -1023,7 +1068,7 @@ impl GraphRepository for SqliteGraphRepository {
             .fetch_one(&mut *transaction)
             .await?;
         let mut page = QueryBuilder::new(
-            "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
+            "SELECT e.source, e.destination, e.edge_type_id, e.version, e.created_at, \
                e.properties AS properties FROM edge e WHERE 1 = 1",
         );
         push_edge_conditions(&mut page, filter);
@@ -3236,14 +3281,22 @@ async fn upsert_node_with_tags_items(
     if let Some(properties) = properties {
         let encoded = serde_json::to_string(properties)
             .map_err(|error| RepositoryError::SqlExecutionError(error.to_string()))?;
-        sqlx::query(
-            "UPDATE node SET properties = ?, version = version + 1, \
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
-        )
-        .bind(encoded)
-        .bind(row.id)
-        .execute(&mut *connection)
-        .await?;
+        if node.id == 0 {
+            sqlx::query("UPDATE node SET properties = ? WHERE id = ?")
+                .bind(encoded)
+                .bind(row.id)
+                .execute(&mut *connection)
+                .await?;
+        } else {
+            sqlx::query(
+                "UPDATE node SET properties = ?, version = version + 1, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+            )
+            .bind(encoded)
+            .bind(row.id)
+            .execute(&mut *connection)
+            .await?;
+        }
     }
     let row = sqlx::query_as::<_, Node>(&format!("SELECT {NODE_COLUMNS} FROM node WHERE id = ?"))
         .bind(row.id)

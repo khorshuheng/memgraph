@@ -123,12 +123,21 @@ async fn idempotency(State(state): State<AppState>, request: Request, next: Next
                 }
             };
             if status.as_u16() < 500 {
-                if let Err(error) = state
-                    .graph_service
-                    .idempotency_complete(&key, i64::from(status.as_u16()), &response_bytes)
-                    .await
-                {
-                    tracing::error!(%error, "failed to store an idempotent response");
+                for attempt in 1..=3 {
+                    match state
+                        .graph_service
+                        .idempotency_complete(&key, i64::from(status.as_u16()), &response_bytes)
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(error) if attempt == 3 => {
+                            tracing::error!(%error, "failed to store an idempotent response");
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(20 * attempt))
+                                .await;
+                        }
+                    }
                 }
             } else {
                 let _ = state.graph_service.idempotency_abort(&key).await;

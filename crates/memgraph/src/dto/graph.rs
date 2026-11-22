@@ -315,6 +315,7 @@ pub struct EdgeResponse {
     pub edge_type_id: i64,
     pub edge_type: String,
     pub properties: serde_json::Value,
+    pub version: i64,
     pub created_at: String,
 }
 
@@ -326,6 +327,7 @@ impl From<EdgeModel> for EdgeResponse {
             edge_type_id: edge.edge_type_id,
             edge_type: String::new(),
             properties: serde_json::json!({}),
+            version: 0,
             created_at: edge.created_at,
         }
     }
@@ -340,6 +342,7 @@ impl From<EdgeRecord> for EdgeResponse {
             edge_type: String::new(),
             properties: serde_json::from_str(&edge.properties)
                 .unwrap_or_else(|_| serde_json::json!({})),
+            version: edge.version,
             created_at: edge.created_at,
         }
     }
@@ -512,6 +515,7 @@ impl NeighborResponse {
             },
             edge: EdgeResponse {
                 properties: edge_properties,
+                version: neighbor.edge_version,
                 ..neighbor.edge.into()
             },
             node: NodeResponse::with_tags_and_properties(neighbor.node, tags, properties),

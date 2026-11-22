@@ -140,6 +140,7 @@ pub struct Neighbor {
     pub edge: Edge,
     pub node: Node,
     pub edge_properties: String,
+    pub edge_version: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -231,6 +232,7 @@ pub struct EdgeRecord {
     pub source: i64,
     pub destination: i64,
     pub edge_type_id: i64,
+    pub version: i64,
     pub created_at: String,
     pub properties: String,
 }

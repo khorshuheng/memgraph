@@ -486,10 +486,33 @@ impl GraphService {
         edge: &Edge,
         properties: &serde_json::Value,
     ) -> Result<(), ServiceError> {
+        self.set_edge_properties_with_version(edge, properties, None)
+            .await
+    }
+
+    pub async fn set_edge_properties_checked(
+        &self,
+        edge: &Edge,
+        properties: &serde_json::Value,
+        expected_version: i64,
+    ) -> Result<(), ServiceError> {
+        self.set_edge_properties_with_version(edge, properties, Some(expected_version))
+            .await
+    }
+
+    async fn set_edge_properties_with_version(
+        &self,
+        edge: &Edge,
+        properties: &serde_json::Value,
+        expected_version: Option<i64>,
+    ) -> Result<(), ServiceError> {
         let encoded = encode_properties(Some(properties))?.ok_or_else(|| {
             ServiceError::UnprocessableEntity("properties must be a JSON object".to_string())
         })?;
-        let updated = self.repository.set_edge_properties(edge, &encoded).await?;
+        let updated = self
+            .repository
+            .set_edge_properties(edge, &encoded, expected_version)
+            .await?;
         if updated {
             Ok(())
         } else {
@@ -8445,6 +8468,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edge_versions_support_if_match() {
+        let service = service().await;
+        let kind = seed_person(&service).await;
+        let first = service
+            .upsert_node(&node(kind, "edge first", ""))
+            .await
+            .unwrap();
+        let second = service
+            .upsert_node(&node(kind, "edge second", ""))
+            .await
+            .unwrap();
+        let knows = service
+            .create_edge_type(&edge_type("knows", ""))
+            .await
+            .unwrap();
+        service
+            .add_edge(&Edge {
+                source: first.id,
+                destination: second.id,
+                edge_type_id: knows.id,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+        let page = service
+            .list_edges(&EdgeFilter::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.items[0].version, 1);
+
+        let edge = Edge {
+            source: first.id,
+            destination: second.id,
+            edge_type_id: knows.id,
+            created_at: String::new(),
+        };
+        service
+            .set_edge_properties_checked(&edge, &serde_json::json!({"weight": 2}), 1)
+            .await
+            .unwrap();
+        let page = service
+            .list_edges(&EdgeFilter::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.items[0].version, 2);
+        assert!(matches!(
+            service
+                .set_edge_properties_checked(&edge, &serde_json::json!({"weight": 3}), 1)
+                .await,
+            Err(ServiceError::PreconditionFailed(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn if_match_versions_reject_stale_updates() {
         let service = service().await;
         let kind = seed_person(&service).await;
@@ -8454,6 +8531,15 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(created.version, 1);
+        let (with_properties, _) = service
+            .create_node_with_properties(
+                &node(kind, "ada with properties", ""),
+                &[],
+                Some(&serde_json::json!({"owner": "ada"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(with_properties.version, 1);
         let patch = NodePatch {
             description: Some("first".to_string()),
             ..Default::default()

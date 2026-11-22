@@ -828,6 +828,7 @@ pub async fn add_edge(
 )]
 pub async fn update_edge(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(params): Json<UpdateEdgeParameters>,
 ) -> Result<StatusCode, ApiError> {
     let edge = Edge {
@@ -836,10 +837,21 @@ pub async fn update_edge(
         edge_type_id: params.edge_type_id,
         created_at: String::new(),
     };
-    state
-        .graph_service
-        .set_edge_properties(&edge, &params.properties)
-        .await?;
+    let expected = parse_if_match(&headers)?;
+    match expected {
+        Some(version) => {
+            state
+                .graph_service
+                .set_edge_properties_checked(&edge, &params.properties, version)
+                .await?
+        }
+        None => {
+            state
+                .graph_service
+                .set_edge_properties(&edge, &params.properties)
+                .await?
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1822,6 +1834,7 @@ mod tests {
 
         let status = update_edge(
             State(state.clone()),
+            HeaderMap::new(),
             Json(UpdateEdgeParameters {
                 source: first.id,
                 destination: second.id,
@@ -1850,6 +1863,7 @@ mod tests {
 
         update_edge(
             State(state.clone()),
+            HeaderMap::new(),
             Json(UpdateEdgeParameters {
                 source: first.id,
                 destination: second.id,
@@ -1862,6 +1876,7 @@ mod tests {
 
         let missing = update_edge(
             State(state.clone()),
+            HeaderMap::new(),
             Json(UpdateEdgeParameters {
                 source: second.id,
                 destination: first.id,
@@ -1875,6 +1890,7 @@ mod tests {
 
         let invalid = update_edge(
             State(state.clone()),
+            HeaderMap::new(),
             Json(UpdateEdgeParameters {
                 source: first.id,
                 destination: second.id,
@@ -2427,6 +2443,7 @@ mod tests {
         assert_eq!(edges.total, 1);
         assert_eq!(edges.items[0].source, first.id);
         assert_eq!(edges.items[0].edge_type, "knows");
+        assert_eq!(edges.items[0].version, 1);
 
         let export = graph_export(State(state.clone()))
             .await
@@ -2561,6 +2578,58 @@ mod tests {
                 .iter()
                 .any(|edge_type| edge_type.name == "widget_part")
         );
+    }
+
+    #[tokio::test]
+    async fn update_edge_honours_if_match() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "person").await;
+        let first = new_node(&state, kind, "first", "", "", &[]).await;
+        let second = new_node(&state, kind, "second", "", "", &[]).await;
+        let knows = state
+            .graph_service
+            .create_edge_type(&EdgeType {
+                id: 0,
+                name: "knows".to_string(),
+                description: String::new(),
+                resolves: false,
+                single_outgoing: false,
+                acyclic: false,
+                source_kinds: None,
+                destination_kinds: None,
+                updated_at: String::new(),
+            })
+            .await
+            .expect("edge type");
+        state
+            .graph_service
+            .add_edge(&Edge {
+                source: first.id,
+                destination: second.id,
+                edge_type_id: knows.id,
+                created_at: String::new(),
+            })
+            .await
+            .expect("edge");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_MATCH, axum::http::HeaderValue::from_static("1"));
+        let params = || UpdateEdgeParameters {
+            source: first.id,
+            destination: second.id,
+            edge_type_id: knows.id,
+            properties: serde_json::json!({"weight": 1}),
+        };
+        let status = update_edge(State(state.clone()), headers.clone(), Json(params()))
+            .await
+            .expect("matching edge version");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let error = update_edge(State(state.clone()), headers, Json(params()))
+            .await
+            .expect_err("stale edge version");
+        assert_eq!(error.status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(error.code, "precondition_failed");
     }
 
     #[tokio::test]
