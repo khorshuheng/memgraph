@@ -77,8 +77,8 @@ pub const ENDPOINTS: &[EndpointDoc] = &[
     },
     EndpointDoc {
         method: "GET",
-        path: "/api/nodes?ids=1,2",
-        description: "Batch-get nodes by id in request order (max 200).",
+        path: "/api/nodes",
+        description: "Batch-get nodes by ids in request order (max 200).",
         example: "curl '$BASE/api/nodes?ids=120,119'",
     },
     EndpointDoc {
@@ -133,25 +133,25 @@ pub const ENDPOINTS: &[EndpointDoc] = &[
         method: "GET",
         path: "/api/edges",
         description: "List edges filtered by edge_type, source or destination.",
-        example: "curl '$BASE/api/edges?edge_type=implements&source=137'",
+        example: "curl '$BASE/api/edges?edge_type=belongs_to&source=119'",
     },
     EndpointDoc {
         method: "POST",
         path: "/api/edges",
         description: "Create an edge; endpoints accept ids or {kind,name}, type accepts id or name.",
-        example: "curl -X POST $BASE/api/edges -H 'content-type: application/json' -d '{\"source\":{\"kind\":\"task\",\"name\":\"a\"},\"destination\":{\"kind\":\"task\",\"name\":\"b\"},\"edge_type\":\"depends_on\"}'",
+        example: "curl -X POST $BASE/api/edges -H 'content-type: application/json' -d '{\"source\":122,\"destination\":120,\"edge_type\":\"depends_on\"}'",
     },
     EndpointDoc {
         method: "PATCH",
         path: "/api/edges",
         description: "Replace edge properties for an exact triple.",
-        example: "curl -X PATCH $BASE/api/edges -H 'content-type: application/json' -d '{\"source\":1,\"destination\":2,\"edge_type_id\":3,\"properties\":{\"note\":\"x\"}}'",
+        example: "curl -X PATCH $BASE/api/edges -H 'content-type: application/json' -d '{\"source\":119,\"destination\":1,\"edge_type_id\":1,\"properties\":{\"note\":\"x\"}}'",
     },
     EndpointDoc {
         method: "DELETE",
         path: "/api/edges",
         description: "Delete an edge by triple.",
-        example: "curl -X DELETE '$BASE/api/edges?source=1&destination=2&edge_type_id=3'",
+        example: "curl -X DELETE '$BASE/api/edges?source=119&destination=1&edge_type_id=1'",
     },
     EndpointDoc {
         method: "GET",
@@ -175,13 +175,13 @@ pub const ENDPOINTS: &[EndpointDoc] = &[
         method: "POST",
         path: "/api/plans",
         description: "Create a goal with a task tree, dependencies and wiring in one transaction.",
-        example: "curl -X POST $BASE/api/plans -H 'content-type: application/json' -d '{\"goal\":{\"name\":\"ship\"},\"anchor\":{\"node_id\":1,\"edge_type\":\"belongs_to\"},\"tasks\":[{\"key\":\"a\",\"name\":\"first\"}]}'",
+        example: "curl -X POST $BASE/api/plans -H 'content-type: application/json' -d '{\"goal\":{\"name\":\"ship\",\"description\":\"\",\"content\":\"\"},\"anchor\":{\"node_id\":1,\"edge_type\":\"belongs_to\"},\"tasks\":[{\"key\":\"a\",\"name\":\"first\",\"description\":\"\",\"content\":\"\"}]}'",
     },
     EndpointDoc {
         method: "POST",
         path: "/api/changes",
         description: "Record a landed change: implements task refs and modifies file refs atomically.",
-        example: "curl -X POST $BASE/api/changes -H 'content-type: application/json' -d '{\"commit\":\"abc1234\",\"title\":\"do work\",\"tasks\":[{\"kind\":\"task\",\"name\":\"new task\"}],\"files\":[\"src/lib.rs\"]}'",
+        example: "curl -X POST $BASE/api/changes -H 'content-type: application/json' -d '{\"commit\":\"abc1234\",\"title\":\"do work\",\"tasks\":[120],\"files\":[]}'",
     },
     EndpointDoc {
         method: "GET",
@@ -239,6 +239,7 @@ pub struct ApiEndpointResponse {
 pub struct ApiIndexResponse {
     pub name: String,
     pub version: String,
+    pub base_url: String,
     pub openapi: String,
     pub llms_txt: String,
     pub endpoints: Vec<ApiEndpointResponse>,
@@ -256,6 +257,7 @@ pub async fn api_index() -> ApiSuccess<ApiIndexResponse> {
         data: ApiIndexResponse {
             name: env!("CARGO_PKG_NAME").to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            base_url: "http://127.0.0.1:7373".to_string(),
             openapi: "/openapi.json".to_string(),
             llms_txt: "/llms.txt".to_string(),
             endpoints: ENDPOINTS
@@ -290,9 +292,13 @@ fn llms_text() -> String {
         "# memgraph\n\n\
          Rust HTTP graph store over SQLite. Use tags, properties and edges to track \
          goals, tasks, changes and files.\n\n\
-         Base URL: `http://127.0.0.1:7373` (set `BASE` below).\n\
+         Base URL: `http://127.0.0.1:7373`.\n\n\
+         ```bash\n\
+         export BASE=http://127.0.0.1:7373\n\
+         ```\n\n\
          Machine-readable contract: `GET /openapi.json`. One call vocabulary: \
-         `GET /api/vocabulary`.\n\n\
+         `GET /api/vocabulary`. Ids in the examples come from the running graph; \
+         discover them with `GET /api/nodes` or `GET /api/vocabulary`.\n\n\
          ## Endpoints (one example per route)\n",
     );
     for endpoint in ENDPOINTS {
@@ -306,11 +312,14 @@ fn llms_text() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[tokio::test]
     async fn index_and_llms_txt_cover_every_endpoint() {
         let index = api_index().await;
+        assert_eq!(index.data.base_url, "http://127.0.0.1:7373");
         assert_eq!(index.data.endpoints.len(), ENDPOINTS.len());
         assert!(
             index
@@ -321,6 +330,7 @@ mod tests {
         );
 
         let text = llms_text();
+        assert!(text.contains("export BASE=http://127.0.0.1:7373"));
         for endpoint in ENDPOINTS {
             assert!(
                 text.contains(&format!("{} {}", endpoint.method, endpoint.path)),
@@ -335,5 +345,15 @@ mod tests {
                 endpoint.path
             );
         }
+    }
+
+    #[tokio::test]
+    async fn endpoint_table_matches_the_openapi_paths() {
+        let doc = crate::routes::root::openapi_doc().await;
+        let openapi_paths: HashSet<&str> = doc.paths.paths.keys().map(String::as_str).collect();
+        let mut documented: HashSet<&str> =
+            ENDPOINTS.iter().map(|endpoint| endpoint.path).collect();
+        documented.remove("/openapi.json");
+        assert_eq!(documented, openapi_paths);
     }
 }
