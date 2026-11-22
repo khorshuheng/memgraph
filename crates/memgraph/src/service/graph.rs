@@ -9,9 +9,9 @@ use crate::{
         NodePatch, NodeRef, PackDraft, PackEdgeType, PackNodeKind, PackProperty, PackReport,
         PendingEdge, PendingNode, Plan, PlanDraft, PlanTask, PlanTaskDraft, PropertyType,
         ReachFilter, SearchPage, TagUsage, TaskDraft, TaskPatch, WorkDependency, WorkFilter,
-        WorkRef, WorkStatus, WorkTask,
+        WorkPage, WorkRef, WorkStatus, WorkTask,
     },
-    repository::graph::{GraphRepository, WorkTaskRow},
+    repository::graph::{GraphRepository, WorkSnapshot},
 };
 
 use super::error::ServiceError;
@@ -797,7 +797,7 @@ impl GraphService {
         };
         let pending = PendingNode {
             node,
-            properties: None,
+            properties: draft.properties.clone(),
             tags,
         };
         let mut edges = Vec::new();
@@ -1047,17 +1047,24 @@ impl GraphService {
         &self,
         filter: &WorkFilter,
         only_ready: bool,
-    ) -> Result<Vec<WorkTask>, ServiceError> {
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<WorkPage, ServiceError> {
         self.validate_work_filter(filter).await?;
-        let rows = self.repository.work_tasks(filter).await?;
-        let rows = rows
-            .into_iter()
-            .filter(|row| !row.done && (!only_ready || !row.blocked))
-            .collect();
-        self.assemble_work_tasks(rows).await
+        let (limit, offset) = self.work_page(limit, offset);
+        let snapshot = self
+            .repository
+            .work_snapshot(filter, only_ready, false, limit, offset)
+            .await?;
+        Ok(assemble_work_page(snapshot))
     }
 
-    pub async fn goal_tree(&self, goal_id: i64) -> Result<(Node, Vec<WorkTask>), ServiceError> {
+    pub async fn goal_tree(
+        &self,
+        goal_id: i64,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<(Node, WorkPage), ServiceError> {
         let goal = self.get_node(goal_id).await?;
         let goal_kind = self.kind_id("goal").await?;
         if goal.kind_id != goal_kind {
@@ -1065,15 +1072,30 @@ impl GraphService {
                 "node {goal_id} is not a goal"
             )));
         }
-        let rows = self
+        let (limit, offset) = self.work_page(limit, offset);
+        let snapshot = self
             .repository
-            .work_tasks(&WorkFilter {
-                goal: Some(goal_id),
-                repo: None,
-            })
+            .work_snapshot(
+                &WorkFilter {
+                    goal: Some(goal_id),
+                    repo: None,
+                },
+                false,
+                true,
+                limit,
+                offset,
+            )
             .await?;
-        let tasks = self.assemble_work_tasks(rows).await?;
-        Ok((goal, tasks))
+        Ok((goal, assemble_work_page(snapshot)))
+    }
+
+    fn work_page(&self, limit: Option<i64>, offset: Option<i64>) -> (i64, i64) {
+        (
+            limit
+                .unwrap_or(self.paging.default_limit)
+                .clamp(1, self.paging.max_limit),
+            offset.unwrap_or(0).max(0),
+        )
     }
 
     async fn validate_work_filter(&self, filter: &WorkFilter) -> Result<(), ServiceError> {
@@ -1097,56 +1119,55 @@ impl GraphService {
         }
         Ok(())
     }
+}
 
-    async fn assemble_work_tasks(
-        &self,
-        rows: Vec<WorkTaskRow>,
-    ) -> Result<Vec<WorkTask>, ServiceError> {
-        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
-        let dependencies = self.repository.work_dependencies(&ids).await?;
-        let implementations = self.repository.work_implementations(&ids).await?;
-        let mut deps_by_task: HashMap<i64, Vec<WorkDependency>> = HashMap::new();
-        for dependency in dependencies {
-            deps_by_task
-                .entry(dependency.task_id)
-                .or_default()
-                .push(WorkDependency {
-                    id: dependency.dependency_id,
-                    name: dependency.dependency_name,
-                    done: dependency.done,
-                });
-        }
-        let mut impls_by_task: HashMap<i64, Vec<WorkRef>> = HashMap::new();
-        for implementation in implementations {
-            impls_by_task
-                .entry(implementation.task_id)
-                .or_default()
-                .push(WorkRef {
-                    id: implementation.change_id,
-                    name: implementation.change_name,
-                });
-        }
-        let mut tasks = Vec::with_capacity(rows.len());
-        for row in rows {
-            let status = if row.done {
-                WorkStatus::Done
-            } else if row.blocked {
-                WorkStatus::Blocked
-            } else {
-                WorkStatus::Pending
-            };
-            tasks.push(WorkTask {
-                id: row.id,
-                name: row.name,
-                status,
-                updated_at: row.updated_at,
-                goal_id: row.goal_id,
-                goal_name: row.goal_name,
-                depends_on: deps_by_task.remove(&row.id).unwrap_or_default(),
-                implemented_by: impls_by_task.remove(&row.id).unwrap_or_default(),
+fn assemble_work_page(snapshot: WorkSnapshot) -> WorkPage {
+    let mut deps_by_task: HashMap<i64, Vec<WorkDependency>> = HashMap::new();
+    for dependency in snapshot.dependencies {
+        deps_by_task
+            .entry(dependency.task_id)
+            .or_default()
+            .push(WorkDependency {
+                id: dependency.dependency_id,
+                name: dependency.dependency_name,
+                done: dependency.done,
             });
-        }
-        Ok(tasks)
+    }
+    let mut impls_by_task: HashMap<i64, Vec<WorkRef>> = HashMap::new();
+    for implementation in snapshot.implementations {
+        impls_by_task
+            .entry(implementation.task_id)
+            .or_default()
+            .push(WorkRef {
+                id: implementation.change_id,
+                name: implementation.change_name,
+            });
+    }
+    let mut items = Vec::with_capacity(snapshot.rows.len());
+    for row in snapshot.rows {
+        let status = if row.done {
+            WorkStatus::Done
+        } else if row.blocked {
+            WorkStatus::Blocked
+        } else {
+            WorkStatus::Pending
+        };
+        items.push(WorkTask {
+            id: row.id,
+            name: row.name,
+            status,
+            updated_at: row.updated_at,
+            goal_id: row.goal_id,
+            goal_name: row.goal_name,
+            depends_on: deps_by_task.remove(&row.id).unwrap_or_default(),
+            implemented_by: impls_by_task.remove(&row.id).unwrap_or_default(),
+        });
+    }
+    WorkPage {
+        items,
+        total: snapshot.total,
+        limit: snapshot.limit,
+        offset: snapshot.offset,
     }
 }
 
@@ -6976,9 +6997,10 @@ mod tests {
             .unwrap();
 
         let pending = service
-            .work_report(&WorkFilter::default(), false)
+            .work_report(&WorkFilter::default(), false, None, None)
             .await
-            .unwrap();
+            .unwrap()
+            .items;
         let statuses: Vec<(&str, WorkStatus)> = pending
             .iter()
             .map(|task| (task.name.as_str(), task.status))
@@ -6997,15 +7019,17 @@ mod tests {
         assert!(ready_entry.implemented_by.is_empty());
 
         let next = service
-            .work_report(&WorkFilter::default(), true)
+            .work_report(&WorkFilter::default(), true, None, None)
             .await
-            .unwrap();
+            .unwrap()
+            .items;
         assert_eq!(
             next.iter().map(|task| task.id).collect::<Vec<_>>(),
             vec![ready.id]
         );
 
-        let (tree_goal, tree) = service.goal_tree(goal).await.unwrap();
+        let (tree_goal, tree) = service.goal_tree(goal, None, None).await.unwrap();
+        let tree = tree.items;
         assert_eq!(tree_goal.id, goal);
         assert_eq!(tree.len(), 3);
         let done_entry = tree.iter().find(|task| task.id == done.id).unwrap();
@@ -7037,9 +7061,12 @@ mod tests {
                     repo: None,
                 },
                 false,
+                None,
+                None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .items;
         assert!(in_goal.iter().all(|task| task.id != other_task.id));
         let in_repo = service
             .work_report(
@@ -7048,17 +7075,29 @@ mod tests {
                     repo: Some(repo),
                 },
                 false,
+                None,
+                None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .items;
         assert!(in_repo.iter().any(|task| task.id == other_task.id));
 
+        let page = service
+            .work_report(&WorkFilter::default(), false, Some(1), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.limit, 1);
+        assert_eq!(page.offset, 1);
+
         assert!(matches!(
-            service.goal_tree(blocked.id).await,
+            service.goal_tree(blocked.id, None, None).await,
             Err(ServiceError::UnprocessableEntity(_))
         ));
         assert!(matches!(
-            service.goal_tree(999_999).await,
+            service.goal_tree(999_999, None, None).await,
             Err(ServiceError::EntityNotFound)
         ));
         assert!(matches!(
@@ -7069,6 +7108,8 @@ mod tests {
                         repo: None,
                     },
                     false,
+                    None,
+                    None,
                 )
                 .await,
             Err(ServiceError::UnprocessableEntity(_))
@@ -7099,6 +7140,7 @@ mod tests {
             summary: "details".to_string(),
             tasks: vec![task.id, task.id],
             files: vec!["src/lib.rs".to_string(), " src/main.rs ".to_string()],
+            properties: None,
             tags: Some(vec!["Repo:X".to_string()]),
         };
         let change = service.create_change(&draft).await.unwrap();
@@ -7111,7 +7153,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outgoing.len(), 3);
-        let tree = service.goal_tree(goal).await.unwrap().1;
+        let tree = service.goal_tree(goal, None, None).await.unwrap().1.items;
         assert_eq!(tree[0].status, WorkStatus::Done);
         assert_eq!(tree[0].implemented_by[0].name, "abc123");
 
@@ -7163,5 +7205,209 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(changes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn work_views_do_not_enumerate_paths_in_a_diamond_dag() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+        let task_kind = seeded_kind(&service, "task").await;
+        let part_of = seeded_edge_type(&service, "part_of").await;
+
+        let mut previous: Vec<i64> = Vec::new();
+        for layer in 0..12 {
+            let mut current = Vec::new();
+            for lane in 0..2 {
+                let created = service
+                    .upsert_node(&node(task_kind, &format!("diamond {layer}-{lane}"), ""))
+                    .await
+                    .unwrap();
+                if layer == 0 {
+                    service
+                        .add_edge(&Edge {
+                            source: created.id,
+                            destination: goal,
+                            edge_type_id: part_of,
+                            created_at: String::new(),
+                        })
+                        .await
+                        .unwrap();
+                } else {
+                    for parent in &previous {
+                        service
+                            .add_edge(&Edge {
+                                source: created.id,
+                                destination: *parent,
+                                edge_type_id: part_of,
+                                created_at: String::new(),
+                            })
+                            .await
+                            .unwrap();
+                    }
+                }
+                current.push(created.id);
+            }
+            previous = current;
+        }
+
+        let started = std::time::Instant::now();
+        let page = service
+            .work_report(&WorkFilter::default(), false, None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.total, 24);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn work_views_terminate_on_a_part_of_cycle() {
+        let service = service().await;
+        service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![],
+                edge_types: vec![PackEdgeType {
+                    name: "part_of".to_string(),
+                    description: None,
+                    resolves: None,
+                    single_outgoing: None,
+                    acyclic: Some(false),
+                    source_kinds: Some(vec!["task".to_string()]),
+                    destination_kinds: Some(vec!["task".to_string(), "goal".to_string()]),
+                }],
+            })
+            .await
+            .unwrap();
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+        let task_kind = seeded_kind(&service, "task").await;
+        let part_of = seeded_edge_type(&service, "part_of").await;
+        let first = service
+            .upsert_node(&node(task_kind, "cycle a", ""))
+            .await
+            .unwrap();
+        let second = service
+            .upsert_node(&node(task_kind, "cycle b", ""))
+            .await
+            .unwrap();
+        for (source, destination) in [
+            (first.id, goal),
+            (second.id, first.id),
+            (first.id, second.id),
+        ] {
+            service
+                .add_edge(&Edge {
+                    source,
+                    destination,
+                    edge_type_id: part_of,
+                    created_at: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.work_report(&WorkFilter::default(), false, None, None),
+        )
+        .await
+        .expect("work view must terminate on a cycle")
+        .unwrap();
+        assert_eq!(page.total, 2);
+    }
+
+    #[tokio::test]
+    async fn changes_carry_properties_and_respect_strict_declarations() {
+        let service = service().await;
+        service
+            .apply_pack(&PackDraft {
+                node_kinds: vec![PackNodeKind {
+                    name: "change".to_string(),
+                    description: None,
+                    unique_name: None,
+                    strict_properties: Some(true),
+                    properties: Some(vec![property("author", "string", true)]),
+                }],
+                edge_types: vec![],
+            })
+            .await
+            .unwrap();
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+        let mut task = new_task("property task");
+        task.parent = Some(goal);
+        let task = service.create_task(&task).await.unwrap();
+
+        let draft = ChangeDraft {
+            commit: "withprops".to_string(),
+            title: "t".to_string(),
+            summary: String::new(),
+            tasks: vec![task.id],
+            files: vec![],
+            properties: Some(serde_json::json!({"author": "ada"})),
+            tags: None,
+        };
+        let change = service.create_change(&draft).await.unwrap();
+        assert_eq!(
+            service.node_properties(change.id).await.unwrap(),
+            serde_json::json!({"author": "ada"})
+        );
+
+        let mut missing = draft.clone();
+        missing.commit = "noprops".to_string();
+        missing.properties = None;
+        assert!(matches!(
+            service.create_change(&missing).await,
+            Err(ServiceError::UnprocessableEntity(message)) if message.contains("author")
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_duplicate_changes_conflict_cleanly() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "memgraph-change-race-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let service = file_service(&path).await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+        let mut task = new_task("race task");
+        task.parent = Some(goal);
+        let task = service.create_task(&task).await.unwrap();
+        let draft = ChangeDraft {
+            commit: "race123".to_string(),
+            title: "race".to_string(),
+            summary: String::new(),
+            tasks: vec![task.id],
+            files: vec![],
+            properties: None,
+            tags: None,
+        };
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let service = service.clone();
+            let draft = draft.clone();
+            handles.push(tokio::spawn(
+                async move { service.create_change(&draft).await },
+            ));
+        }
+        let mut created = 0;
+        let mut conflicts = 0;
+        for handle in handles {
+            match handle.await.unwrap() {
+                Ok(_) => created += 1,
+                Err(ServiceError::Conflict(_)) => conflicts += 1,
+                Err(error) => panic!("unexpected error: {error:?}"),
+            }
+        }
+        assert_eq!((created, conflicts), (1, 3));
+
+        drop(service);
+        remove_sqlite(&path);
     }
 }

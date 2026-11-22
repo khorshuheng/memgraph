@@ -12,10 +12,10 @@ use crate::{
             CreatePlanParameters, CreateTaskParameters, DeleteEdgeParameters, EdgeTypeResponse,
             GoalTreeResponse, ImportParameters, ImportReportResponse, ListNodesParameters,
             ListNodesResponse, NeighborParameters, NeighborResponse, NodeKindResponse,
-            NodeResponse, PackReportResponse, PlanResponse, PlanTaskResponse,
+            NodeResponse, PackReportResponse, PageParameters, PlanResponse, PlanTaskResponse,
             ReplaceTagsParameters, SearchHitResponse, SearchParameters, SearchResponse,
             TagUsageResponse, UpdateEdgeParameters, UpdateNodeParameters, UpdateTaskParameters,
-            WorkParameters, WorkTaskResponse,
+            WorkListResponse, WorkParameters,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
@@ -183,7 +183,12 @@ pub async fn create_task(
     post,
     path = "/changes",
     request_body = CreateChangeParameters,
-    responses((status = 201, description = "Change recorded", body = NodeResponse))
+    responses(
+        (status = 201, description = "Change recorded", body = NodeResponse),
+        (status = 404, description = "A referenced task was not found"),
+        (status = 409, description = "A change with this commit already exists"),
+        (status = 422, description = "A referenced file is unknown, a node has the wrong kind, or properties violate the change kind")
+    )
 )]
 pub async fn create_change(
     State(state): State<AppState>,
@@ -466,17 +471,26 @@ pub async fn list_tags(
     get,
     path = "/work/pending",
     params(WorkParameters),
-    responses((status = 200, description = "Unfinished tasks with their dependency state", body = ApiList<WorkTaskResponse>))
+    responses(
+        (status = 200, description = "Unfinished tasks with their dependency state", body = WorkListResponse),
+        (status = 404, description = "Goal or repo filter not found"),
+        (status = 422, description = "Filter node has the wrong kind")
+    )
 )]
 pub async fn work_pending(
     State(state): State<AppState>,
     Query(params): Query<WorkParameters>,
-) -> Result<ApiList<WorkTaskResponse>, ApiError> {
+) -> Result<ApiSuccess<WorkListResponse>, ApiError> {
+    let limit = params.limit;
+    let offset = params.offset;
     let filter: WorkFilter = params.into();
-    let tasks = state.graph_service.work_report(&filter, false).await?;
-    Ok(ApiList {
+    let page = state
+        .graph_service
+        .work_report(&filter, false, limit, offset)
+        .await?;
+    Ok(ApiSuccess {
         status: StatusCode::OK,
-        items: tasks.into_iter().map(Into::into).collect(),
+        data: page.into(),
     })
 }
 
@@ -485,17 +499,26 @@ pub async fn work_pending(
     get,
     path = "/work/next",
     params(WorkParameters),
-    responses((status = 200, description = "Unfinished tasks whose dependencies are all done", body = ApiList<WorkTaskResponse>))
+    responses(
+        (status = 200, description = "Unfinished tasks whose dependencies are all done", body = WorkListResponse),
+        (status = 404, description = "Goal or repo filter not found"),
+        (status = 422, description = "Filter node has the wrong kind")
+    )
 )]
 pub async fn work_next(
     State(state): State<AppState>,
     Query(params): Query<WorkParameters>,
-) -> Result<ApiList<WorkTaskResponse>, ApiError> {
+) -> Result<ApiSuccess<WorkListResponse>, ApiError> {
+    let limit = params.limit;
+    let offset = params.offset;
     let filter: WorkFilter = params.into();
-    let tasks = state.graph_service.work_report(&filter, true).await?;
-    Ok(ApiList {
+    let page = state
+        .graph_service
+        .work_report(&filter, true, limit, offset)
+        .await?;
+    Ok(ApiSuccess {
         status: StatusCode::OK,
-        items: tasks.into_iter().map(Into::into).collect(),
+        data: page.into(),
     })
 }
 
@@ -503,7 +526,7 @@ pub async fn work_next(
     tag = "Graph",
     get,
     path = "/goals/{goal_id}/tree",
-    params(("goal_id" = i64, Path, description = "Goal id")),
+    params(PageParameters, ("goal_id" = i64, Path, description = "Goal id")),
     responses(
         (status = 200, description = "Goal with its task tree and status", body = GoalTreeResponse),
         (status = 404, description = "Goal not found"),
@@ -513,15 +536,22 @@ pub async fn work_next(
 pub async fn goal_tree(
     State(state): State<AppState>,
     Path(goal_id): Path<i64>,
+    Query(params): Query<PageParameters>,
 ) -> Result<ApiSuccess<GoalTreeResponse>, ApiError> {
-    let (goal, tasks) = state.graph_service.goal_tree(goal_id).await?;
+    let (goal, page) = state
+        .graph_service
+        .goal_tree(goal_id, params.limit, params.offset)
+        .await?;
     let tags = state.graph_service.node_tags(goal.id).await?;
     let properties = state.graph_service.node_properties(goal.id).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
         data: GoalTreeResponse {
             goal: NodeResponse::with_tags_and_properties(goal, tags, properties),
-            tasks: tasks.into_iter().map(Into::into).collect(),
+            tasks: page.items.into_iter().map(Into::into).collect(),
+            total: page.total,
+            limit: page.limit,
+            offset: page.offset,
         },
     })
 }
@@ -1866,42 +1896,69 @@ mod tests {
             Query(WorkParameters {
                 goal: Some(goal),
                 repo: None,
+                limit: None,
+                offset: None,
             }),
         )
         .await
         .expect("pending");
-        assert_eq!(pending.items.len(), 1);
-        assert_eq!(pending.items[0].id, task.id);
-        assert_eq!(pending.items[0].status, "pending");
-        assert_eq!(pending.items[0].goal.as_ref().expect("goal").id, goal);
+        assert_eq!(pending.data.items.len(), 1);
+        assert_eq!(pending.data.total, 1);
+        assert_eq!(pending.data.items[0].id, task.id);
+        assert_eq!(pending.data.items[0].status, "pending");
+        assert_eq!(pending.data.items[0].goal.as_ref().expect("goal").id, goal);
 
         let next = work_next(
             State(state.clone()),
             Query(WorkParameters {
                 goal: None,
                 repo: None,
+                limit: None,
+                offset: None,
             }),
         )
         .await
         .expect("next");
-        assert_eq!(next.items.len(), 1);
+        assert_eq!(next.data.items.len(), 1);
 
-        let tree = goal_tree(State(state.clone()), Path(goal))
-            .await
-            .expect("tree")
-            .data;
+        let tree = goal_tree(
+            State(state.clone()),
+            Path(goal),
+            Query(PageParameters {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("tree")
+        .data;
         assert_eq!(tree.goal.id, goal);
         assert_eq!(tree.tasks.len(), 1);
+        assert_eq!(tree.total, 1);
         assert_eq!(tree.tasks[0].status, "pending");
 
-        let error = goal_tree(State(state.clone()), Path(task.id))
-            .await
-            .expect_err("task is not a goal");
+        let error = goal_tree(
+            State(state.clone()),
+            Path(task.id),
+            Query(PageParameters {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect_err("task is not a goal");
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
 
-        let error = goal_tree(State(state.clone()), Path(999_999))
-            .await
-            .expect_err("missing goal");
+        let error = goal_tree(
+            State(state.clone()),
+            Path(999_999),
+            Query(PageParameters {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect_err("missing goal");
         assert_eq!(error.status, StatusCode::NOT_FOUND);
     }
 
@@ -1945,6 +2002,7 @@ mod tests {
                 summary: "details".to_string(),
                 tasks: vec![task.id],
                 files: vec!["src/lib.rs".to_string()],
+                properties: Some(serde_json::json!({"author": "ada"})),
                 tags: Some(vec!["API".to_string()]),
             }),
         )
@@ -1953,6 +2011,7 @@ mod tests {
         .data;
         assert_eq!(change.name, "feed42");
         assert_eq!(change.tags, vec!["api"]);
+        assert_eq!(change.properties, serde_json::json!({"author": "ada"}));
         let outgoing = state
             .graph_service
             .neighbors(change.id, crate::model::NeighborDirection::Outgoing, None)
@@ -1965,10 +2024,12 @@ mod tests {
             Query(WorkParameters {
                 goal: Some(goal),
                 repo: None,
+                limit: None,
+                offset: None,
             }),
         )
         .await
         .expect("pending");
-        assert!(pending.items.is_empty());
+        assert!(pending.data.items.is_empty());
     }
 }

@@ -94,6 +94,16 @@ pub struct WorkImplementationRow {
     pub change_name: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkSnapshot {
+    pub rows: Vec<WorkTaskRow>,
+    pub dependencies: Vec<WorkDependencyRow>,
+    pub implementations: Vec<WorkImplementationRow>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 #[async_trait]
 pub trait GraphRepository: Send + Sync {
     async fn create_node_kind(&self, node_kind: &NodeKind) -> Result<NodeKind, RepositoryError>;
@@ -158,15 +168,14 @@ pub trait GraphRepository: Send + Sync {
         ids: &[i64],
     ) -> Result<HashMap<i64, Vec<NodeKindProperty>>, RepositoryError>;
     async fn list_tags(&self) -> Result<Vec<TagUsage>, RepositoryError>;
-    async fn work_tasks(&self, filter: &WorkFilter) -> Result<Vec<WorkTaskRow>, RepositoryError>;
-    async fn work_dependencies(
+    async fn work_snapshot(
         &self,
-        task_ids: &[i64],
-    ) -> Result<Vec<WorkDependencyRow>, RepositoryError>;
-    async fn work_implementations(
-        &self,
-        task_ids: &[i64],
-    ) -> Result<Vec<WorkImplementationRow>, RepositoryError>;
+        filter: &WorkFilter,
+        only_ready: bool,
+        include_done: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<WorkSnapshot, RepositoryError>;
 
     async fn add_edge(&self, edge: &Edge) -> Result<(), RepositoryError>;
     async fn add_edge_with_properties(
@@ -798,112 +807,41 @@ impl GraphRepository for SqliteGraphRepository {
         Ok(rows)
     }
 
-    async fn work_tasks(&self, filter: &WorkFilter) -> Result<Vec<WorkTaskRow>, RepositoryError> {
-        let mut builder = QueryBuilder::new(
-            "WITH RECURSIVE ancestry(task_id, node_id, depth) AS ( \
-               SELECT e.source, e.destination, 1 FROM edge e \
-                 WHERE e.edge_type_id = (SELECT id FROM edge_type WHERE name = 'part_of') \
-               UNION ALL \
-               SELECT a.task_id, e.destination, a.depth + 1 FROM ancestry a \
-                 JOIN edge e ON e.source = a.node_id \
-                 WHERE e.edge_type_id = (SELECT id FROM edge_type WHERE name = 'part_of') \
-             ), tasks AS ( \
-               SELECT n.id, n.name, n.updated_at, \
-                 EXISTS(SELECT 1 FROM edge i WHERE i.destination = n.id \
-                   AND i.edge_type_id = (SELECT id FROM edge_type WHERE name = 'implements')) AS done \
-               FROM node n JOIN node_kind k ON k.id = n.kind_id AND k.name = 'task' \
-             ) \
-             SELECT t.id, t.name, t.updated_at, t.done, \
-               (t.done = 0 AND EXISTS(SELECT 1 FROM edge d WHERE d.source = t.id \
-                 AND d.edge_type_id = (SELECT id FROM edge_type WHERE name = 'depends_on') \
-                 AND NOT EXISTS(SELECT 1 FROM edge i2 WHERE i2.destination = d.destination \
-                   AND i2.edge_type_id = (SELECT id FROM edge_type WHERE name = 'implements')))) AS blocked, \
-               g.id AS goal_id, g.name AS goal_name \
-             FROM tasks t \
-             LEFT JOIN (SELECT task_id, node_id FROM ( \
-                 SELECT a.task_id, a.node_id, \
-                   ROW_NUMBER() OVER (PARTITION BY a.task_id ORDER BY a.depth) AS rn \
-                 FROM ancestry a JOIN node gk ON gk.id = a.node_id \
-                 JOIN node_kind gkk ON gkk.id = gk.kind_id AND gkk.name = 'goal' \
-               ) WHERE rn = 1) ng ON ng.task_id = t.id \
-             LEFT JOIN node g ON g.id = ng.node_id \
-             WHERE 1 = 1",
-        );
-        if let Some(goal) = filter.goal {
-            builder.push(
-                " AND EXISTS (SELECT 1 FROM ancestry a WHERE a.task_id = t.id AND a.node_id = ",
-            );
-            builder.push_bind(goal);
-            builder.push(")");
-        }
-        if let Some(repo) = filter.repo {
-            builder.push(
-                " AND EXISTS (SELECT 1 FROM ancestry a JOIN edge b ON b.source = a.node_id \
-                   AND b.edge_type_id = (SELECT id FROM edge_type WHERE name = 'belongs_to') \
-                   WHERE a.task_id = t.id AND b.destination = ",
-            );
-            builder.push_bind(repo);
-            builder.push(")");
-        }
-        builder.push(" ORDER BY t.id");
-        let rows = builder
-            .build_query_as::<WorkTaskRow>()
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows)
-    }
-
-    async fn work_dependencies(
+    async fn work_snapshot(
         &self,
-        task_ids: &[i64],
-    ) -> Result<Vec<WorkDependencyRow>, RepositoryError> {
-        if task_ids.is_empty() {
-            return Ok(Vec::new());
+        filter: &WorkFilter,
+        only_ready: bool,
+        include_done: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<WorkSnapshot, RepositoryError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN")
+            .execute(&mut *connection)
+            .await
+            .map_err(RepositoryError::from)?;
+        match work_snapshot_items(
+            &mut connection,
+            filter,
+            only_ready,
+            include_done,
+            limit,
+            offset,
+        )
+        .await
+        {
+            Ok(snapshot) => {
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(RepositoryError::from(error));
+                }
+                Ok(snapshot)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
         }
-        let mut builder = QueryBuilder::new(
-            "SELECT d.source AS task_id, d.destination AS dependency_id, \
-               n.name AS dependency_name, \
-               EXISTS(SELECT 1 FROM edge i WHERE i.destination = d.destination \
-                 AND i.edge_type_id = (SELECT id FROM edge_type WHERE name = 'implements')) AS done \
-             FROM edge d JOIN node n ON n.id = d.destination \
-             WHERE d.edge_type_id = (SELECT id FROM edge_type WHERE name = 'depends_on') \
-               AND d.source IN (",
-        );
-        let mut separated = builder.separated(", ");
-        for id in task_ids {
-            separated.push_bind(*id);
-        }
-        builder.push(") ORDER BY d.source, d.destination");
-        let rows = builder
-            .build_query_as::<WorkDependencyRow>()
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows)
-    }
-
-    async fn work_implementations(
-        &self,
-        task_ids: &[i64],
-    ) -> Result<Vec<WorkImplementationRow>, RepositoryError> {
-        if task_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut builder = QueryBuilder::new(
-            "SELECT i.destination AS task_id, c.id AS change_id, c.name AS change_name \
-             FROM edge i JOIN node c ON c.id = i.source \
-             WHERE i.edge_type_id = (SELECT id FROM edge_type WHERE name = 'implements') \
-               AND i.destination IN (",
-        );
-        let mut separated = builder.separated(", ");
-        for id in task_ids {
-            separated.push_bind(*id);
-        }
-        builder.push(") ORDER BY i.destination, c.id");
-        let rows = builder
-            .build_query_as::<WorkImplementationRow>()
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows)
     }
 
     async fn search_nodes(
@@ -2244,6 +2182,144 @@ async fn insert_nodes_with_edges_items(
         .await?;
     }
     Ok(created)
+}
+
+async fn work_snapshot_items(
+    connection: &mut SqliteConnection,
+    filter: &WorkFilter,
+    only_ready: bool,
+    include_done: bool,
+    limit: i64,
+    offset: i64,
+) -> Result<WorkSnapshot, RepositoryError> {
+    let rows = work_task_rows(connection, filter).await?;
+    let rows: Vec<WorkTaskRow> = rows
+        .into_iter()
+        .filter(|row| (include_done || !row.done) && (!only_ready || !row.blocked))
+        .collect();
+    let total = rows.len() as i64;
+    let offset = offset.max(0) as usize;
+    let limit = limit.max(0) as usize;
+    let page: Vec<WorkTaskRow> = rows.into_iter().skip(offset).take(limit).collect();
+    let ids: Vec<i64> = page.iter().map(|row| row.id).collect();
+    let dependencies = work_dependency_rows(connection, &ids).await?;
+    let implementations = work_implementation_rows(connection, &ids).await?;
+    Ok(WorkSnapshot {
+        rows: page,
+        dependencies,
+        implementations,
+        total,
+        limit: limit as i64,
+        offset: offset as i64,
+    })
+}
+
+async fn work_task_rows(
+    connection: &mut SqliteConnection,
+    filter: &WorkFilter,
+) -> Result<Vec<WorkTaskRow>, RepositoryError> {
+    let mut builder = QueryBuilder::new(
+        "WITH RECURSIVE goal_of(task_id, goal_id) AS ( \
+           SELECT g.id, g.id FROM node g \
+             JOIN node_kind k ON k.id = g.kind_id AND k.name = 'goal' \
+           UNION \
+           SELECT e.source, go.goal_id FROM goal_of go \
+             JOIN edge e ON e.destination = go.task_id \
+             WHERE e.edge_type_id = (SELECT id FROM edge_type WHERE name = 'part_of') \
+         ), tasks AS ( \
+           SELECT n.id, n.name, n.updated_at, \
+             EXISTS(SELECT 1 FROM edge i WHERE i.destination = n.id \
+               AND i.edge_type_id = (SELECT id FROM edge_type WHERE name = 'implements')) AS done \
+           FROM node n JOIN node_kind k ON k.id = n.kind_id AND k.name = 'task' \
+         ), nearest_goal AS ( \
+           SELECT task_id, MIN(goal_id) AS goal_id FROM goal_of GROUP BY task_id \
+         ) \
+         SELECT t.id, t.name, t.updated_at, t.done, \
+           (t.done = 0 AND EXISTS(SELECT 1 FROM edge d WHERE d.source = t.id \
+             AND d.edge_type_id = (SELECT id FROM edge_type WHERE name = 'depends_on') \
+             AND NOT EXISTS(SELECT 1 FROM edge i2 WHERE i2.destination = d.destination \
+               AND i2.edge_type_id = (SELECT id FROM edge_type WHERE name = 'implements')))) AS blocked, \
+           g.id AS goal_id, g.name AS goal_name \
+         FROM tasks t \
+         LEFT JOIN nearest_goal ng ON ng.task_id = t.id \
+         LEFT JOIN node g ON g.id = ng.goal_id \
+         WHERE 1 = 1",
+    );
+    if let Some(goal) = filter.goal {
+        builder.push(
+            " AND EXISTS (SELECT 1 FROM goal_of go WHERE go.task_id = t.id AND go.goal_id = ",
+        );
+        builder.push_bind(goal);
+        builder.push(")");
+    }
+    if let Some(repo) = filter.repo {
+        builder.push(
+            " AND EXISTS (SELECT 1 FROM goal_of go JOIN edge b ON b.source = go.goal_id \
+               AND b.edge_type_id = (SELECT id FROM edge_type WHERE name = 'belongs_to') \
+               WHERE go.task_id = t.id AND b.destination = ",
+        );
+        builder.push_bind(repo);
+        builder.push(")");
+    }
+    builder.push(" ORDER BY t.id");
+    let rows = builder
+        .build_query_as::<WorkTaskRow>()
+        .fetch_all(&mut *connection)
+        .await?;
+    Ok(rows)
+}
+
+async fn work_dependency_rows(
+    connection: &mut SqliteConnection,
+    task_ids: &[i64],
+) -> Result<Vec<WorkDependencyRow>, RepositoryError> {
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut builder = QueryBuilder::new(
+        "SELECT d.source AS task_id, d.destination AS dependency_id, \
+           n.name AS dependency_name, \
+           EXISTS(SELECT 1 FROM edge i WHERE i.destination = d.destination \
+             AND i.edge_type_id = (SELECT id FROM edge_type WHERE name = 'implements')) AS done \
+         FROM edge d JOIN node n ON n.id = d.destination \
+         WHERE d.edge_type_id = (SELECT id FROM edge_type WHERE name = 'depends_on') \
+           AND d.source IN (",
+    );
+    let mut separated = builder.separated(", ");
+    for id in task_ids {
+        separated.push_bind(*id);
+    }
+    builder.push(") ORDER BY d.source, d.destination");
+    let rows = builder
+        .build_query_as::<WorkDependencyRow>()
+        .fetch_all(&mut *connection)
+        .await?;
+    Ok(rows)
+}
+
+async fn work_implementation_rows(
+    connection: &mut SqliteConnection,
+    task_ids: &[i64],
+) -> Result<Vec<WorkImplementationRow>, RepositoryError> {
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut builder = QueryBuilder::new(
+        "SELECT i.destination AS task_id, c.id AS change_id, c.name AS change_name \
+         FROM edge i JOIN node c ON c.id = i.source \
+         WHERE i.edge_type_id = (SELECT id FROM edge_type WHERE name = 'implements') \
+           AND i.destination IN (",
+    );
+    let mut separated = builder.separated(", ");
+    for id in task_ids {
+        separated.push_bind(*id);
+    }
+    builder.push(") ORDER BY i.destination, c.id");
+    let rows = builder
+        .build_query_as::<WorkImplementationRow>()
+        .fetch_all(&mut *connection)
+        .await?;
+    Ok(rows)
 }
 
 async fn node_tags_in(

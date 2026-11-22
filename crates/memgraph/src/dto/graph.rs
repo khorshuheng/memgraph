@@ -9,7 +9,7 @@ use crate::model::{
     PackReport, Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft,
     PlanTask as PlanTaskModel, PlanTaskDraft, ReachFilter,
     RelationDirection as RelationDirectionModel, SearchScope as SearchScopeModel, TaskDraft,
-    TaskPatch, WorkFilter, WorkTask,
+    TaskPatch, WorkFilter, WorkPage, WorkTask,
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1139,6 +1139,8 @@ impl From<UpdateTaskParameters> for TaskPatch {
 pub struct WorkParameters {
     pub goal: Option<i64>,
     pub repo: Option<i64>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
 }
 
 impl From<WorkParameters> for WorkFilter {
@@ -1148,6 +1150,13 @@ impl From<WorkParameters> for WorkFilter {
             repo: params.repo,
         }
     }
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct PageParameters {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1211,17 +1220,40 @@ impl From<WorkTask> for WorkTaskResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct WorkListResponse {
+    pub items: Vec<WorkTaskResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+impl From<WorkPage> for WorkListResponse {
+    fn from(page: WorkPage) -> Self {
+        WorkListResponse {
+            items: page.items.into_iter().map(Into::into).collect(),
+            total: page.total,
+            limit: page.limit,
+            offset: page.offset,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct GoalTreeResponse {
     pub goal: NodeResponse,
     pub tasks: Vec<WorkTaskResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[schema(
     description = "A landed change. Creates the change node plus its implements (task) and \
                    modifies (file) edges in one transaction. Task refs are ids; file refs are \
-                   repo-relative natural-key names. Tags are trimmed, lowercased and \
-                   deduplicated; blank tags and more than 64 tags are rejected."
+                   repo-relative natural-key names. Properties are validated against the change \
+                   kind's declarations. Tags are trimmed, lowercased and deduplicated; blank \
+                   tags and more than 64 tags are rejected."
 )]
 pub struct CreateChangeParameters {
     pub commit: String,
@@ -1232,6 +1264,8 @@ pub struct CreateChangeParameters {
     pub tasks: Vec<i64>,
     #[serde(default)]
     pub files: Vec<String>,
+    #[serde(default)]
+    pub properties: Option<serde_json::Value>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
 }
@@ -1244,6 +1278,7 @@ impl From<CreateChangeParameters> for ChangeDraft {
             summary: params.summary,
             tasks: params.tasks,
             files: params.files,
+            properties: params.properties,
             tags: params.tags,
         }
     }

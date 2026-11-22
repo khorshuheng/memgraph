@@ -41,7 +41,12 @@ impl From<sqlx::Error> for RepositoryError {
                     RepositoryError::Busy(err.to_string())
                 }
                 _ if matches!(err.code().as_deref(), Some("1811")) => {
-                    RepositoryError::ContractViolation(err.message().to_string())
+                    let message = err.message().to_string();
+                    if message.contains("node name must be unique") {
+                        RepositoryError::UniqueConstraintViolation(message)
+                    } else {
+                        RepositoryError::ContractViolation(message)
+                    }
                 }
                 _ => RepositoryError::SqlExecutionError(err.to_string()),
             },

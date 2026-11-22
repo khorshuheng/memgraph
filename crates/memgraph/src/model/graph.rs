@@ -206,6 +206,14 @@ pub struct WorkTask {
     pub implemented_by: Vec<WorkRef>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkPage {
+    pub items: Vec<WorkTask>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackStatus {
     Created,
@@ -581,6 +589,7 @@ pub struct ChangeDraft {
     pub summary: String,
     pub tasks: Vec<i64>,
     pub files: Vec<String>,
+    pub properties: Option<serde_json::Value>,
     pub tags: Option<Vec<String>>,
 }
 
