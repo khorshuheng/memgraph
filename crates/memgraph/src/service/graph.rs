@@ -8,9 +8,10 @@ use crate::{
         NeighborDirection, Node, NodeFilter, NodeKind, NodeKindProperty, NodePage, NodePatch,
         NodeRef, PackDraft, PackEdgeType, PackNodeKind, PackProperty, PackReport, PendingEdge,
         PendingNode, Plan, PlanDraft, PlanTask, PlanTaskDraft, PropertyType, ReachFilter,
-        SearchPage, TagUsage, TaskDraft, TaskPatch,
+        SearchPage, TagUsage, TaskDraft, TaskPatch, WorkDependency, WorkFilter, WorkRef,
+        WorkStatus, WorkTask,
     },
-    repository::graph::GraphRepository,
+    repository::graph::{GraphRepository, WorkTaskRow},
 };
 
 use super::error::ServiceError;
@@ -929,6 +930,112 @@ impl GraphService {
 
     pub async fn list_tags(&self) -> Result<Vec<TagUsage>, ServiceError> {
         self.repository.list_tags().await.map_err(Into::into)
+    }
+
+    pub async fn work_report(
+        &self,
+        filter: &WorkFilter,
+        only_ready: bool,
+    ) -> Result<Vec<WorkTask>, ServiceError> {
+        self.validate_work_filter(filter).await?;
+        let rows = self.repository.work_tasks(filter).await?;
+        let rows = rows
+            .into_iter()
+            .filter(|row| !row.done && (!only_ready || !row.blocked))
+            .collect();
+        self.assemble_work_tasks(rows).await
+    }
+
+    pub async fn goal_tree(&self, goal_id: i64) -> Result<(Node, Vec<WorkTask>), ServiceError> {
+        let goal = self.get_node(goal_id).await?;
+        let goal_kind = self.kind_id("goal").await?;
+        if goal.kind_id != goal_kind {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "node {goal_id} is not a goal"
+            )));
+        }
+        let rows = self
+            .repository
+            .work_tasks(&WorkFilter {
+                goal: Some(goal_id),
+                repo: None,
+            })
+            .await?;
+        let tasks = self.assemble_work_tasks(rows).await?;
+        Ok((goal, tasks))
+    }
+
+    async fn validate_work_filter(&self, filter: &WorkFilter) -> Result<(), ServiceError> {
+        if let Some(goal) = filter.goal {
+            let node = self.get_node(goal).await?;
+            let goal_kind = self.kind_id("goal").await?;
+            if node.kind_id != goal_kind {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "node {goal} is not a goal"
+                )));
+            }
+        }
+        if let Some(repo) = filter.repo {
+            let node = self.get_node(repo).await?;
+            let repo_kind = self.kind_id("repo").await?;
+            if node.kind_id != repo_kind {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "node {repo} is not a repo"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn assemble_work_tasks(
+        &self,
+        rows: Vec<WorkTaskRow>,
+    ) -> Result<Vec<WorkTask>, ServiceError> {
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        let dependencies = self.repository.work_dependencies(&ids).await?;
+        let implementations = self.repository.work_implementations(&ids).await?;
+        let mut deps_by_task: HashMap<i64, Vec<WorkDependency>> = HashMap::new();
+        for dependency in dependencies {
+            deps_by_task
+                .entry(dependency.task_id)
+                .or_default()
+                .push(WorkDependency {
+                    id: dependency.dependency_id,
+                    name: dependency.dependency_name,
+                    done: dependency.done,
+                });
+        }
+        let mut impls_by_task: HashMap<i64, Vec<WorkRef>> = HashMap::new();
+        for implementation in implementations {
+            impls_by_task
+                .entry(implementation.task_id)
+                .or_default()
+                .push(WorkRef {
+                    id: implementation.change_id,
+                    name: implementation.change_name,
+                });
+        }
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in rows {
+            let status = if row.done {
+                WorkStatus::Done
+            } else if row.blocked {
+                WorkStatus::Blocked
+            } else {
+                WorkStatus::Pending
+            };
+            tasks.push(WorkTask {
+                id: row.id,
+                name: row.name,
+                status,
+                updated_at: row.updated_at,
+                goal_id: row.goal_id,
+                goal_name: row.goal_name,
+                depends_on: deps_by_task.remove(&row.id).unwrap_or_default(),
+                implemented_by: impls_by_task.remove(&row.id).unwrap_or_default(),
+            });
+        }
+        Ok(tasks)
     }
 }
 
@@ -6719,5 +6826,141 @@ mod tests {
             after_properties, after_tags,
             "a property change must bump updated_at"
         );
+    }
+
+    #[tokio::test]
+    async fn work_views_derive_status_from_implements_and_dependencies() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+        let goal_kind = seeded_kind(&service, "goal").await;
+        let change_kind = seeded_kind(&service, "change").await;
+        let belongs_to = seeded_edge_type(&service, "belongs_to").await;
+        let implements = seeded_edge_type(&service, "implements").await;
+
+        let mut done = new_task("done task");
+        done.parent = Some(goal);
+        let done = service.create_task(&done).await.unwrap();
+        let mut ready = new_task("ready task");
+        ready.parent = Some(goal);
+        ready.depends_on = vec![done.id];
+        let ready = service.create_task(&ready).await.unwrap();
+        let mut blocked = new_task("blocked task");
+        blocked.parent = Some(goal);
+        blocked.depends_on = vec![ready.id];
+        let blocked = service.create_task(&blocked).await.unwrap();
+
+        let change = service
+            .upsert_node(&node(change_kind, "abc123", ""))
+            .await
+            .unwrap();
+        service
+            .add_edge(&Edge {
+                source: change.id,
+                destination: done.id,
+                edge_type_id: implements,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let pending = service
+            .work_report(&WorkFilter::default(), false)
+            .await
+            .unwrap();
+        let statuses: Vec<(&str, WorkStatus)> = pending
+            .iter()
+            .map(|task| (task.name.as_str(), task.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                ("ready task", WorkStatus::Pending),
+                ("blocked task", WorkStatus::Blocked)
+            ]
+        );
+        let ready_entry = pending.iter().find(|task| task.id == ready.id).unwrap();
+        assert_eq!(ready_entry.goal_id, Some(goal));
+        assert_eq!(ready_entry.depends_on.len(), 1);
+        assert!(ready_entry.depends_on[0].done);
+        assert!(ready_entry.implemented_by.is_empty());
+
+        let next = service
+            .work_report(&WorkFilter::default(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            next.iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec![ready.id]
+        );
+
+        let (tree_goal, tree) = service.goal_tree(goal).await.unwrap();
+        assert_eq!(tree_goal.id, goal);
+        assert_eq!(tree.len(), 3);
+        let done_entry = tree.iter().find(|task| task.id == done.id).unwrap();
+        assert_eq!(done_entry.status, WorkStatus::Done);
+        assert_eq!(done_entry.implemented_by.len(), 1);
+        assert_eq!(done_entry.implemented_by[0].name, "abc123");
+
+        let other_goal = service
+            .upsert_node(&node(goal_kind, "other goal", ""))
+            .await
+            .unwrap();
+        service
+            .add_edge(&Edge {
+                source: other_goal.id,
+                destination: repo,
+                edge_type_id: belongs_to,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+        let mut other_task = new_task("other task");
+        other_task.parent = Some(other_goal.id);
+        let other_task = service.create_task(&other_task).await.unwrap();
+
+        let in_goal = service
+            .work_report(
+                &WorkFilter {
+                    goal: Some(goal),
+                    repo: None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(in_goal.iter().all(|task| task.id != other_task.id));
+        let in_repo = service
+            .work_report(
+                &WorkFilter {
+                    goal: None,
+                    repo: Some(repo),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(in_repo.iter().any(|task| task.id == other_task.id));
+
+        assert!(matches!(
+            service.goal_tree(blocked.id).await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
+        assert!(matches!(
+            service.goal_tree(999_999).await,
+            Err(ServiceError::EntityNotFound)
+        ));
+        assert!(matches!(
+            service
+                .work_report(
+                    &WorkFilter {
+                        goal: Some(done.id),
+                        repo: None,
+                    },
+                    false,
+                )
+                .await,
+            Err(ServiceError::UnprocessableEntity(_))
+        ));
     }
 }

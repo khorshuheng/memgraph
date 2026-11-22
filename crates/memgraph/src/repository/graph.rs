@@ -10,7 +10,7 @@ use crate::model::{
     Node, NodeFilter, NodeKind, NodeKindProperty, NodePatch, NodeRef, PackDraft, PackEdgeType,
     PackItem, PackNodeKind, PackProperty, PackReport, PackStatus, PendingEdge, PendingNode,
     PropertyType, ReachFilter, RelationDirection, SearchHit, SearchPage, SearchScope, TagUsage,
-    encode_kind_list, split_kind_list, validate_declared_properties,
+    WorkFilter, encode_kind_list, split_kind_list, validate_declared_properties,
 };
 
 use super::error::RepositoryError;
@@ -66,6 +66,32 @@ fn scope_clause(scope: SearchScope) -> &'static str {
 pub struct NodeAccessRecord {
     pub node_id: i64,
     pub access_id: i64,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct WorkTaskRow {
+    pub id: i64,
+    pub name: String,
+    pub updated_at: String,
+    pub done: bool,
+    pub blocked: bool,
+    pub goal_id: Option<i64>,
+    pub goal_name: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct WorkDependencyRow {
+    pub task_id: i64,
+    pub dependency_id: i64,
+    pub dependency_name: String,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct WorkImplementationRow {
+    pub task_id: i64,
+    pub change_id: i64,
+    pub change_name: String,
 }
 
 #[async_trait]
@@ -132,6 +158,15 @@ pub trait GraphRepository: Send + Sync {
         ids: &[i64],
     ) -> Result<HashMap<i64, Vec<NodeKindProperty>>, RepositoryError>;
     async fn list_tags(&self) -> Result<Vec<TagUsage>, RepositoryError>;
+    async fn work_tasks(&self, filter: &WorkFilter) -> Result<Vec<WorkTaskRow>, RepositoryError>;
+    async fn work_dependencies(
+        &self,
+        task_ids: &[i64],
+    ) -> Result<Vec<WorkDependencyRow>, RepositoryError>;
+    async fn work_implementations(
+        &self,
+        task_ids: &[i64],
+    ) -> Result<Vec<WorkImplementationRow>, RepositoryError>;
 
     async fn add_edge(&self, edge: &Edge) -> Result<(), RepositoryError>;
     async fn add_edge_with_properties(
@@ -760,6 +795,114 @@ impl GraphRepository for SqliteGraphRepository {
         )
         .fetch_all(&self.pool)
         .await?;
+        Ok(rows)
+    }
+
+    async fn work_tasks(&self, filter: &WorkFilter) -> Result<Vec<WorkTaskRow>, RepositoryError> {
+        let mut builder = QueryBuilder::new(
+            "WITH RECURSIVE ancestry(task_id, node_id, depth) AS ( \
+               SELECT e.source, e.destination, 1 FROM edge e \
+                 WHERE e.edge_type_id = (SELECT id FROM edge_type WHERE name = 'part_of') \
+               UNION ALL \
+               SELECT a.task_id, e.destination, a.depth + 1 FROM ancestry a \
+                 JOIN edge e ON e.source = a.node_id \
+                 WHERE e.edge_type_id = (SELECT id FROM edge_type WHERE name = 'part_of') \
+             ), tasks AS ( \
+               SELECT n.id, n.name, n.updated_at, \
+                 EXISTS(SELECT 1 FROM edge i WHERE i.destination = n.id \
+                   AND i.edge_type_id = (SELECT id FROM edge_type WHERE name = 'implements')) AS done \
+               FROM node n JOIN node_kind k ON k.id = n.kind_id AND k.name = 'task' \
+             ) \
+             SELECT t.id, t.name, t.updated_at, t.done, \
+               (t.done = 0 AND EXISTS(SELECT 1 FROM edge d WHERE d.source = t.id \
+                 AND d.edge_type_id = (SELECT id FROM edge_type WHERE name = 'depends_on') \
+                 AND NOT EXISTS(SELECT 1 FROM edge i2 WHERE i2.destination = d.destination \
+                   AND i2.edge_type_id = (SELECT id FROM edge_type WHERE name = 'implements')))) AS blocked, \
+               g.id AS goal_id, g.name AS goal_name \
+             FROM tasks t \
+             LEFT JOIN (SELECT task_id, node_id FROM ( \
+                 SELECT a.task_id, a.node_id, \
+                   ROW_NUMBER() OVER (PARTITION BY a.task_id ORDER BY a.depth) AS rn \
+                 FROM ancestry a JOIN node gk ON gk.id = a.node_id \
+                 JOIN node_kind gkk ON gkk.id = gk.kind_id AND gkk.name = 'goal' \
+               ) WHERE rn = 1) ng ON ng.task_id = t.id \
+             LEFT JOIN node g ON g.id = ng.node_id \
+             WHERE 1 = 1",
+        );
+        if let Some(goal) = filter.goal {
+            builder.push(
+                " AND EXISTS (SELECT 1 FROM ancestry a WHERE a.task_id = t.id AND a.node_id = ",
+            );
+            builder.push_bind(goal);
+            builder.push(")");
+        }
+        if let Some(repo) = filter.repo {
+            builder.push(
+                " AND EXISTS (SELECT 1 FROM ancestry a JOIN edge b ON b.source = a.node_id \
+                   AND b.edge_type_id = (SELECT id FROM edge_type WHERE name = 'belongs_to') \
+                   WHERE a.task_id = t.id AND b.destination = ",
+            );
+            builder.push_bind(repo);
+            builder.push(")");
+        }
+        builder.push(" ORDER BY t.id");
+        let rows = builder
+            .build_query_as::<WorkTaskRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
+
+    async fn work_dependencies(
+        &self,
+        task_ids: &[i64],
+    ) -> Result<Vec<WorkDependencyRow>, RepositoryError> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut builder = QueryBuilder::new(
+            "SELECT d.source AS task_id, d.destination AS dependency_id, \
+               n.name AS dependency_name, \
+               EXISTS(SELECT 1 FROM edge i WHERE i.destination = d.destination \
+                 AND i.edge_type_id = (SELECT id FROM edge_type WHERE name = 'implements')) AS done \
+             FROM edge d JOIN node n ON n.id = d.destination \
+             WHERE d.edge_type_id = (SELECT id FROM edge_type WHERE name = 'depends_on') \
+               AND d.source IN (",
+        );
+        let mut separated = builder.separated(", ");
+        for id in task_ids {
+            separated.push_bind(*id);
+        }
+        builder.push(") ORDER BY d.source, d.destination");
+        let rows = builder
+            .build_query_as::<WorkDependencyRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
+
+    async fn work_implementations(
+        &self,
+        task_ids: &[i64],
+    ) -> Result<Vec<WorkImplementationRow>, RepositoryError> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut builder = QueryBuilder::new(
+            "SELECT i.destination AS task_id, c.id AS change_id, c.name AS change_name \
+             FROM edge i JOIN node c ON c.id = i.source \
+             WHERE i.edge_type_id = (SELECT id FROM edge_type WHERE name = 'implements') \
+               AND i.destination IN (",
+        );
+        let mut separated = builder.separated(", ");
+        for id in task_ids {
+            separated.push_bind(*id);
+        }
+        builder.push(") ORDER BY i.destination, c.id");
+        let rows = builder
+            .build_query_as::<WorkImplementationRow>()
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 

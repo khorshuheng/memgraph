@@ -9,19 +9,20 @@ use crate::{
         graph::{
             ApplyPackParameters, CreateEdgeParameters, CreateEdgeTypeParameters,
             CreateNodeKindParameters, CreateNodeParameters, CreatePlanParameters,
-            CreateTaskParameters, DeleteEdgeParameters, EdgeTypeResponse, ImportParameters,
-            ImportReportResponse, ListNodesParameters, ListNodesResponse, NeighborParameters,
-            NeighborResponse, NodeKindResponse, NodeResponse, PackReportResponse, PlanResponse,
-            PlanTaskResponse, ReplaceTagsParameters, SearchHitResponse, SearchParameters,
-            SearchResponse, TagUsageResponse, UpdateEdgeParameters, UpdateNodeParameters,
-            UpdateTaskParameters,
+            CreateTaskParameters, DeleteEdgeParameters, EdgeTypeResponse, GoalTreeResponse,
+            ImportParameters, ImportReportResponse, ListNodesParameters, ListNodesResponse,
+            NeighborParameters, NeighborResponse, NodeKindResponse, NodeResponse,
+            PackReportResponse, PlanResponse, PlanTaskResponse, ReplaceTagsParameters,
+            SearchHitResponse, SearchParameters, SearchResponse, TagUsageResponse,
+            UpdateEdgeParameters, UpdateNodeParameters, UpdateTaskParameters, WorkParameters,
+            WorkTaskResponse,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
     },
     model::{
         Edge, EdgeType, ImportDraft, Node, NodeFilter, NodeKind, NodePatch, PackDraft, PlanDraft,
-        TaskDraft, TaskPatch,
+        TaskDraft, TaskPatch, WorkFilter,
     },
     state::AppState,
 };
@@ -436,6 +437,71 @@ pub async fn list_tags(
                 node_count: usage.node_count,
             })
             .collect(),
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    get,
+    path = "/work/pending",
+    params(WorkParameters),
+    responses((status = 200, description = "Unfinished tasks with their dependency state", body = ApiList<WorkTaskResponse>))
+)]
+pub async fn work_pending(
+    State(state): State<AppState>,
+    Query(params): Query<WorkParameters>,
+) -> Result<ApiList<WorkTaskResponse>, ApiError> {
+    let filter: WorkFilter = params.into();
+    let tasks = state.graph_service.work_report(&filter, false).await?;
+    Ok(ApiList {
+        status: StatusCode::OK,
+        items: tasks.into_iter().map(Into::into).collect(),
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    get,
+    path = "/work/next",
+    params(WorkParameters),
+    responses((status = 200, description = "Unfinished tasks whose dependencies are all done", body = ApiList<WorkTaskResponse>))
+)]
+pub async fn work_next(
+    State(state): State<AppState>,
+    Query(params): Query<WorkParameters>,
+) -> Result<ApiList<WorkTaskResponse>, ApiError> {
+    let filter: WorkFilter = params.into();
+    let tasks = state.graph_service.work_report(&filter, true).await?;
+    Ok(ApiList {
+        status: StatusCode::OK,
+        items: tasks.into_iter().map(Into::into).collect(),
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    get,
+    path = "/goals/{goal_id}/tree",
+    params(("goal_id" = i64, Path, description = "Goal id")),
+    responses(
+        (status = 200, description = "Goal with its task tree and status", body = GoalTreeResponse),
+        (status = 404, description = "Goal not found"),
+        (status = 422, description = "Node is not a goal")
+    )
+)]
+pub async fn goal_tree(
+    State(state): State<AppState>,
+    Path(goal_id): Path<i64>,
+) -> Result<ApiSuccess<GoalTreeResponse>, ApiError> {
+    let (goal, tasks) = state.graph_service.goal_tree(goal_id).await?;
+    let tags = state.graph_service.node_tags(goal.id).await?;
+    let properties = state.graph_service.node_properties(goal.id).await?;
+    Ok(ApiSuccess {
+        status: StatusCode::OK,
+        data: GoalTreeResponse {
+            goal: NodeResponse::with_tags_and_properties(goal, tags, properties),
+            tasks: tasks.into_iter().map(Into::into).collect(),
+        },
     })
 }
 
@@ -1747,5 +1813,71 @@ mod tests {
             clamped.data.limit,
             crate::config::PagingConfig::default().max_limit
         );
+    }
+
+    #[tokio::test]
+    async fn work_views_and_goal_tree_expose_task_status() {
+        let state = test_state().await;
+        let goal = seed_anchored_goal(&state).await;
+        let task = create_task(
+            State(state.clone()),
+            Json(CreateTaskParameters {
+                id: None,
+                name: "handler task".to_string(),
+                description: String::new(),
+                content: String::new(),
+                parent: Some(goal),
+                depends_on: vec![],
+                affects: vec![],
+                properties: None,
+                tags: Some(vec!["api".to_string()]),
+            }),
+        )
+        .await
+        .expect("create task")
+        .data;
+
+        let pending = work_pending(
+            State(state.clone()),
+            Query(WorkParameters {
+                goal: Some(goal),
+                repo: None,
+            }),
+        )
+        .await
+        .expect("pending");
+        assert_eq!(pending.items.len(), 1);
+        assert_eq!(pending.items[0].id, task.id);
+        assert_eq!(pending.items[0].status, "pending");
+        assert_eq!(pending.items[0].goal.as_ref().expect("goal").id, goal);
+
+        let next = work_next(
+            State(state.clone()),
+            Query(WorkParameters {
+                goal: None,
+                repo: None,
+            }),
+        )
+        .await
+        .expect("next");
+        assert_eq!(next.items.len(), 1);
+
+        let tree = goal_tree(State(state.clone()), Path(goal))
+            .await
+            .expect("tree")
+            .data;
+        assert_eq!(tree.goal.id, goal);
+        assert_eq!(tree.tasks.len(), 1);
+        assert_eq!(tree.tasks[0].status, "pending");
+
+        let error = goal_tree(State(state.clone()), Path(task.id))
+            .await
+            .expect_err("task is not a goal");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let error = goal_tree(State(state.clone()), Path(999_999))
+            .await
+            .expect_err("missing goal");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
     }
 }

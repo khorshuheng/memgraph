@@ -158,6 +158,54 @@ pub struct TagUsage {
     pub node_count: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkFilter {
+    pub goal: Option<i64>,
+    pub repo: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkStatus {
+    Pending,
+    Blocked,
+    Done,
+}
+
+impl WorkStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkStatus::Pending => "pending",
+            WorkStatus::Blocked => "blocked",
+            WorkStatus::Done => "done",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkRef {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkDependency {
+    pub id: i64,
+    pub name: String,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkTask {
+    pub id: i64,
+    pub name: String,
+    pub status: WorkStatus,
+    pub updated_at: String,
+    pub goal_id: Option<i64>,
+    pub goal_name: Option<String>,
+    pub depends_on: Vec<WorkDependency>,
+    pub implemented_by: Vec<WorkRef>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackStatus {
     Created,

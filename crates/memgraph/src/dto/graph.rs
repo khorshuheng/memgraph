@@ -9,7 +9,7 @@ use crate::model::{
     PackReport, Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft,
     PlanTask as PlanTaskModel, PlanTaskDraft, ReachFilter,
     RelationDirection as RelationDirectionModel, SearchScope as SearchScopeModel, TaskDraft,
-    TaskPatch,
+    TaskPatch, WorkFilter, WorkTask,
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1132,4 +1132,86 @@ impl From<UpdateTaskParameters> for TaskPatch {
             tags: params.tags,
         }
     }
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct WorkParameters {
+    pub goal: Option<i64>,
+    pub repo: Option<i64>,
+}
+
+impl From<WorkParameters> for WorkFilter {
+    fn from(params: WorkParameters) -> Self {
+        WorkFilter {
+            goal: params.goal,
+            repo: params.repo,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WorkRefResponse {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WorkDependencyResponse {
+    pub id: i64,
+    pub name: String,
+    pub done: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(
+    description = "An unfinished task: pending when its dependencies are met, blocked when a \
+                   depends_on target is not done."
+)]
+pub struct WorkTaskResponse {
+    pub id: i64,
+    pub name: String,
+    pub status: String,
+    pub updated_at: String,
+    pub goal: Option<WorkRefResponse>,
+    pub depends_on: Vec<WorkDependencyResponse>,
+    pub implemented_by: Vec<WorkRefResponse>,
+}
+
+impl From<WorkTask> for WorkTaskResponse {
+    fn from(task: WorkTask) -> Self {
+        WorkTaskResponse {
+            id: task.id,
+            name: task.name,
+            status: task.status.as_str().to_string(),
+            updated_at: task.updated_at,
+            goal: task
+                .goal_id
+                .zip(task.goal_name)
+                .map(|(id, name)| WorkRefResponse { id, name }),
+            depends_on: task
+                .depends_on
+                .into_iter()
+                .map(|dependency| WorkDependencyResponse {
+                    id: dependency.id,
+                    name: dependency.name,
+                    done: dependency.done,
+                })
+                .collect(),
+            implemented_by: task
+                .implemented_by
+                .into_iter()
+                .map(|implementation| WorkRefResponse {
+                    id: implementation.id,
+                    name: implementation.name,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GoalTreeResponse {
+    pub goal: NodeResponse,
+    pub tasks: Vec<WorkTaskResponse>,
 }
