@@ -10,7 +10,7 @@ use crate::{
             ApplyPackParameters, CreateChangeParameters, CreateEdgeParameters,
             CreateEdgeTypeParameters, CreateNodeKindParameters, CreateNodeParameters,
             CreatePlanParameters, CreateTaskParameters, DeleteEdgeParameters, EdgeListParameters,
-            EdgeListResponse, EdgeTypeResponse, GoalTreeResponse, GraphExportResponse,
+            EdgeListResponse, EdgeTypeResponse, FillNames, GoalTreeResponse, GraphExportResponse,
             ImportParameters, ImportReportResponse, ListNodesParameters, ListNodesResponse,
             NeighborParameters, NeighborResponse, NodeKindResponse, NodeResponse,
             PackReportResponse, PageParameters, PlanResponse, PlanTaskResponse,
@@ -27,6 +27,12 @@ use crate::{
     },
     state::AppState,
 };
+
+async fn fill_names<T: FillNames>(state: &AppState, data: &mut T) -> Result<(), ApiError> {
+    let (kinds, edge_types) = state.graph_service.name_maps().await?;
+    data.fill_names(&kinds, &edge_types);
+    Ok(())
+}
 
 #[utoipa::path(
     tag = "Graph",
@@ -152,9 +158,11 @@ pub async fn create_node(
         .create_node_with_properties(&node, &tags, properties.as_ref())
         .await?;
     let properties = state.graph_service.node_properties(created.id).await?;
+    let mut data = NodeResponse::with_tags_and_properties(created, tags, properties);
+    fill_names(&state, &mut data).await?;
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
-        data: NodeResponse::with_tags_and_properties(created, tags, properties),
+        data,
     })
 }
 
@@ -173,9 +181,11 @@ pub async fn create_task(
     let created = state.graph_service.create_task(&draft).await?;
     let tags = state.graph_service.node_tags(created.id).await?;
     let properties = state.graph_service.node_properties(created.id).await?;
+    let mut data = NodeResponse::with_tags_and_properties(created, tags, properties);
+    fill_names(&state, &mut data).await?;
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
-        data: NodeResponse::with_tags_and_properties(created, tags, properties),
+        data,
     })
 }
 
@@ -199,9 +209,11 @@ pub async fn create_change(
     let created = state.graph_service.create_change(&draft).await?;
     let tags = state.graph_service.node_tags(created.id).await?;
     let properties = state.graph_service.node_properties(created.id).await?;
+    let mut data = NodeResponse::with_tags_and_properties(created, tags, properties);
+    fill_names(&state, &mut data).await?;
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
-        data: NodeResponse::with_tags_and_properties(created, tags, properties),
+        data,
     })
 }
 
@@ -247,9 +259,11 @@ pub async fn create_plan(
             }
         })
         .collect();
+    let mut data = PlanResponse { goal, tasks };
+    fill_names(&state, &mut data).await?;
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
-        data: PlanResponse { goal, tasks },
+        data,
     })
 }
 
@@ -289,6 +303,8 @@ pub async fn list_nodes(
     })?;
     if let Some(ids) = ids {
         if params.kind.is_some()
+            || params.name.is_some()
+            || params.name_contains.is_some()
             || params.scope.is_some()
             || params.within.is_some()
             || params.via.is_some()
@@ -304,23 +320,21 @@ pub async fn list_nodes(
         }
         let nodes = state.graph_service.nodes_by_ids(&ids).await?;
         let total = nodes.len() as i64;
+        let mut data = ListNodesResponse {
+            items: nodes
+                .into_iter()
+                .map(|item| {
+                    NodeResponse::with_tags_and_properties(item.node, item.tags, item.properties)
+                })
+                .collect(),
+            total,
+            limit: total,
+            offset: 0,
+        };
+        fill_names(&state, &mut data).await?;
         return Ok(ApiSuccess {
             status: StatusCode::OK,
-            data: ListNodesResponse {
-                items: nodes
-                    .into_iter()
-                    .map(|item| {
-                        NodeResponse::with_tags_and_properties(
-                            item.node,
-                            item.tags,
-                            item.properties,
-                        )
-                    })
-                    .collect(),
-                total,
-                limit: total,
-                offset: 0,
-            },
+            data,
         });
     }
     let limit = params.limit;
@@ -338,24 +352,26 @@ pub async fn list_nodes(
     let ids: Vec<i64> = page.items.iter().map(|node| node.id).collect();
     let mut tags = state.graph_service.node_tags_for_ids(&ids).await?;
     let mut properties = state.graph_service.node_properties_for_ids(&ids).await?;
+    let mut data = ListNodesResponse {
+        items: page
+            .items
+            .into_iter()
+            .map(|node| {
+                let node_tags = tags.remove(&node.id).unwrap_or_default();
+                let node_properties = properties
+                    .remove(&node.id)
+                    .unwrap_or_else(|| serde_json::json!({}));
+                NodeResponse::with_tags_and_properties(node, node_tags, node_properties)
+            })
+            .collect(),
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+    };
+    fill_names(&state, &mut data).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: ListNodesResponse {
-            items: page
-                .items
-                .into_iter()
-                .map(|node| {
-                    let node_tags = tags.remove(&node.id).unwrap_or_default();
-                    let node_properties = properties
-                        .remove(&node.id)
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    NodeResponse::with_tags_and_properties(node, node_tags, node_properties)
-                })
-                .collect(),
-            total: page.total,
-            limit: page.limit,
-            offset: page.offset,
-        },
+        data,
     })
 }
 
@@ -376,9 +392,11 @@ pub async fn update_task(
     let updated = state.graph_service.update_task(task_id, &patch).await?;
     let tags = state.graph_service.node_tags(updated.id).await?;
     let properties = state.graph_service.node_properties(updated.id).await?;
+    let mut data = NodeResponse::with_tags_and_properties(updated, tags, properties);
+    fill_names(&state, &mut data).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: NodeResponse::with_tags_and_properties(updated, tags, properties),
+        data,
     })
 }
 
@@ -396,9 +414,11 @@ pub async fn get_node(
     let node = state.graph_service.get_node(node_id).await?;
     let tags = state.graph_service.node_tags(node_id).await?;
     let properties = state.graph_service.node_properties(node_id).await?;
+    let mut data = NodeResponse::with_tags_and_properties(node, tags, properties);
+    fill_names(&state, &mut data).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: NodeResponse::with_tags_and_properties(node, tags, properties),
+        data,
     })
 }
 
@@ -423,9 +443,11 @@ pub async fn update_node(
     let patch: NodePatch = params.into();
     let (node, tags) = state.graph_service.update_node(node_id, &patch).await?;
     let properties = state.graph_service.node_properties(node_id).await?;
+    let mut data = NodeResponse::with_tags_and_properties(node, tags, properties);
+    fill_names(&state, &mut data).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: NodeResponse::with_tags_and_properties(node, tags, properties),
+        data,
     })
 }
 
@@ -585,15 +607,17 @@ pub async fn goal_tree(
         .await?;
     let tags = state.graph_service.node_tags(goal.id).await?;
     let properties = state.graph_service.node_properties(goal.id).await?;
+    let mut data = GoalTreeResponse {
+        goal: NodeResponse::with_tags_and_properties(goal, tags, properties),
+        tasks: page.items.into_iter().map(Into::into).collect(),
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+    };
+    fill_names(&state, &mut data).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: GoalTreeResponse {
-            goal: NodeResponse::with_tags_and_properties(goal, tags, properties),
-            tasks: page.items.into_iter().map(Into::into).collect(),
-            total: page.total,
-            limit: page.limit,
-            offset: page.offset,
-        },
+        data,
     })
 }
 
@@ -620,18 +644,20 @@ pub async fn list_neighbors(
     let ids: Vec<i64> = neighbors.iter().map(|neighbor| neighbor.node.id).collect();
     let mut tags = state.graph_service.node_tags_for_ids(&ids).await?;
     let mut properties = state.graph_service.node_properties_for_ids(&ids).await?;
+    let mut items: Vec<NeighborResponse> = neighbors
+        .into_iter()
+        .map(|neighbor| {
+            let node_tags = tags.remove(&neighbor.node.id).unwrap_or_default();
+            let node_properties = properties
+                .remove(&neighbor.node.id)
+                .unwrap_or_else(|| serde_json::json!({}));
+            NeighborResponse::with_tags_and_properties(neighbor, node_tags, node_properties)
+        })
+        .collect();
+    fill_names(&state, &mut items).await?;
     Ok(ApiList {
         status: StatusCode::OK,
-        items: neighbors
-            .into_iter()
-            .map(|neighbor| {
-                let node_tags = tags.remove(&neighbor.node.id).unwrap_or_default();
-                let node_properties = properties
-                    .remove(&neighbor.node.id)
-                    .unwrap_or_else(|| serde_json::json!({}));
-                NeighborResponse::with_tags_and_properties(neighbor, node_tags, node_properties)
-            })
-            .collect(),
+        items,
     })
 }
 
@@ -656,14 +682,16 @@ pub async fn list_edges(
         .graph_service
         .list_edges(&filter, limit, offset)
         .await?;
+    let mut data = EdgeListResponse {
+        items: page.items.into_iter().map(Into::into).collect(),
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+    };
+    fill_names(&state, &mut data).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: EdgeListResponse {
-            items: page.items.into_iter().map(Into::into).collect(),
-            total: page.total,
-            limit: page.limit,
-            offset: page.offset,
-        },
+        data,
     })
 }
 
@@ -679,7 +707,21 @@ pub async fn add_edge(
     Json(params): Json<CreateEdgeParameters>,
 ) -> Result<StatusCode, ApiError> {
     let properties = params.properties.clone();
-    let edge: Edge = params.into();
+    let edge = Edge {
+        source: state
+            .graph_service
+            .resolve_node_selector(&params.source.into())
+            .await?,
+        destination: state
+            .graph_service
+            .resolve_node_selector(&params.destination.into())
+            .await?,
+        edge_type_id: state
+            .graph_service
+            .resolve_edge_type(params.edge_type_id, params.edge_type.as_deref())
+            .await?,
+        created_at: String::new(),
+    };
     state
         .graph_service
         .add_edge_with_properties(&edge, properties.as_ref())
@@ -762,30 +804,32 @@ pub async fn search(
         .graph_service
         .node_properties_for_ids(&hit_ids)
         .await?;
+    let mut data = SearchResponse {
+        items: page
+            .hits
+            .into_iter()
+            .map(|hit| {
+                let node_properties = properties
+                    .remove(&hit.node.id)
+                    .unwrap_or_else(|| serde_json::json!({}));
+                SearchHitResponse {
+                    node: NodeResponse::with_tags_and_properties(
+                        hit.node,
+                        hit.tags,
+                        node_properties,
+                    ),
+                    score: hit.score,
+                }
+            })
+            .collect(),
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+    };
+    fill_names(&state, &mut data).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: SearchResponse {
-            items: page
-                .hits
-                .into_iter()
-                .map(|hit| {
-                    let node_properties = properties
-                        .remove(&hit.node.id)
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    SearchHitResponse {
-                        node: NodeResponse::with_tags_and_properties(
-                            hit.node,
-                            hit.tags,
-                            node_properties,
-                        ),
-                        score: hit.score,
-                    }
-                })
-                .collect(),
-            total: page.total,
-            limit: page.limit,
-            offset: page.offset,
-        },
+        data,
     })
 }
 
@@ -802,9 +846,11 @@ pub async fn graph_export(
     State(state): State<AppState>,
 ) -> Result<ApiSuccess<GraphExportResponse>, ApiError> {
     let export = state.graph_service.export_graph().await?;
+    let mut data: GraphExportResponse = export.into();
+    fill_names(&state, &mut data).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: export.into(),
+        data,
     })
 }
 
@@ -830,8 +876,8 @@ mod tests {
     use crate::config::{AppConfig, DatabaseConfig, PagingConfig, ServerConfig};
     use crate::dto::graph::{
         CreatePlanGoalParameters, CreatePlanTaskParameters, ImportConflictParameters,
-        ImportNodeParameters, NeighborDirection, PackEdgeTypeParameters, PackNodeKindParameters,
-        PackPropertyParameters, PlanAnchorParameters,
+        ImportNodeParameters, NeighborDirection, NodeSelectorParameters, PackEdgeTypeParameters,
+        PackNodeKindParameters, PackPropertyParameters, PlanAnchorParameters,
     };
     use crate::model::{PackNodeKind, PackProperty};
 
@@ -1063,6 +1109,8 @@ mod tests {
             State(state.clone()),
             Query(ListNodesParameters {
                 kind: None,
+                name: None,
+                name_contains: None,
                 scope: None,
                 within: None,
                 via: None,
@@ -1448,6 +1496,8 @@ mod tests {
             State(state.clone()),
             Query(ListNodesParameters {
                 kind: None,
+                name: None,
+                name_contains: None,
                 scope: None,
                 within: None,
                 via: None,
@@ -1518,6 +1568,8 @@ mod tests {
             State(state.clone()),
             Query(ListNodesParameters {
                 kind: None,
+                name: None,
+                name_contains: None,
                 scope: None,
                 within: None,
                 via: None,
@@ -1552,6 +1604,8 @@ mod tests {
             State(state.clone()),
             Query(ListNodesParameters {
                 kind: None,
+                name: None,
+                name_contains: None,
                 scope: None,
                 within: None,
                 via: None,
@@ -1592,9 +1646,10 @@ mod tests {
         add_edge(
             State(state.clone()),
             Json(CreateEdgeParameters {
-                source: first.id,
-                destination: second.id,
-                edge_type_id: edge_type.id,
+                source: NodeSelectorParameters::Id(first.id),
+                destination: NodeSelectorParameters::Id(second.id),
+                edge_type_id: Some(edge_type.id),
+                edge_type: None,
                 properties: Some(serde_json::json!({"weight": 2})),
             }),
         )
@@ -1642,9 +1697,10 @@ mod tests {
         add_edge(
             State(state.clone()),
             Json(CreateEdgeParameters {
-                source: first.id,
-                destination: second.id,
-                edge_type_id: edge_type.id,
+                source: NodeSelectorParameters::Id(first.id),
+                destination: NodeSelectorParameters::Id(second.id),
+                edge_type_id: Some(edge_type.id),
+                edge_type: None,
                 properties: None,
             }),
         )
@@ -1902,6 +1958,8 @@ mod tests {
             State(state),
             Query(ListNodesParameters {
                 kind: None,
+                name: None,
+                name_contains: None,
                 scope: None,
                 within: None,
                 via: None,
@@ -1929,6 +1987,8 @@ mod tests {
             State(state.clone()),
             Query(ListNodesParameters {
                 kind: None,
+                name: None,
+                name_contains: None,
                 scope: None,
                 within: None,
                 via: None,
@@ -1950,6 +2010,8 @@ mod tests {
             State(state.clone()),
             Query(ListNodesParameters {
                 kind: None,
+                name: None,
+                name_contains: None,
                 scope: None,
                 within: None,
                 via: None,
@@ -2075,7 +2137,7 @@ mod tests {
             .expect("file kind")
             .id;
         new_node(&state, file_kind, "src/lib.rs", "", "", &[]).await;
-        let task = create_task(
+        let _task = create_task(
             State(state.clone()),
             Json(CreateTaskParameters {
                 id: None,
@@ -2099,7 +2161,10 @@ mod tests {
                 commit: "feed42".to_string(),
                 title: "handler change".to_string(),
                 summary: "details".to_string(),
-                tasks: vec![task.id],
+                tasks: vec![NodeSelectorParameters::Named {
+                    kind: "task".to_string(),
+                    name: "change task".to_string(),
+                }],
                 files: vec!["src/lib.rs".to_string()],
                 properties: Some(serde_json::json!({"author": "ada"})),
                 tags: Some(vec!["API".to_string()]),
@@ -2168,6 +2233,8 @@ mod tests {
             State(state.clone()),
             Query(ListNodesParameters {
                 kind: None,
+                name: None,
+                name_contains: None,
                 scope: None,
                 within: None,
                 via: None,
@@ -2187,11 +2254,36 @@ mod tests {
         );
         assert_eq!(batch.total, 2);
         assert_eq!(batch.items[1].tags, vec!["math"]);
+        assert_eq!(batch.items[0].kind, "person");
+
+        let named = list_nodes(
+            State(state.clone()),
+            Query(ListNodesParameters {
+                kind: None,
+                name: None,
+                name_contains: Some("irs".to_string()),
+                scope: None,
+                within: None,
+                via: None,
+                descend: None,
+                ids: None,
+                properties: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("name contains")
+        .data;
+        assert_eq!(named.total, 1);
+        assert_eq!(named.items[0].name, "first");
 
         let error = list_nodes(
             State(state.clone()),
             Query(ListNodesParameters {
                 kind: Some("person".to_string()),
+                name: None,
+                name_contains: None,
                 scope: None,
                 within: None,
                 via: None,
@@ -2221,6 +2313,7 @@ mod tests {
         .data;
         assert_eq!(edges.total, 1);
         assert_eq!(edges.items[0].source, first.id);
+        assert_eq!(edges.items[0].edge_type, "knows");
 
         let export = graph_export(State(state.clone()))
             .await
@@ -2234,5 +2327,66 @@ mod tests {
                 .iter()
                 .any(|node| node.name == "first" && node.tags == vec!["math"])
         );
+        assert!(export.nodes.iter().all(|node| node.kind == "person"));
+        assert_eq!(export.edges[0].edge_type, "knows");
+    }
+
+    #[tokio::test]
+    async fn creates_edges_from_name_refs() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "person").await;
+        new_node(&state, kind, "first", "", "", &[]).await;
+        new_node(&state, kind, "second", "", "", &[]).await;
+        state
+            .graph_service
+            .create_edge_type(&EdgeType {
+                id: 0,
+                name: "knows".to_string(),
+                description: String::new(),
+                resolves: false,
+                single_outgoing: false,
+                acyclic: false,
+                source_kinds: None,
+                destination_kinds: None,
+                updated_at: String::new(),
+            })
+            .await
+            .expect("edge type");
+
+        let status = add_edge(
+            State(state.clone()),
+            Json(CreateEdgeParameters {
+                source: NodeSelectorParameters::Named {
+                    kind: "person".to_string(),
+                    name: "first".to_string(),
+                },
+                destination: NodeSelectorParameters::Named {
+                    kind: "person".to_string(),
+                    name: "second".to_string(),
+                },
+                edge_type_id: None,
+                edge_type: Some("knows".to_string()),
+                properties: None,
+            }),
+        )
+        .await
+        .expect("edge by name");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let edges = list_edges(
+            State(state.clone()),
+            Query(EdgeListParameters {
+                edge_type: Some("knows".to_string()),
+                source: None,
+                destination: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("edges")
+        .data;
+        assert_eq!(edges.total, 1);
+        assert_eq!(edges.items[0].edge_type, "knows");
     }
 }

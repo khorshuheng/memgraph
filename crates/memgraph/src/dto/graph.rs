@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
@@ -5,9 +7,9 @@ use crate::model::{
     ChangeDraft, Edge as EdgeModel, EdgeFilter, EdgeRecord, EdgeType as EdgeTypeModel, GraphExport,
     ImportConflict, ImportDraft, ImportEdge, ImportNode, ImportRef, ImportReport, ImportStatus,
     Neighbor as NeighborModel, NeighborDirection as NeighborDirectionModel, Node as NodeModel,
-    NodeFilter, NodeKind as NodeKindModel, NodeKindProperty, NodePatch, PackDraft, PackEdgeType,
-    PackNodeKind, PackReport, Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft,
-    PlanTask as PlanTaskModel, PlanTaskDraft, ReachFilter,
+    NodeFilter, NodeKind as NodeKindModel, NodeKindProperty, NodePatch, NodeSelector, PackDraft,
+    PackEdgeType, PackNodeKind, PackReport, Plan as PlanModel, PlanAnchorDraft, PlanDraft,
+    PlanGoalDraft, PlanTask as PlanTaskModel, PlanTaskDraft, ReachFilter,
     RelationDirection as RelationDirectionModel, SearchScope as SearchScopeModel, TaskDraft,
     TaskPatch, WorkFilter, WorkPage, WorkTask,
 };
@@ -221,6 +223,7 @@ impl From<CreateNodeParameters> for NodeModel {
 pub struct NodeResponse {
     pub id: i64,
     pub kind_id: i64,
+    pub kind: String,
     pub name: String,
     pub description: String,
     pub content: String,
@@ -238,6 +241,7 @@ impl NodeResponse {
         NodeResponse {
             id: node.id,
             kind_id: node.kind_id,
+            kind: String::new(),
             name: node.name,
             description: node.description,
             content: node.content,
@@ -253,6 +257,7 @@ impl From<NodeModel> for NodeResponse {
         NodeResponse {
             id: node.id,
             kind_id: node.kind_id,
+            kind: String::new(),
             name: node.name,
             description: node.description,
             content: node.content,
@@ -263,11 +268,36 @@ impl From<NodeModel> for NodeResponse {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum NodeSelectorParameters {
+    Id(i64),
+    Named { kind: String, name: String },
+}
+
+impl From<NodeSelectorParameters> for NodeSelector {
+    fn from(params: NodeSelectorParameters) -> Self {
+        match params {
+            NodeSelectorParameters::Id(id) => NodeSelector::Id(id),
+            NodeSelectorParameters::Named { kind, name } => NodeSelector::Named { kind, name },
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    description = "A new edge. Source and destination accept an id or {kind, name}; \
+                   provide exactly one of edge_type_id or edge_type."
+)]
 pub struct CreateEdgeParameters {
-    pub source: i64,
-    pub destination: i64,
-    pub edge_type_id: i64,
+    #[schema(value_type = Object)]
+    pub source: NodeSelectorParameters,
+    #[schema(value_type = Object)]
+    pub destination: NodeSelectorParameters,
+    #[serde(default)]
+    pub edge_type_id: Option<i64>,
+    #[serde(default)]
+    pub edge_type: Option<String>,
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
 }
@@ -277,19 +307,9 @@ pub struct EdgeResponse {
     pub source: i64,
     pub destination: i64,
     pub edge_type_id: i64,
+    pub edge_type: String,
     pub properties: serde_json::Value,
     pub created_at: String,
-}
-
-impl From<CreateEdgeParameters> for EdgeModel {
-    fn from(params: CreateEdgeParameters) -> Self {
-        EdgeModel {
-            source: params.source,
-            destination: params.destination,
-            edge_type_id: params.edge_type_id,
-            created_at: String::new(),
-        }
-    }
 }
 
 impl From<EdgeModel> for EdgeResponse {
@@ -298,6 +318,7 @@ impl From<EdgeModel> for EdgeResponse {
             source: edge.source,
             destination: edge.destination,
             edge_type_id: edge.edge_type_id,
+            edge_type: String::new(),
             properties: serde_json::json!({}),
             created_at: edge.created_at,
         }
@@ -310,6 +331,7 @@ impl From<EdgeRecord> for EdgeResponse {
             source: edge.source,
             destination: edge.destination,
             edge_type_id: edge.edge_type_id,
+            edge_type: String::new(),
             properties: serde_json::from_str(&edge.properties)
                 .unwrap_or_else(|_| serde_json::json!({})),
             created_at: edge.created_at,
@@ -349,6 +371,7 @@ pub struct EdgeListResponse {
 pub struct GraphExportNodeResponse {
     pub id: i64,
     pub kind_id: i64,
+    pub kind: String,
     pub name: String,
     pub tags: Vec<String>,
 }
@@ -358,6 +381,7 @@ pub struct GraphExportEdgeResponse {
     pub source: i64,
     pub destination: i64,
     pub edge_type_id: i64,
+    pub edge_type: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -379,6 +403,7 @@ impl From<GraphExport> for GraphExportResponse {
                 .map(|node| GraphExportNodeResponse {
                     id: node.id,
                     kind_id: node.kind_id,
+                    kind: String::new(),
                     name: node.name,
                     tags: node.tags,
                 })
@@ -390,6 +415,7 @@ impl From<GraphExport> for GraphExportResponse {
                     source: edge.source,
                     destination: edge.destination,
                     edge_type_id: edge.edge_type_id,
+                    edge_type: String::new(),
                 })
                 .collect(),
             node_count,
@@ -510,6 +536,8 @@ impl From<SearchScope> for SearchScopeModel {
 #[into_params(parameter_in = Query)]
 pub struct ListNodesParameters {
     pub kind: Option<String>,
+    pub name: Option<String>,
+    pub name_contains: Option<String>,
     pub scope: Option<SearchScope>,
     pub within: Option<i64>,
     pub via: Option<String>,
@@ -556,6 +584,8 @@ impl From<ListNodesParameters> for NodeFilter {
     fn from(params: ListNodesParameters) -> Self {
         NodeFilter {
             kind: params.kind,
+            name: params.name,
+            name_contains: params.name_contains,
             scope: params.scope.unwrap_or(SearchScope::All).into(),
             reach: ReachFilter {
                 within: params.within,
@@ -1374,7 +1404,8 @@ pub struct CreateChangeParameters {
     #[serde(default)]
     pub summary: String,
     #[serde(default)]
-    pub tasks: Vec<i64>,
+    #[schema(value_type = Vec<Object>)]
+    pub tasks: Vec<NodeSelectorParameters>,
     #[serde(default)]
     pub files: Vec<String>,
     #[serde(default)]
@@ -1389,10 +1420,113 @@ impl From<CreateChangeParameters> for ChangeDraft {
             commit: params.commit,
             title: params.title,
             summary: params.summary,
-            tasks: params.tasks,
+            tasks: params.tasks.into_iter().map(Into::into).collect(),
             files: params.files,
             properties: params.properties,
             tags: params.tags,
+        }
+    }
+}
+
+pub trait FillNames {
+    fn fill_names(&mut self, kinds: &HashMap<i64, String>, edge_types: &HashMap<i64, String>);
+}
+
+impl<T: FillNames> FillNames for Vec<T> {
+    fn fill_names(&mut self, kinds: &HashMap<i64, String>, edge_types: &HashMap<i64, String>) {
+        for item in self {
+            item.fill_names(kinds, edge_types);
+        }
+    }
+}
+
+impl FillNames for NodeResponse {
+    fn fill_names(&mut self, kinds: &HashMap<i64, String>, _edge_types: &HashMap<i64, String>) {
+        if let Some(kind) = kinds.get(&self.kind_id) {
+            self.kind = kind.clone();
+        }
+    }
+}
+
+impl FillNames for EdgeResponse {
+    fn fill_names(&mut self, _kinds: &HashMap<i64, String>, edge_types: &HashMap<i64, String>) {
+        if let Some(edge_type) = edge_types.get(&self.edge_type_id) {
+            self.edge_type = edge_type.clone();
+        }
+    }
+}
+
+impl FillNames for NeighborResponse {
+    fn fill_names(&mut self, kinds: &HashMap<i64, String>, edge_types: &HashMap<i64, String>) {
+        self.edge.fill_names(kinds, edge_types);
+        self.node.fill_names(kinds, edge_types);
+    }
+}
+
+impl FillNames for ListNodesResponse {
+    fn fill_names(&mut self, kinds: &HashMap<i64, String>, edge_types: &HashMap<i64, String>) {
+        for item in &mut self.items {
+            item.fill_names(kinds, edge_types);
+        }
+    }
+}
+
+impl FillNames for EdgeListResponse {
+    fn fill_names(&mut self, kinds: &HashMap<i64, String>, edge_types: &HashMap<i64, String>) {
+        for item in &mut self.items {
+            item.fill_names(kinds, edge_types);
+        }
+    }
+}
+
+impl FillNames for SearchHitResponse {
+    fn fill_names(&mut self, kinds: &HashMap<i64, String>, edge_types: &HashMap<i64, String>) {
+        self.node.fill_names(kinds, edge_types);
+    }
+}
+
+impl FillNames for SearchResponse {
+    fn fill_names(&mut self, kinds: &HashMap<i64, String>, edge_types: &HashMap<i64, String>) {
+        for item in &mut self.items {
+            item.fill_names(kinds, edge_types);
+        }
+    }
+}
+
+impl FillNames for PlanTaskResponse {
+    fn fill_names(&mut self, kinds: &HashMap<i64, String>, edge_types: &HashMap<i64, String>) {
+        self.node.fill_names(kinds, edge_types);
+    }
+}
+
+impl FillNames for PlanResponse {
+    fn fill_names(&mut self, kinds: &HashMap<i64, String>, edge_types: &HashMap<i64, String>) {
+        if let Some(goal) = &mut self.goal {
+            goal.fill_names(kinds, edge_types);
+        }
+        for task in &mut self.tasks {
+            task.fill_names(kinds, edge_types);
+        }
+    }
+}
+
+impl FillNames for GoalTreeResponse {
+    fn fill_names(&mut self, kinds: &HashMap<i64, String>, edge_types: &HashMap<i64, String>) {
+        self.goal.fill_names(kinds, edge_types);
+    }
+}
+
+impl FillNames for GraphExportResponse {
+    fn fill_names(&mut self, kinds: &HashMap<i64, String>, edge_types: &HashMap<i64, String>) {
+        for node in &mut self.nodes {
+            if let Some(kind) = kinds.get(&node.kind_id) {
+                node.kind = kind.clone();
+            }
+        }
+        for edge in &mut self.edges {
+            if let Some(edge_type) = edge_types.get(&edge.edge_type_id) {
+                edge.edge_type = edge_type.clone();
+            }
         }
     }
 }

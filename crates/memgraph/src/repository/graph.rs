@@ -156,6 +156,8 @@ pub trait GraphRepository: Send + Sync {
         kind_id: i64,
         name: &str,
     ) -> Result<Option<i64>, RepositoryError>;
+    async fn node_ids_by_name(&self, kind_id: i64, name: &str)
+    -> Result<Vec<i64>, RepositoryError>;
 
     async fn set_node_tags(&self, node_id: i64, tags: &[String]) -> Result<(), RepositoryError>;
     async fn node_tags(&self, node_id: i64) -> Result<Vec<String>, RepositoryError>;
@@ -598,6 +600,21 @@ impl GraphRepository for SqliteGraphRepository {
         .fetch_optional(&self.pool)
         .await?;
         Ok(id)
+    }
+
+    async fn node_ids_by_name(
+        &self,
+        kind_id: i64,
+        name: &str,
+    ) -> Result<Vec<i64>, RepositoryError> {
+        let ids = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM node WHERE kind_id = ? AND name = ? ORDER BY id",
+        )
+        .bind(kind_id)
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids)
     }
 
     async fn add_edge(&self, edge: &Edge) -> Result<(), RepositoryError> {
@@ -2600,6 +2617,15 @@ fn push_node_conditions(builder: &mut QueryBuilder<Sqlite>, filter: &NodeFilter)
     builder.push(" IS NULL OR n.kind_id = (SELECT id FROM node_kind WHERE name = ");
     builder.push_bind(filter.kind.clone());
     builder.push("))");
+    if let Some(name) = &filter.name {
+        builder.push(" AND n.name = ");
+        builder.push_bind(name.clone());
+    }
+    if let Some(name_contains) = &filter.name_contains {
+        builder.push(" AND instr(n.name, ");
+        builder.push_bind(name_contains.clone());
+        builder.push(") > 0");
+    }
     builder.push(scope_clause(filter.scope));
     push_property_filters(builder, &filter.properties);
 }

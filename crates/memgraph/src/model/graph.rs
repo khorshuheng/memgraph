@@ -105,6 +105,8 @@ pub struct ReachFilter {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeFilter {
     pub kind: Option<String>,
+    pub name: Option<String>,
+    pub name_contains: Option<String>,
     pub scope: SearchScope,
     pub reach: ReachFilter,
     pub properties: serde_json::Map<String, serde_json::Value>,
@@ -114,6 +116,8 @@ impl Default for NodeFilter {
     fn default() -> Self {
         Self {
             kind: None,
+            name: None,
+            name_contains: None,
             scope: SearchScope::All,
             reach: ReachFilter::default(),
             properties: serde_json::Map::new(),
@@ -639,10 +643,16 @@ pub struct ChangeDraft {
     pub commit: String,
     pub title: String,
     pub summary: String,
-    pub tasks: Vec<i64>,
+    pub tasks: Vec<NodeSelector>,
     pub files: Vec<String>,
     pub properties: Option<serde_json::Value>,
     pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeSelector {
+    Id(i64),
+    Named { kind: String, name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

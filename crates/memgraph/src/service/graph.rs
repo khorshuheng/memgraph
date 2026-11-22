@@ -6,9 +6,9 @@ use crate::{
     model::{
         ChangeDraft, Edge, EdgeFilter, EdgePage, EdgeType, GraphExport, ImportDraft, ImportEdge,
         ImportNode, ImportRef, ImportReport, Neighbor, NeighborDirection, Node, NodeFilter,
-        NodeKind, NodeKindProperty, NodePage, NodePatch, NodeRef, NodeWithMetadata, PackDraft,
-        PackEdgeType, PackNodeKind, PackProperty, PackReport, PendingEdge, PendingNode, Plan,
-        PlanDraft, PlanTask, PlanTaskDraft, PropertyType, ReachFilter, SearchPage, TagUsage,
+        NodeKind, NodeKindProperty, NodePage, NodePatch, NodeRef, NodeSelector, NodeWithMetadata,
+        PackDraft, PackEdgeType, PackNodeKind, PackProperty, PackReport, PendingEdge, PendingNode,
+        Plan, PlanDraft, PlanTask, PlanTaskDraft, PropertyType, ReachFilter, SearchPage, TagUsage,
         TaskDraft, TaskPatch, WorkDependency, WorkFilter, WorkPage, WorkRef, WorkStatus, WorkTask,
     },
     repository::graph::{GraphRepository, WorkSnapshot},
@@ -346,6 +346,8 @@ impl GraphService {
         }
         Ok(NodeFilter {
             kind: filter.kind.clone(),
+            name: filter.name.clone(),
+            name_contains: filter.name_contains.clone(),
             scope: filter.scope,
             reach: self.normalize_reach(&filter.reach).await?,
             properties: filter.properties.clone(),
@@ -723,9 +725,10 @@ impl GraphService {
             ));
         }
         let mut tasks: Vec<i64> = Vec::new();
-        for task in &draft.tasks {
-            if !tasks.contains(task) {
-                tasks.push(*task);
+        for selector in &draft.tasks {
+            let task = self.resolve_node_selector(selector).await?;
+            if !tasks.contains(&task) {
+                tasks.push(task);
             }
         }
         let mut files: Vec<String> = Vec::new();
@@ -1080,6 +1083,74 @@ impl GraphService {
                 })
             })
             .collect())
+    }
+
+    pub async fn resolve_node_selector(
+        &self,
+        selector: &NodeSelector,
+    ) -> Result<i64, ServiceError> {
+        match selector {
+            NodeSelector::Id(id) => Ok(*id),
+            NodeSelector::Named { kind, name } => {
+                let kind_id = self.kind_id(kind).await?;
+                let ids = self.repository.node_ids_by_name(kind_id, name).await?;
+                match ids.as_slice() {
+                    [] => Err(ServiceError::UnprocessableEntity(format!(
+                        "no {kind} named '{name}'"
+                    ))),
+                    [id] => Ok(*id),
+                    _ => Err(ServiceError::UnprocessableEntity(format!(
+                        "{kind} name '{name}' is ambiguous; use an id"
+                    ))),
+                }
+            }
+        }
+    }
+
+    pub async fn resolve_edge_type(
+        &self,
+        edge_type_id: Option<i64>,
+        edge_type: Option<&str>,
+    ) -> Result<i64, ServiceError> {
+        match (edge_type_id, edge_type) {
+            (Some(id), None) => Ok(id),
+            (None, Some(name)) => self
+                .repository
+                .list_edge_types()
+                .await?
+                .into_iter()
+                .find(|edge_type| edge_type.name == name)
+                .map(|edge_type| edge_type.id)
+                .ok_or_else(|| {
+                    ServiceError::UnprocessableEntity(format!("edge type '{name}' is not defined"))
+                }),
+            (None, None) => Err(ServiceError::UnprocessableEntity(
+                "provide edge_type_id or edge_type".to_string(),
+            )),
+            (Some(_), Some(_)) => Err(ServiceError::UnprocessableEntity(
+                "provide exactly one of edge_type_id or edge_type".to_string(),
+            )),
+        }
+    }
+
+    pub async fn name_maps(
+        &self,
+    ) -> Result<(HashMap<i64, String>, HashMap<i64, String>), ServiceError> {
+        let kinds = self
+            .repository
+            .list_node_kinds()
+            .await?
+            .into_iter()
+            .map(|kind| (kind.id, kind.name))
+            .collect();
+        let edge_types = self
+            .repository
+            .list_edge_types()
+            .await?
+            .into_iter()
+            .map(|edge_type| (edge_type.id, edge_type.name))
+            .collect();
+        Ok((kinds, edge_types))
     }
 
     pub async fn list_edges(
@@ -3036,6 +3107,8 @@ mod tests {
                     via: Some("belongs_to".to_string()),
                     descend: None,
                 },
+                name: None,
+                name_contains: None,
             })
             .await
             .unwrap();
@@ -3055,6 +3128,8 @@ mod tests {
                     via: Some("belongs_to".to_string()),
                     descend: Some("none".to_string()),
                 },
+                name: None,
+                name_contains: None,
             })
             .await
             .unwrap();
@@ -3083,6 +3158,8 @@ mod tests {
                         via: Some("belongs_to".to_string()),
                         descend: None,
                     },
+                    name: None,
+                    name_contains: None,
                 })
                 .await,
             Err(ServiceError::UnprocessableEntity(_))
@@ -3098,6 +3175,8 @@ mod tests {
                         via: Some("nope".to_string()),
                         descend: None,
                     },
+                    name: None,
+                    name_contains: None,
                 })
                 .await,
             Err(ServiceError::UnprocessableEntity(_))
@@ -3113,6 +3192,8 @@ mod tests {
                         via: Some(DESCEND_NONE.to_string()),
                         descend: None,
                     },
+                    name: None,
+                    name_contains: None,
                 })
                 .await,
             Err(ServiceError::UnprocessableEntity(_))
@@ -3128,6 +3209,8 @@ mod tests {
                         via: None,
                         descend: None,
                     },
+                    name: None,
+                    name_contains: None,
                 })
                 .await,
             Err(ServiceError::UnprocessableEntity(_))
@@ -3139,6 +3222,8 @@ mod tests {
                     kind: Some("nope".to_string()),
                     scope: SearchScope::All,
                     reach: ReachFilter::default(),
+                    name: None,
+                    name_contains: None,
                 })
                 .await,
             Err(ServiceError::UnprocessableEntity(_))
@@ -3165,6 +3250,8 @@ mod tests {
                 via: Some("belongs_to".to_string()),
                 descend: None,
             },
+            name: None,
+            name_contains: None,
         };
         assert_eq!(
             service
@@ -3451,6 +3538,8 @@ mod tests {
                     via: Some("belongs_to".to_string()),
                     descend: Some("none".to_string()),
                 },
+                name: None,
+                name_contains: None,
             })
             .await
             .unwrap();
@@ -7213,7 +7302,7 @@ mod tests {
             commit: "abc123".to_string(),
             title: "do work".to_string(),
             summary: "details".to_string(),
-            tasks: vec![task.id, task.id],
+            tasks: vec![NodeSelector::Id(task.id), NodeSelector::Id(task.id)],
             files: vec!["src/lib.rs".to_string(), " src/main.rs ".to_string()],
             properties: None,
             tags: Some(vec!["Repo:X".to_string()]),
@@ -7247,7 +7336,7 @@ mod tests {
 
         let mut missing_task = draft.clone();
         missing_task.commit = "def456".to_string();
-        missing_task.tasks = vec![999_999];
+        missing_task.tasks = vec![NodeSelector::Id(999_999)];
         missing_task.files = vec![];
         assert!(matches!(
             service.create_change(&missing_task).await,
@@ -7256,7 +7345,7 @@ mod tests {
 
         let mut wrong_kind = draft.clone();
         wrong_kind.commit = "def456".to_string();
-        wrong_kind.tasks = vec![goal];
+        wrong_kind.tasks = vec![NodeSelector::Id(goal)];
         wrong_kind.files = vec![];
         assert!(matches!(
             service.create_change(&wrong_kind).await,
@@ -7417,7 +7506,7 @@ mod tests {
             commit: "withprops".to_string(),
             title: "t".to_string(),
             summary: String::new(),
-            tasks: vec![task.id],
+            tasks: vec![NodeSelector::Id(task.id)],
             files: vec![],
             properties: Some(serde_json::json!({"author": "ada"})),
             tags: None,
@@ -7457,7 +7546,7 @@ mod tests {
             commit: "race123".to_string(),
             title: "race".to_string(),
             summary: String::new(),
-            tasks: vec![task.id],
+            tasks: vec![NodeSelector::Id(task.id)],
             files: vec![],
             properties: None,
             tags: None,
@@ -7516,6 +7605,123 @@ mod tests {
         assert!(matches!(
             service.nodes_by_ids(&too_many).await,
             Err(ServiceError::UnprocessableEntity(message)) if message.contains("at most 200")
+        ));
+    }
+
+    #[tokio::test]
+    async fn filters_nodes_by_exact_and_contains_name() {
+        let service = service().await;
+        let kind = seed_person(&service).await;
+        service
+            .create_node(&node(kind, "Ada Lovelace", ""), &[])
+            .await
+            .unwrap();
+        service
+            .create_node(&node(kind, "Ada Byron", ""), &[])
+            .await
+            .unwrap();
+        service
+            .create_node(&node(kind, "Grace Hopper", ""), &[])
+            .await
+            .unwrap();
+
+        let exact = service
+            .list_nodes(&NodeFilter {
+                name: Some("Ada Lovelace".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].name, "Ada Lovelace");
+
+        let contains = service
+            .list_nodes(&NodeFilter {
+                name_contains: Some("Ada".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(contains.len(), 2);
+
+        let case_sensitive = service
+            .list_nodes(&NodeFilter {
+                name_contains: Some("ada".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(case_sensitive.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_covers_node_names() {
+        let service = service().await;
+        let kind = seed_person(&service).await;
+        let ada = service
+            .create_node(&node(kind, "Ada Lovelace", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        let page = service
+            .search(Some("Lovelace"), &[], &Default::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.hits[0].node.id, ada.id);
+    }
+
+    #[tokio::test]
+    async fn resolves_named_selectors_and_rejects_ambiguity() {
+        let service = service().await;
+        let kind = service
+            .create_node_kind(&NodeKind {
+                id: 0,
+                version: 0,
+                name: "thing".to_string(),
+                description: String::new(),
+                unique_name: false,
+                strict_properties: false,
+                updated_at: String::new(),
+            })
+            .await
+            .unwrap();
+        let first = service
+            .create_node(&node(kind.id, "duplicate", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            service
+                .resolve_node_selector(&NodeSelector::Named {
+                    kind: "thing".to_string(),
+                    name: "duplicate".to_string(),
+                })
+                .await
+                .unwrap(),
+            first.id
+        );
+        service
+            .create_node(&node(kind.id, "duplicate", ""), &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .resolve_node_selector(&NodeSelector::Named {
+                    kind: "thing".to_string(),
+                    name: "duplicate".to_string(),
+                })
+                .await,
+            Err(ServiceError::UnprocessableEntity(message)) if message.contains("ambiguous")
+        ));
+        assert!(matches!(
+            service
+                .resolve_node_selector(&NodeSelector::Named {
+                    kind: "thing".to_string(),
+                    name: "missing".to_string(),
+                })
+                .await,
+            Err(ServiceError::UnprocessableEntity(message)) if message.contains("no thing named")
         ));
     }
 
