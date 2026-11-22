@@ -682,6 +682,61 @@ mod tests {
         .data
     }
 
+    async fn seed_anchored_goal(state: &AppState) -> i64 {
+        let repo_kind = seed_kind(state, "repo").await;
+        seed_kind(state, "goal").await;
+        seed_kind(state, "task").await;
+        seed_kind(state, "file").await;
+        for (name, source, destination) in [
+            ("belongs_to", "goal", "repo"),
+            ("part_of", "task", "task,goal"),
+            ("depends_on", "task", "task"),
+            ("affects", "task", "file"),
+        ] {
+            state
+                .graph_service
+                .create_edge_type(&EdgeType {
+                    id: 0,
+                    name: name.to_string(),
+                    description: String::new(),
+                    resolves: false,
+                    single_outgoing: false,
+                    acyclic: false,
+                    source_kinds: Some(source.to_string()),
+                    destination_kinds: Some(destination.to_string()),
+                    updated_at: String::new(),
+                })
+                .await
+                .expect("edge type");
+        }
+        let repo = new_node(state, repo_kind, "acme/widget", "", "", &[]).await;
+        create_plan(
+            State(state.clone()),
+            Json(CreatePlanParameters {
+                goal: Some(CreatePlanGoalParameters {
+                    id: None,
+                    name: "ship".to_string(),
+                    description: String::new(),
+                    content: String::new(),
+                    properties: None,
+                    tags: None,
+                }),
+                goal_id: None,
+                anchor: Some(PlanAnchorParameters {
+                    node_id: repo.id,
+                    edge_type: "belongs_to".to_string(),
+                }),
+                tasks: vec![],
+            }),
+        )
+        .await
+        .expect("create anchored goal")
+        .data
+        .goal
+        .expect("goal")
+        .id
+    }
+
     async fn search_handler(
         state: &AppState,
         params: SearchParameters,
@@ -710,6 +765,79 @@ mod tests {
             .expect("get node")
             .data;
         assert_eq!(fetched.tags, vec!["repo:x", "topic:storage"]);
+    }
+
+    #[tokio::test]
+    async fn create_and_update_task_expose_and_replace_tags() {
+        let state = test_state().await;
+        let goal = seed_anchored_goal(&state).await;
+
+        let created = create_task(
+            State(state.clone()),
+            Json(CreateTaskParameters {
+                id: None,
+                name: "tagged task".to_string(),
+                description: String::new(),
+                content: String::new(),
+                parent: Some(goal),
+                depends_on: vec![],
+                affects: vec![],
+                properties: None,
+                tags: Some(vec!["Repo:X".to_string(), " Phase:Plan ".to_string()]),
+            }),
+        )
+        .await
+        .expect("create task")
+        .data;
+        assert_eq!(created.tags, vec!["phase:plan", "repo:x"]);
+
+        let updated = update_task(
+            State(state.clone()),
+            Path(created.id),
+            Json(UpdateTaskParameters {
+                name: None,
+                description: Some("changed".to_string()),
+                content: None,
+                properties: None,
+                tags: Some(vec!["Other".to_string()]),
+            }),
+        )
+        .await
+        .expect("update task")
+        .data;
+        assert_eq!(updated.tags, vec!["other"]);
+
+        let preserved = update_task(
+            State(state.clone()),
+            Path(created.id),
+            Json(UpdateTaskParameters {
+                name: None,
+                description: Some("again".to_string()),
+                content: None,
+                properties: None,
+                tags: None,
+            }),
+        )
+        .await
+        .expect("update task")
+        .data;
+        assert_eq!(preserved.tags, vec!["other"]);
+
+        let cleared = update_task(
+            State(state.clone()),
+            Path(created.id),
+            Json(UpdateTaskParameters {
+                name: None,
+                description: None,
+                content: None,
+                properties: None,
+                tags: Some(vec![]),
+            }),
+        )
+        .await
+        .expect("clear tags")
+        .data;
+        assert!(cleared.tags.is_empty());
     }
 
     #[tokio::test]

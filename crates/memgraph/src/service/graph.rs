@@ -514,7 +514,7 @@ impl GraphService {
     pub async fn update_task(&self, task_id: i64, patch: &TaskPatch) -> Result<Node, ServiceError> {
         if patch.is_empty() {
             return Err(ServiceError::UnprocessableEntity(
-                "provide at least one of name, description or content".to_string(),
+                "provide at least one of name, description, content or tags".to_string(),
             ));
         }
         let node = self.get_node(task_id).await?;
@@ -6503,6 +6503,43 @@ mod tests {
             service.node_tags(plan.tasks[0].node.id).await.unwrap(),
             vec!["phase:build"]
         );
+    }
+
+    #[tokio::test]
+    async fn plan_upserts_leave_omitted_tags_and_clear_on_empty() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+
+        let mut task = plan_task("a", None, &[]);
+        task.id = 201;
+        task.tags = Some(vec!["Phase:Build".to_string()]);
+        let mut draft = plan_draft(repo, vec![task]);
+        let goal = draft.goal.as_mut().expect("goal");
+        goal.id = 200;
+        goal.tags = Some(vec!["Goal:Ship".to_string()]);
+        let first = service.create_plan(&draft).await.unwrap();
+        let goal_id = first.goal.as_ref().expect("goal").id;
+        let task_id = first.tasks[0].node.id;
+
+        let mut omitted = plan_draft(repo, vec![plan_task("a", None, &[])]);
+        let goal = omitted.goal.as_mut().expect("goal");
+        goal.id = goal_id;
+        goal.description = "changed".to_string();
+        omitted.tasks[0].id = task_id;
+        omitted.tasks[0].description = "changed".to_string();
+        service.create_plan(&omitted).await.unwrap();
+        assert_eq!(service.node_tags(goal_id).await.unwrap(), vec!["goal:ship"]);
+        assert_eq!(
+            service.node_tags(task_id).await.unwrap(),
+            vec!["phase:build"]
+        );
+
+        let mut cleared = omitted.clone();
+        cleared.goal.as_mut().expect("goal").tags = Some(Vec::new());
+        cleared.tasks[0].tags = Some(Vec::new());
+        service.create_plan(&cleared).await.unwrap();
+        assert!(service.node_tags(goal_id).await.unwrap().is_empty());
+        assert!(service.node_tags(task_id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
