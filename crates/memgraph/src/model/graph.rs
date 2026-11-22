@@ -516,6 +516,7 @@ pub enum NodeRef {
 pub struct PendingNode {
     pub node: Node,
     pub properties: Option<serde_json::Value>,
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -535,6 +536,7 @@ pub struct TaskDraft {
     pub depends_on: Vec<i64>,
     pub affects: Vec<i64>,
     pub properties: Option<serde_json::Value>,
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -562,6 +564,7 @@ pub struct TaskPatch {
     pub description: Option<String>,
     pub content: Option<String>,
     pub properties: Option<serde_json::Value>,
+    pub tags: Option<Vec<String>>,
 }
 
 impl TaskPatch {
@@ -570,6 +573,7 @@ impl TaskPatch {
             && self.description.is_none()
             && self.content.is_none()
             && self.properties.is_none()
+            && self.tags.is_none()
     }
 }
 
@@ -580,6 +584,7 @@ pub struct PlanGoalDraft {
     pub description: String,
     pub content: String,
     pub properties: Option<serde_json::Value>,
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -593,6 +598,7 @@ pub struct PlanTaskDraft {
     pub depends_on: Vec<String>,
     pub affects: Vec<i64>,
     pub properties: Option<serde_json::Value>,
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

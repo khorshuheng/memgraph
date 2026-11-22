@@ -434,7 +434,7 @@ impl GraphRepository for SqliteGraphRepository {
                 validate_declared_properties(candidate, &schema.properties, schema.strict)
                     .map_err(RepositoryError::ContractViolation)?;
             }
-            let row = if node.id == 0 {
+            let mut row = if node.id == 0 {
                 sqlx::query_as::<_, Node>(&format!(
                     "INSERT INTO node (kind_id, name, description, content) VALUES (?, ?, ?, ?) \
                      RETURNING {NODE_COLUMNS}"
@@ -464,14 +464,39 @@ impl GraphRepository for SqliteGraphRepository {
                 .fetch_one(&mut *transaction)
                 .await?
             };
+            let mut touched = false;
             if let Some(properties) = &pending.properties {
                 let encoded = serde_json::to_string(properties)
                     .map_err(|error| RepositoryError::SqlExecutionError(error.to_string()))?;
-                sqlx::query("UPDATE node SET properties = ? WHERE id = ?")
-                    .bind(encoded)
-                    .bind(row.id)
-                    .execute(&mut *transaction)
-                    .await?;
+                let current =
+                    sqlx::query_scalar::<_, String>("SELECT properties FROM node WHERE id = ?")
+                        .bind(row.id)
+                        .fetch_one(&mut *transaction)
+                        .await?;
+                if encoded != current {
+                    sqlx::query("UPDATE node SET properties = ? WHERE id = ?")
+                        .bind(encoded)
+                        .bind(row.id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    touched = true;
+                }
+            }
+            if let Some(tags) = &pending.tags {
+                let current = node_tags_in(&mut transaction, row.id).await?;
+                if !tags_equal(&current, tags) {
+                    replace_tags(&mut transaction, row.id, tags).await?;
+                    touched = true;
+                }
+            }
+            if touched && node.id != 0 {
+                row = sqlx::query_as::<_, Node>(&format!(
+                    "UPDATE node SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                     WHERE id = ? RETURNING {NODE_COLUMNS}"
+                ))
+                .bind(row.id)
+                .fetch_one(&mut *transaction)
+                .await?;
             }
             ids.push(row.id);
             created.push(row);

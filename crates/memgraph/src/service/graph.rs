@@ -531,7 +531,7 @@ impl GraphService {
                     name: patch.name.clone(),
                     description: patch.description.clone(),
                     content: patch.content.clone(),
-                    tags: None,
+                    tags: patch.tags.clone(),
                     properties: patch.properties.clone(),
                 },
             )
@@ -542,6 +542,9 @@ impl GraphService {
     pub async fn create_task(&self, draft: &TaskDraft) -> Result<Node, ServiceError> {
         let mut normalized = draft.clone();
         normalized.name = node_name(&normalized.name)?;
+        if let Some(tags) = &draft.tags {
+            normalized.tags = Some(normalize_tags(tags)?);
+        }
         let draft = &normalized;
         if draft.id < 0 {
             return Err(ServiceError::UnprocessableEntity(format!(
@@ -627,6 +630,7 @@ impl GraphService {
         let pending = PendingNode {
             node,
             properties: draft.properties.clone(),
+            tags: draft.tags.clone(),
         };
         let mut created = self
             .repository
@@ -641,9 +645,15 @@ impl GraphService {
         let mut normalized = draft.clone();
         if let Some(goal) = &mut normalized.goal {
             goal.name = node_name(&goal.name)?;
+            if let Some(tags) = &goal.tags {
+                goal.tags = Some(normalize_tags(tags)?);
+            }
         }
         for task in &mut normalized.tasks {
             task.name = node_name(&task.name)?;
+            if let Some(tags) = &task.tags {
+                task.tags = Some(normalize_tags(tags)?);
+            }
         }
         let draft = &normalized;
 
@@ -1045,6 +1055,7 @@ fn build_plan_nodes(
                 updated_at: String::new(),
             },
             properties: goal.properties.clone(),
+            tags: goal.tags.clone(),
         });
     }
     for task in &draft.tasks {
@@ -1058,6 +1069,7 @@ fn build_plan_nodes(
                 updated_at: String::new(),
             },
             properties: task.properties.clone(),
+            tags: task.tags.clone(),
         });
     }
     nodes
@@ -1817,6 +1829,7 @@ mod tests {
             depends_on: depends_on.iter().map(|value| value.to_string()).collect(),
             affects: vec![],
             properties: None,
+            tags: None,
         }
     }
 
@@ -1828,6 +1841,7 @@ mod tests {
                 description: String::new(),
                 content: String::new(),
                 properties: None,
+                tags: None,
             }),
             goal_id: None,
             anchor: Some(PlanAnchorDraft {
@@ -1883,6 +1897,7 @@ mod tests {
             depends_on: vec![],
             affects: vec![],
             properties: None,
+            tags: None,
         }
     }
 
@@ -2255,6 +2270,7 @@ mod tests {
                 description: String::new(),
                 content: String::new(),
                 properties: None,
+                tags: None,
             }),
             goal_id: None,
             anchor: Some(PlanAnchorDraft {
@@ -2408,6 +2424,7 @@ mod tests {
                     description: Some("recalibrated widget".to_string()),
                     content: None,
                     properties: None,
+                    tags: None,
                 },
             )
             .await
@@ -2456,6 +2473,7 @@ mod tests {
                         description: None,
                         content: None,
                         properties: None,
+                        tags: None,
                     },
                 )
                 .await,
@@ -2470,6 +2488,7 @@ mod tests {
                         description: Some("x".to_string()),
                         content: None,
                         properties: None,
+                        tags: None,
                     },
                 )
                 .await,
@@ -2484,6 +2503,7 @@ mod tests {
                         description: Some("x".to_string()),
                         content: None,
                         properties: None,
+                        tags: None,
                     },
                 )
                 .await
@@ -2879,6 +2899,7 @@ mod tests {
                 description: String::new(),
                 content: String::new(),
                 properties: None,
+                tags: None,
             }),
             goal_id: None,
             anchor: Some(anchor),
@@ -3011,6 +3032,7 @@ mod tests {
                 description: String::new(),
                 content: String::new(),
                 properties: None,
+                tags: None,
             }),
             goal_id: None,
             anchor: None,
@@ -4304,6 +4326,7 @@ mod tests {
                     description: String::new(),
                     content: String::new(),
                     properties: None,
+                    tags: None,
                 }),
                 goal_id: None,
                 anchor: Some(PlanAnchorDraft {
@@ -4331,6 +4354,7 @@ mod tests {
                     description: String::new(),
                     content: String::new(),
                     properties: None,
+                    tags: None,
                 }),
                 goal_id: None,
                 anchor: Some(PlanAnchorDraft {
@@ -4352,6 +4376,7 @@ mod tests {
                     description: String::new(),
                     content: String::new(),
                     properties: None,
+                    tags: None,
                 }),
                 goal_id: None,
                 anchor: Some(PlanAnchorDraft {
@@ -4723,6 +4748,7 @@ mod tests {
                                 description: None,
                                 content: None,
                                 properties: None,
+                                tags: None,
                             },
                         )
                         .await
@@ -6421,5 +6447,107 @@ mod tests {
             .unwrap();
         assert!(beyond.items.is_empty());
         assert_eq!(beyond.total, 5);
+    }
+
+    #[tokio::test]
+    async fn task_and_plan_writes_store_tags() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+
+        let mut task = new_task("tagged task");
+        task.parent = Some(goal);
+        task.tags = Some(vec!["Repo:X".to_string(), "phase:plan".to_string()]);
+        let created = service.create_task(&task).await.unwrap();
+        assert_eq!(
+            service.node_tags(created.id).await.unwrap(),
+            vec!["phase:plan", "repo:x"]
+        );
+
+        let mut update = new_task("tagged task");
+        update.id = created.id;
+        update.parent = Some(goal);
+        update.description = "changed".to_string();
+        service.create_task(&update).await.unwrap();
+        assert_eq!(
+            service.node_tags(created.id).await.unwrap(),
+            vec!["phase:plan", "repo:x"]
+        );
+
+        service
+            .update_task(
+                created.id,
+                &TaskPatch {
+                    name: None,
+                    description: None,
+                    content: None,
+                    properties: None,
+                    tags: Some(vec!["other".to_string()]),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(service.node_tags(created.id).await.unwrap(), vec!["other"]);
+
+        let mut plan_task = plan_task("a", None, &[]);
+        plan_task.tags = Some(vec!["Phase:Build".to_string()]);
+        let mut draft = plan_draft(repo, vec![plan_task]);
+        draft.goal.as_mut().unwrap().tags = Some(vec!["Goal:Ship".to_string()]);
+        let plan = service.create_plan(&draft).await.unwrap();
+        let plan_goal = plan.goal.as_ref().expect("goal").id;
+        assert_eq!(
+            service.node_tags(plan_goal).await.unwrap(),
+            vec!["goal:ship"]
+        );
+        assert_eq!(
+            service.node_tags(plan.tasks[0].node.id).await.unwrap(),
+            vec!["phase:build"]
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_and_property_upserts_bump_updated_at_only_on_change() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+
+        let mut task = new_task("recency task");
+        task.parent = Some(goal);
+        task.tags = Some(vec!["a".to_string()]);
+        task.properties = Some(serde_json::json!({"k": 1}));
+        let created = service.create_task(&task).await.unwrap();
+        let base = service.get_node(created.id).await.unwrap().updated_at;
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let mut same = new_task("recency task");
+        same.id = created.id;
+        same.parent = Some(goal);
+        same.tags = Some(vec!["a".to_string()]);
+        same.properties = Some(serde_json::json!({"k": 1}));
+        service.create_task(&same).await.unwrap();
+        assert_eq!(
+            service.get_node(created.id).await.unwrap().updated_at,
+            base,
+            "an unchanged upsert must not bump updated_at"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let mut tags_only = same.clone();
+        tags_only.tags = Some(vec!["b".to_string()]);
+        service.create_task(&tags_only).await.unwrap();
+        let after_tags = service.get_node(created.id).await.unwrap().updated_at;
+        assert_ne!(after_tags, base, "a tag change must bump updated_at");
+        assert_eq!(service.node_tags(created.id).await.unwrap(), vec!["b"]);
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let mut properties_only = same.clone();
+        properties_only.tags = Some(vec!["b".to_string()]);
+        properties_only.properties = Some(serde_json::json!({"k": 2}));
+        service.create_task(&properties_only).await.unwrap();
+        let after_properties = service.get_node(created.id).await.unwrap().updated_at;
+        assert_ne!(
+            after_properties, after_tags,
+            "a property change must bump updated_at"
+        );
     }
 }

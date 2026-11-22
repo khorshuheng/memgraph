@@ -898,7 +898,8 @@ pub struct ReplaceTagsParameters {
 #[derive(Debug, Deserialize, ToSchema)]
 #[schema(
     description = "A task created under a parent. Supplying id upserts that node and \
-                   replaces its name, description and content."
+                   replaces its name, description and content; omitted tags leave existing \
+                   tags unchanged, an empty list clears them."
 )]
 pub struct CreateTaskParameters {
     pub id: Option<i64>,
@@ -912,6 +913,8 @@ pub struct CreateTaskParameters {
     pub affects: Vec<i64>,
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 impl From<CreateTaskParameters> for TaskDraft {
@@ -925,6 +928,7 @@ impl From<CreateTaskParameters> for TaskDraft {
             depends_on: params.depends_on,
             affects: params.affects,
             properties: params.properties,
+            tags: params.tags,
         }
     }
 }
@@ -954,6 +958,10 @@ impl From<PlanAnchorParameters> for PlanAnchorDraft {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    description = "A plan goal. Omitted tags leave existing tags unchanged on an id upsert; \
+                   an empty list clears them."
+)]
 pub struct CreatePlanGoalParameters {
     pub id: Option<i64>,
     pub name: String,
@@ -961,12 +969,15 @@ pub struct CreatePlanGoalParameters {
     pub content: String,
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[schema(
     description = "A plan task. Supplying id upserts that node and replaces its name, \
-                   description and content; concurrent edits to that node may be overwritten."
+                   description and content; omitted tags leave existing tags unchanged, an \
+                   empty list clears them."
 )]
 pub struct CreatePlanTaskParameters {
     pub id: Option<i64>,
@@ -981,6 +992,8 @@ pub struct CreatePlanTaskParameters {
     pub affects: Vec<i64>,
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 impl From<CreatePlanParameters> for PlanDraft {
@@ -1002,6 +1015,7 @@ impl From<CreatePlanGoalParameters> for PlanGoalDraft {
             description: params.description,
             content: params.content,
             properties: params.properties,
+            tags: params.tags,
         }
     }
 }
@@ -1018,6 +1032,7 @@ impl From<CreatePlanTaskParameters> for PlanTaskDraft {
             depends_on: params.depends_on,
             affects: params.affects,
             properties: params.properties,
+            tags: params.tags,
         }
     }
 }
@@ -1081,12 +1096,18 @@ impl From<UpdateNodeParameters> for NodePatch {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    description = "A task patch. Omitted tags leave the current tags unchanged; an empty \
+                   list clears them."
+)]
 pub struct UpdateTaskParameters {
     pub name: Option<String>,
     pub description: Option<String>,
     pub content: Option<String>,
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 impl From<UpdateTaskParameters> for TaskPatch {
@@ -1096,6 +1117,7 @@ impl From<UpdateTaskParameters> for TaskPatch {
             description: params.description,
             content: params.content,
             properties: params.properties,
+            tags: params.tags,
         }
     }
 }

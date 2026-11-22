@@ -169,10 +169,11 @@ pub async fn create_task(
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let draft: TaskDraft = params.into();
     let created = state.graph_service.create_task(&draft).await?;
+    let tags = state.graph_service.node_tags(created.id).await?;
     let properties = state.graph_service.node_properties(created.id).await?;
     Ok(ApiSuccess {
         status: StatusCode::CREATED,
-        data: NodeResponse::with_tags_and_properties(created, Vec::new(), properties),
+        data: NodeResponse::with_tags_and_properties(created, tags, properties),
     })
 }
 
@@ -195,23 +196,26 @@ pub async fn create_plan(
         .map(|goal| goal.id)
         .chain(plan.tasks.iter().map(|task| task.node.id))
         .collect();
+    let mut tags = state.graph_service.node_tags_for_ids(&ids).await?;
     let mut properties = state.graph_service.node_properties_for_ids(&ids).await?;
     let goal = plan.goal.map(|goal| {
+        let tags = tags.remove(&goal.id).unwrap_or_default();
         let properties = properties
             .remove(&goal.id)
             .unwrap_or_else(|| serde_json::json!({}));
-        NodeResponse::with_tags_and_properties(goal, Vec::new(), properties)
+        NodeResponse::with_tags_and_properties(goal, tags, properties)
     });
     let tasks = plan
         .tasks
         .into_iter()
         .map(|task| {
+            let tags = tags.remove(&task.node.id).unwrap_or_default();
             let properties = properties
                 .remove(&task.node.id)
                 .unwrap_or_else(|| serde_json::json!({}));
             PlanTaskResponse {
                 key: task.key,
-                node: NodeResponse::with_tags_and_properties(task.node, Vec::new(), properties),
+                node: NodeResponse::with_tags_and_properties(task.node, tags, properties),
             }
         })
         .collect();
@@ -302,10 +306,11 @@ pub async fn update_task(
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let patch: TaskPatch = params.into();
     let updated = state.graph_service.update_task(task_id, &patch).await?;
+    let tags = state.graph_service.node_tags(updated.id).await?;
     let properties = state.graph_service.node_properties(updated.id).await?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: NodeResponse::with_tags_and_properties(updated, Vec::new(), properties),
+        data: NodeResponse::with_tags_and_properties(updated, tags, properties),
     })
 }
 
@@ -904,6 +909,7 @@ mod tests {
                 description: None,
                 content: None,
                 properties: None,
+                tags: None,
             }),
         )
         .await
@@ -1459,6 +1465,7 @@ mod tests {
                     description: String::new(),
                     content: String::new(),
                     properties: Some(serde_json::json!({"owner": "goal"})),
+                    tags: Some(vec!["Goal:Ship".to_string()]),
                 }),
                 goal_id: None,
                 anchor: Some(PlanAnchorParameters {
@@ -1475,20 +1482,21 @@ mod tests {
                     depends_on: vec![],
                     affects: vec![],
                     properties: Some(serde_json::json!({"owner": "task"})),
+                    tags: Some(vec!["Phase:Build".to_string()]),
                 }],
             }),
         )
         .await
         .expect("create plan")
         .data;
-        assert_eq!(
-            plan.goal.expect("goal").properties,
-            serde_json::json!({"owner": "goal"})
-        );
+        let goal = plan.goal.expect("goal");
+        assert_eq!(goal.properties, serde_json::json!({"owner": "goal"}));
+        assert_eq!(goal.tags, vec!["goal:ship"]);
         assert_eq!(
             plan.tasks[0].node.properties,
             serde_json::json!({"owner": "task"})
         );
+        assert_eq!(plan.tasks[0].node.tags, vec!["phase:build"]);
     }
 
     #[tokio::test]
