@@ -470,6 +470,7 @@ pub async fn list_nodes(
             || params.via.is_some()
             || params.descend.is_some()
             || params.properties.is_some()
+            || params.tags.is_some()
             || !order.is_empty()
             || since.is_some()
             || params.limit.is_some()
@@ -505,6 +506,7 @@ pub async fn list_nodes(
     }
     let limit = params.limit;
     let offset = params.offset;
+    let tags = params.tag_list();
     let properties = params
         .property_filter()
         .map_err(|message| ApiError::unprocessable(message).with_field("properties"))?;
@@ -512,7 +514,7 @@ pub async fn list_nodes(
     filter.properties = properties;
     let page = state
         .graph_service
-        .list_nodes_page_ordered(&filter, limit, offset, &order, since.as_deref())
+        .list_nodes_page_ordered(&filter, limit, offset, &tags, &order, since.as_deref())
         .await?;
     let ids: Vec<i64> = page.items.iter().map(|node| node.id).collect();
     let mut tags = state.graph_service.node_tags_for_ids(&ids).await?;
@@ -1376,6 +1378,7 @@ mod tests {
             Query(ListNodesParameters {
                 kind: None,
                 name: None,
+                tags: None,
                 name_contains: None,
                 scope: None,
                 within: None,
@@ -1778,6 +1781,7 @@ mod tests {
             Query(ListNodesParameters {
                 kind: None,
                 name: None,
+                tags: None,
                 name_contains: None,
                 scope: None,
                 within: None,
@@ -1853,6 +1857,7 @@ mod tests {
             Query(ListNodesParameters {
                 kind: None,
                 name: None,
+                tags: None,
                 name_contains: None,
                 scope: None,
                 within: None,
@@ -1892,6 +1897,7 @@ mod tests {
             Query(ListNodesParameters {
                 kind: None,
                 name: None,
+                tags: None,
                 name_contains: None,
                 scope: None,
                 within: None,
@@ -2253,6 +2259,7 @@ mod tests {
             Query(ListNodesParameters {
                 kind: None,
                 name: None,
+                tags: None,
                 name_contains: None,
                 scope: None,
                 within: None,
@@ -2285,6 +2292,7 @@ mod tests {
             Query(ListNodesParameters {
                 kind: None,
                 name: None,
+                tags: None,
                 name_contains: None,
                 scope: None,
                 within: None,
@@ -2311,6 +2319,7 @@ mod tests {
             Query(ListNodesParameters {
                 kind: None,
                 name: None,
+                tags: None,
                 name_contains: None,
                 scope: None,
                 within: None,
@@ -2648,6 +2657,7 @@ mod tests {
             Query(ListNodesParameters {
                 kind: None,
                 name: None,
+                tags: None,
                 name_contains: None,
                 scope: None,
                 within: None,
@@ -2683,6 +2693,7 @@ mod tests {
             Query(ListNodesParameters {
                 kind: None,
                 name: None,
+                tags: None,
                 name_contains: None,
                 scope: None,
                 within: None,
@@ -2707,6 +2718,7 @@ mod tests {
             Query(ListNodesParameters {
                 kind: None,
                 name: None,
+                tags: None,
                 name_contains: None,
                 scope: None,
                 within: None,
@@ -2731,6 +2743,7 @@ mod tests {
             Query(ListNodesParameters {
                 kind: None,
                 name: None,
+                tags: None,
                 name_contains: None,
                 scope: None,
                 within: None,
@@ -2787,6 +2800,7 @@ mod tests {
             Query(ListNodesParameters {
                 kind: None,
                 name: None,
+                tags: None,
                 name_contains: None,
                 scope: None,
                 within: None,
@@ -2821,6 +2835,7 @@ mod tests {
             Query(ListNodesParameters {
                 kind: None,
                 name: None,
+                tags: None,
                 name_contains: Some("irs".to_string()),
                 scope: None,
                 within: None,
@@ -2846,6 +2861,7 @@ mod tests {
             Query(ListNodesParameters {
                 kind: Some("person".to_string()),
                 name: None,
+                tags: None,
                 name_contains: None,
                 scope: None,
                 within: None,

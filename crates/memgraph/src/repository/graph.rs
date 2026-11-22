@@ -202,6 +202,7 @@ pub trait GraphRepository: Send + Sync {
         filter: &NodeFilter,
         limit: i64,
         offset: i64,
+        tags: &[String],
         order: &[crate::model::QueryOrder],
         since: Option<&str>,
     ) -> Result<(Vec<Node>, i64), RepositoryError>;
@@ -706,7 +707,7 @@ impl GraphRepository for SqliteGraphRepository {
     }
 
     async fn list_nodes(&self, filter: &NodeFilter) -> Result<Vec<Node>, RepositoryError> {
-        self.list_nodes_page(filter, -1, 0, &[], None)
+        self.list_nodes_page(filter, -1, 0, &[], &[], None)
             .await
             .map(|(items, _)| items)
     }
@@ -716,6 +717,7 @@ impl GraphRepository for SqliteGraphRepository {
         filter: &NodeFilter,
         limit: i64,
         offset: i64,
+        tags: &[String],
         order: &[crate::model::QueryOrder],
         since: Option<&str>,
     ) -> Result<(Vec<Node>, i64), RepositoryError> {
@@ -726,7 +728,7 @@ impl GraphRepository for SqliteGraphRepository {
             push_reach_cte(&mut count, &filter.reach);
         }
         count.push("SELECT count(*) FROM node n JOIN node_kind k ON k.id = n.kind_id WHERE 1 = 1");
-        push_node_conditions(&mut count, filter, since);
+        push_node_conditions(&mut count, filter, since, tags);
         let total = count
             .build_query_scalar::<i64>()
             .fetch_one(&mut *transaction)
@@ -740,7 +742,7 @@ impl GraphRepository for SqliteGraphRepository {
             "SELECT {NODE_COLUMNS_QUALIFIED} FROM node n JOIN node_kind k ON k.id = n.kind_id \
              WHERE 1 = 1"
         ));
-        push_node_conditions(&mut page, filter, since);
+        push_node_conditions(&mut page, filter, since, tags);
         push_node_query_order(&mut page, order);
         page.push(" LIMIT ");
         page.push_bind(limit);
@@ -815,16 +817,33 @@ impl GraphRepository for SqliteGraphRepository {
         edge: &Edge,
         properties: Option<&str>,
     ) -> Result<(), RepositoryError> {
-        sqlx::query(
-            "INSERT INTO edge (source, destination, edge_type_id, properties) \
-             VALUES (?, ?, ?, coalesce(?, '{}')) ON CONFLICT DO NOTHING",
-        )
-        .bind(edge.source)
-        .bind(edge.destination)
-        .bind(edge.edge_type_id)
-        .bind(properties)
-        .execute(&self.pool)
-        .await?;
+        if let Some(properties) = properties {
+            sqlx::query(
+                "INSERT INTO edge (source, destination, edge_type_id, properties) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(source, destination, edge_type_id) DO UPDATE SET \
+                   properties = CASE WHEN edge.properties = excluded.properties \
+                     THEN edge.properties ELSE excluded.properties END, \
+                   version = CASE WHEN edge.properties = excluded.properties \
+                     THEN edge.version ELSE edge.version + 1 END",
+            )
+            .bind(edge.source)
+            .bind(edge.destination)
+            .bind(edge.edge_type_id)
+            .bind(properties)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                "INSERT INTO edge (source, destination, edge_type_id, properties) \
+                 VALUES (?, ?, ?, '{}') ON CONFLICT DO NOTHING",
+            )
+            .bind(edge.source)
+            .bind(edge.destination)
+            .bind(edge.edge_type_id)
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 
@@ -3386,6 +3405,7 @@ fn push_node_conditions(
     builder: &mut QueryBuilder<Sqlite>,
     filter: &NodeFilter,
     since: Option<&str>,
+    tags: &[String],
 ) {
     if filter.reach.within.is_some() {
         builder.push(" AND n.id IN (SELECT id FROM reach)");
@@ -3407,6 +3427,11 @@ fn push_node_conditions(
     if let Some(since) = since {
         builder.push(" AND n.updated_at >= ");
         builder.push_bind(since.to_string());
+    }
+    for tag in tags {
+        builder.push(" AND EXISTS(SELECT 1 FROM node_tag nt WHERE nt.node_id = n.id AND nt.tag = ");
+        builder.push_bind(tag.clone());
+        builder.push(")");
     }
     builder.push(scope_clause(filter.scope));
     push_property_filters(builder, &filter.properties);

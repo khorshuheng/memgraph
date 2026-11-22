@@ -357,7 +357,7 @@ impl GraphService {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<NodePage, ServiceError> {
-        self.list_nodes_page_ordered(filter, limit, offset, &[], None)
+        self.list_nodes_page_ordered(filter, limit, offset, &[], &[], None)
             .await
     }
 
@@ -366,6 +366,7 @@ impl GraphService {
         filter: &NodeFilter,
         limit: Option<i64>,
         offset: Option<i64>,
+        tags: &[String],
         order: &[QueryOrder],
         since: Option<&str>,
     ) -> Result<NodePage, ServiceError> {
@@ -374,6 +375,7 @@ impl GraphService {
             Some(since) => Some(validate_since(since)?),
             None => None,
         };
+        let tags = normalize_tags(tags)?;
         let order = query_order(order, &NODE_ORDER_FIELDS, "id")?;
         let limit = limit
             .unwrap_or(self.paging.default_limit)
@@ -381,7 +383,7 @@ impl GraphService {
         let offset = offset.unwrap_or(0).max(0);
         let (items, total) = self
             .repository
-            .list_nodes_page(&filter, limit, offset, &order, since.as_deref())
+            .list_nodes_page(&filter, limit, offset, &tags, &order, since.as_deref())
             .await?;
         Ok(NodePage {
             items,
@@ -9047,6 +9049,105 @@ mod tests {
             service.export_graph().await,
             Err(ServiceError::PayloadTooLarge(message)) if message.contains("50001")
         ));
+    }
+
+    #[tokio::test]
+    async fn list_nodes_filters_by_all_tags() {
+        let service = service().await;
+        let kind = seed_person(&service).await;
+        service
+            .create_node(&node(kind, "first tagged", ""), &[" A ".to_string()])
+            .await
+            .unwrap();
+        service
+            .create_node(
+                &node(kind, "second tagged", ""),
+                &["a".to_string(), "B".to_string()],
+            )
+            .await
+            .unwrap();
+        service
+            .create_node(&node(kind, "untagged", ""), &[])
+            .await
+            .unwrap();
+
+        let one = service
+            .list_nodes_page_ordered(
+                &NodeFilter::default(),
+                None,
+                None,
+                &["a".to_string()],
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(one.total, 2);
+        let both = service
+            .list_nodes_page_ordered(
+                &NodeFilter::default(),
+                None,
+                None,
+                &["a".to_string(), "b".to_string()],
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(both.total, 1);
+    }
+
+    #[tokio::test]
+    async fn posting_an_existing_edge_updates_supplied_properties() {
+        let service = service().await;
+        let kind = seed_person(&service).await;
+        let first = service
+            .upsert_node(&node(kind, "edge first", ""))
+            .await
+            .unwrap();
+        let second = service
+            .upsert_node(&node(kind, "edge second", ""))
+            .await
+            .unwrap();
+        let knows = service
+            .create_edge_type(&edge_type("knows", ""))
+            .await
+            .unwrap();
+        let edge = Edge {
+            source: first.id,
+            destination: second.id,
+            edge_type_id: knows.id,
+            created_at: String::new(),
+        };
+        service
+            .add_edge_with_properties(&edge, Some(&serde_json::json!({"weight": 1})))
+            .await
+            .unwrap();
+        let page = service
+            .list_edges(&EdgeFilter::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.items[0].version, 1);
+        assert_eq!(page.items[0].properties, "{\"weight\":1}");
+
+        service
+            .add_edge_with_properties(&edge, Some(&serde_json::json!({"weight": 2})))
+            .await
+            .unwrap();
+        let page = service
+            .list_edges(&EdgeFilter::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.items[0].version, 2);
+        assert_eq!(page.items[0].properties, "{\"weight\":2}");
+
+        service.add_edge_with_properties(&edge, None).await.unwrap();
+        let page = service
+            .list_edges(&EdgeFilter::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.items[0].version, 2);
+        assert_eq!(page.items[0].properties, "{\"weight\":2}");
     }
 
     #[tokio::test]

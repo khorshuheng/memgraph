@@ -60,6 +60,49 @@ pub(crate) async fn openapi_doc() -> utoipa::openapi::OpenApi {
     build_router(state).1
 }
 
+fn extract_field(message: &str) -> Option<String> {
+    for marker in ["missing field `", "unknown field `"] {
+        if let Some(rest) = message.split(marker).nth(1)
+            && let Some(field) = rest.split('`').next()
+            && !field.is_empty()
+        {
+            return Some(field.to_string());
+        }
+    }
+    None
+}
+
+async fn normalize_api_errors(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let response = next.run(request).await;
+    if !path.starts_with("/api") || response.status() < StatusCode::BAD_REQUEST {
+        return response;
+    }
+    let plain = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/plain"));
+    if !plain {
+        return response;
+    }
+    let status = response.status();
+    let (parts, body) = response.into_parts();
+    let bytes = match to_bytes(body, 64 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return Response::from_parts(parts, Body::empty()),
+    };
+    let message = String::from_utf8_lossy(&bytes).trim().to_string();
+    if message.is_empty() {
+        return Response::from_parts(parts, Body::empty());
+    }
+    let mut error = ApiError::new(status, "invalid_request", message);
+    if let Some(field) = extract_field(&error.message) {
+        error = error.with_field(&field);
+    }
+    error.into_response()
+}
+
 async fn idempotency(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if request.method() != Method::POST {
         return next.run(request).await;
@@ -194,8 +237,29 @@ pub fn routes(app_state: AppState) -> Router {
         .merge(Redoc::with_url("/redoc", api))
         .merge(api_json_router)
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(normalize_api_errors))
         .layer(middleware::from_fn_with_state(
             idempotency_state,
             idempotency,
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_field;
+
+    #[test]
+    fn extracts_the_offending_field() {
+        assert_eq!(
+            extract_field(
+                "Failed to deserialize the JSON body into the target type: missing field `name` at line 1"
+            ),
+            Some("name".to_string())
+        );
+        assert_eq!(
+            extract_field("unknown field `bogus`, expected one of `kind`, `name`"),
+            Some("bogus".to_string())
+        );
+        assert_eq!(extract_field("edge would create a cycle"), None);
+    }
 }

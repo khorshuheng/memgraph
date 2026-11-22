@@ -353,6 +353,7 @@ impl From<EdgeRecord> for EdgeResponse {
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct EdgeListParameters {
     pub edge_type: Option<String>,
@@ -444,6 +445,7 @@ impl From<GraphExport> for GraphExportResponse {
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct DeleteEdgeParameters {
     pub source: i64,
@@ -490,6 +492,7 @@ impl From<NeighborDirection> for NeighborDirectionModel {
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct NeighborParameters {
     #[serde(default)]
@@ -553,11 +556,13 @@ impl From<SearchScope> for SearchScopeModel {
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct ListNodesParameters {
     pub kind: Option<String>,
     pub name: Option<String>,
     pub name_contains: Option<String>,
+    pub tags: Option<String>,
     pub scope: Option<SearchScope>,
     pub within: Option<i64>,
     pub via: Option<String>,
@@ -583,6 +588,19 @@ pub struct ListNodesResponse {
 impl ListNodesParameters {
     pub fn property_filter(&self) -> Result<serde_json::Map<String, serde_json::Value>, String> {
         parse_property_filter(self.properties.as_deref())
+    }
+
+    pub fn tag_list(&self) -> Vec<String> {
+        self.tags
+            .as_deref()
+            .map(|tags| {
+                tags.split(',')
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn order_list(&self) -> Result<Vec<QueryOrder>, String> {
@@ -1041,6 +1059,7 @@ impl From<ImportReport> for ImportReportResponse {
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct SearchParameters {
     pub q: Option<String>,
@@ -1361,6 +1380,7 @@ impl From<UpdateTaskParameters> for TaskPatch {
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct WorkParameters {
     pub goal: Option<i64>,
@@ -1380,6 +1400,7 @@ impl From<WorkParameters> for WorkFilter {
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct PageParameters {
     pub fields: Option<String>,
