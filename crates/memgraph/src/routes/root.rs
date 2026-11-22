@@ -24,6 +24,7 @@ use super::{graph, health};
 #[openapi(
     info(
         title = "memgraph",
+        description = "Successful responses are wrapped as {\"data\": ...}; lists use \"data\" \n         (an array for unpaged lists, {items,total,limit,offset} for paged lists). Errors are \n         {\"error\":{code,message,field?,hint?,retryable}}.",
         license(identifier = "MIT"),
     ),
     servers(

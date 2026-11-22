@@ -21,21 +21,22 @@ const NODE_KIND_COLUMNS: &str =
     "id, version, name, description, unique_name, strict_properties, updated_at";
 const EDGE_TYPE_COLUMNS: &str = "id, name, description, resolves, single_outgoing, acyclic, source_kinds, destination_kinds, \
      updated_at";
-const NODE_COLUMNS: &str = "id, kind_id, name, description, content, version, updated_at";
+const NODE_COLUMNS: &str =
+    "id, kind_id, name, description, content, version, created_at, updated_at";
 const NODE_COLUMNS_QUALIFIED: &str =
-    "n.id, n.kind_id, n.name, n.description, n.content, n.version, n.updated_at";
+    "n.id, n.kind_id, n.name, n.description, n.content, n.version, n.created_at, n.updated_at";
 const MAX_EXPORT_NODES: i64 = 50_000;
 const MAX_EXPORT_EDGES: i64 = 200_000;
 const OUTGOING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
     e.properties AS edge_properties, e.version AS edge_version, \
-    n.id, n.kind_id, n.name, n.description, n.content, n.version, n.updated_at \
+    n.id, n.kind_id, n.name, n.description, n.content, n.version, n.created_at, n.updated_at \
     FROM edge e JOIN node n ON n.id = e.destination \
     WHERE e.source = ? \
       AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
     ORDER BY e.edge_type_id, e.destination";
 const INCOMING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
     e.properties AS edge_properties, e.version AS edge_version, \
-    n.id, n.kind_id, n.name, n.description, n.content, n.version, n.updated_at \
+    n.id, n.kind_id, n.name, n.description, n.content, n.version, n.created_at, n.updated_at \
     FROM edge e JOIN node n ON n.id = e.source \
     WHERE e.destination = ? \
       AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
@@ -118,6 +119,7 @@ pub struct QueryNodeRow {
     pub name: String,
     pub description: String,
     pub content: String,
+    pub created_at: String,
     pub updated_at: String,
 }
 
@@ -1350,7 +1352,7 @@ impl GraphRepository for SqliteGraphRepository {
         let rows = if let Some(fts_query) = query {
             let mut builder = QueryBuilder::new(
                 "SELECT n.id, n.kind_id, n.name, n.description, n.content, n.version, \
-                 n.updated_at, bm25(node_fts) AS score FROM node_fts \
+                 n.created_at, n.updated_at, bm25(node_fts) AS score FROM node_fts \
                  JOIN node n ON n.id = node_fts.rowid WHERE node_fts MATCH ",
             );
             builder.push_bind(fts_query);
@@ -1367,7 +1369,7 @@ impl GraphRepository for SqliteGraphRepository {
         } else {
             let mut builder = QueryBuilder::new(
                 "SELECT n.id, n.kind_id, n.name, n.description, n.content, n.version, \
-                 n.updated_at, 0.0 AS score FROM node n WHERE 1 = 1",
+                 n.created_at, n.updated_at, 0.0 AS score FROM node n WHERE 1 = 1",
             );
             push_tag_filter(&mut builder, tags);
             push_property_filters(&mut builder, properties);
@@ -1526,6 +1528,7 @@ struct SearchRow {
     description: String,
     content: String,
     version: i64,
+    created_at: String,
     updated_at: String,
     score: f64,
 }
@@ -1540,6 +1543,7 @@ impl SearchRow {
                 description: self.description,
                 content: self.content,
                 version: self.version,
+                created_at: self.created_at,
                 updated_at: self.updated_at,
             },
             score: self.score.abs(),
@@ -2219,8 +2223,8 @@ async fn import_node(
                 None => "{}".to_string(),
             };
             let id = sqlx::query_scalar::<_, i64>(
-                "INSERT INTO node (id, kind_id, name, description, content, properties) \
-                 VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+                "INSERT INTO node (id, kind_id, name, description, content, properties, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) RETURNING id",
             )
             .bind(node.id)
             .bind(kind_id)
@@ -2671,7 +2675,8 @@ async fn insert_nodes_with_edges_items(
         }
         let mut row = if node.id == 0 {
             sqlx::query_as::<_, Node>(&format!(
-                "INSERT INTO node (kind_id, name, description, content) VALUES (?, ?, ?, ?) \
+                "INSERT INTO node (kind_id, name, description, content, created_at) \
+                 VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
                  RETURNING {NODE_COLUMNS}"
             ))
             .bind(node.kind_id)
@@ -2682,8 +2687,8 @@ async fn insert_nodes_with_edges_items(
             .await?
         } else {
             sqlx::query_as::<_, Node>(&format!(
-                "INSERT INTO node (id, kind_id, name, description, content) \
-                 VALUES (?, ?, ?, ?, ?) \
+                "INSERT INTO node (id, kind_id, name, description, content, created_at) \
+                 VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
                  ON CONFLICT(id) DO UPDATE SET kind_id = excluded.kind_id, \
                  name = excluded.name, description = excluded.description, \
                  content = excluded.content, version = CASE WHEN node.kind_id = excluded.kind_id \
@@ -3210,7 +3215,7 @@ async fn query_nodes_items(
     }
     page.push(
         "SELECT n.id, n.kind_id, k.name AS kind, n.name, n.description, n.content, \
-         n.updated_at FROM node n JOIN node_kind k ON k.id = n.kind_id WHERE 1 = 1",
+         n.created_at, n.updated_at FROM node n JOIN node_kind k ON k.id = n.kind_id WHERE 1 = 1",
     );
     push_node_query_conditions(&mut page, query);
     push_node_query_order(&mut page, &query.order);
@@ -3496,7 +3501,8 @@ where
 {
     if node.id == 0 {
         sqlx::query_as::<_, Node>(&format!(
-            "INSERT INTO node (kind_id, name, description, content) VALUES (?, ?, ?, ?) \
+            "INSERT INTO node (kind_id, name, description, content, created_at) \
+             VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
              RETURNING {NODE_COLUMNS}"
         ))
         .bind(node.kind_id)
@@ -3507,7 +3513,8 @@ where
         .await
     } else {
         sqlx::query_as::<_, Node>(&format!(
-            "INSERT INTO node (id, kind_id, name, description, content) VALUES (?, ?, ?, ?, ?) \
+            "INSERT INTO node (id, kind_id, name, description, content, created_at) \
+             VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
              ON CONFLICT(id) DO UPDATE SET kind_id = excluded.kind_id, name = excluded.name, \
              description = excluded.description, content = excluded.content, \
              version = CASE WHEN node.kind_id = excluded.kind_id \

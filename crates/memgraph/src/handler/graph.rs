@@ -29,7 +29,7 @@ use crate::{
     state::AppState,
 };
 
-const NODE_PROJECTION_FIELDS: [&str; 10] = [
+const NODE_PROJECTION_FIELDS: [&str; 11] = [
     "id",
     "kind_id",
     "kind",
@@ -39,6 +39,7 @@ const NODE_PROJECTION_FIELDS: [&str; 10] = [
     "tags",
     "properties",
     "version",
+    "created_at",
     "updated_at",
 ];
 const WORK_PROJECTION_FIELDS: [&str; 7] = [
@@ -1269,6 +1270,7 @@ mod tests {
         .await;
         assert_eq!(created.tags, vec!["repo:x", "topic:storage"]);
         assert_eq!(created.name, "use sqlite");
+        assert!(!created.created_at.is_empty());
 
         let fetched = get_node(State(state.clone()), Path(created.id))
             .await

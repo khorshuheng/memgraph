@@ -8,7 +8,6 @@ use utoipa::ToSchema;
 pub struct ApiSuccess<T: Serialize> {
     #[serde(skip_serializing)]
     pub status: StatusCode,
-    #[serde(flatten)]
     pub data: T,
 }
 
@@ -23,6 +22,7 @@ pub struct ApiList<T: Serialize> {
     #[serde(skip_serializing)]
     #[schema(ignore)]
     pub status: StatusCode,
+    #[serde(rename = "data")]
     pub items: Vec<T>,
 }
 
@@ -78,8 +78,47 @@ impl ApiError {
     }
 }
 
+#[derive(Serialize)]
+struct ApiErrorEnvelope<'a> {
+    error: &'a ApiError,
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(self)).into_response()
+        (self.status, Json(ApiErrorEnvelope { error: &self })).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+
+    use super::*;
+
+    #[test]
+    fn success_and_list_use_the_data_envelope() {
+        let success = serde_json::to_value(ApiSuccess {
+            status: StatusCode::OK,
+            data: "value",
+        })
+        .unwrap();
+        assert_eq!(success, serde_json::json!({"data": "value"}));
+
+        let list = serde_json::to_value(ApiList {
+            status: StatusCode::OK,
+            items: vec!["a", "b"],
+        })
+        .unwrap();
+        assert_eq!(list, serde_json::json!({"data": ["a", "b"]}));
+    }
+
+    #[tokio::test]
+    async fn errors_use_the_error_envelope() {
+        let response = ApiError::unprocessable("bad input").into_response();
+        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert_eq!(body["error"]["message"], "bad input");
+        assert_eq!(body["error"]["retryable"], false);
     }
 }

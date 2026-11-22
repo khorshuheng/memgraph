@@ -20,7 +20,7 @@ use super::error::ServiceError;
 const DEFAULT_DESCEND: &str = "part_of";
 const DESCEND_NONE: &str = "none";
 const MAX_BATCH_IDS: usize = 200;
-const NODE_QUERY_FIELDS: [&str; 9] = [
+const NODE_QUERY_FIELDS: [&str; 11] = [
     "id",
     "kind_id",
     "kind",
@@ -29,6 +29,8 @@ const NODE_QUERY_FIELDS: [&str; 9] = [
     "content",
     "tags",
     "properties",
+    "version",
+    "created_at",
     "updated_at",
 ];
 const EDGE_QUERY_FIELDS: [&str; 6] = [
@@ -799,6 +801,7 @@ impl GraphService {
             description: draft.description.clone(),
             content: draft.content.clone(),
             version: 0,
+            created_at: String::new(),
             updated_at: String::new(),
         };
         let mut edges = Vec::new();
@@ -991,6 +994,7 @@ impl GraphService {
             description: title.to_string(),
             content: draft.summary.clone(),
             version: 0,
+            created_at: String::new(),
             updated_at: String::new(),
         };
         let pending = PendingNode {
@@ -1497,6 +1501,7 @@ impl GraphService {
                             .unwrap_or("{}"),
                     )
                     .unwrap_or_else(|_| serde_json::json!({})),
+                    "created_at" => serde_json::json!(row.created_at),
                     "updated_at" => serde_json::json!(row.updated_at),
                     _ => unreachable!(),
                 };
@@ -1982,6 +1987,7 @@ fn build_plan_nodes(
                 description: goal.description.clone(),
                 content: goal.content.clone(),
                 version: 0,
+                created_at: String::new(),
                 updated_at: String::new(),
             },
             properties: goal.properties.clone(),
@@ -1997,6 +2003,7 @@ fn build_plan_nodes(
                 description: task.description.clone(),
                 content: task.content.clone(),
                 version: 0,
+                created_at: String::new(),
                 updated_at: String::new(),
             },
             properties: task.properties.clone(),
@@ -2520,6 +2527,7 @@ mod tests {
             description: String::new(),
             content: content.to_string(),
             version: 0,
+            created_at: String::new(),
             updated_at: String::new(),
         }
     }
@@ -2532,6 +2540,7 @@ mod tests {
             description: description.to_string(),
             content: String::new(),
             version: 0,
+            created_at: String::new(),
             updated_at: String::new(),
         }
     }
@@ -8590,6 +8599,31 @@ mod tests {
                 .unwrap(),
             IdempotencyReservation::Reserved
         );
+    }
+
+    #[tokio::test]
+    async fn created_at_is_set_once_and_preserved() {
+        let service = service().await;
+        let kind = seed_person(&service).await;
+        let created = service
+            .create_node(&node(kind, "created stamp", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        assert!(!created.created_at.is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let (updated, _) = service
+            .update_node(
+                created.id,
+                &NodePatch {
+                    description: Some("changed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.created_at, created.created_at);
+        assert_ne!(updated.updated_at, created.updated_at);
     }
 
     #[tokio::test]

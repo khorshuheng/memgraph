@@ -79,6 +79,7 @@ mod tests {
                 description: format!("{name} description"),
                 content: String::new(),
                 version: 0,
+                created_at: String::new(),
                 updated_at: String::new(),
             })
             .await
@@ -151,6 +152,7 @@ mod tests {
                 description: String::new(),
                 content: String::new(),
                 version: 0,
+                created_at: String::new(),
                 updated_at: String::new(),
             })
             .await;

@@ -65,6 +65,7 @@ pub struct Node {
     pub description: String,
     pub content: String,
     pub version: i64,
+    pub created_at: String,
     pub updated_at: String,
 }
 

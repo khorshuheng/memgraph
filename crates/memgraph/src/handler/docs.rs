@@ -305,6 +305,10 @@ fn llms_text() -> String {
          Machine-readable contract: `GET /openapi.json`. One call vocabulary: \
          `GET /api/vocabulary`. Ids in the examples come from the running graph; \
          discover them with `GET /api/nodes` or `GET /api/vocabulary`.\n\n\
+         ## Response envelope\n\n\
+         Successful responses are `{\"data\": ...}`; unpaged lists put the array in `data`, \
+         paged lists put `{items,total,limit,offset}` in `data`. Errors are \
+         `{\"error\":{code,message,field?,hint?,retryable}}`.\n\n\
          POST requests accept an `Idempotency-Key` header; retrying the same key and \
          body replays the stored response. PATCH requests accept \
          `If-Match: \"<version>\"` and return 412 when the node changed.\n\n\
