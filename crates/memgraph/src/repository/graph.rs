@@ -254,6 +254,31 @@ impl SqliteGraphRepository {
             }
         }
     }
+
+    async fn insert_nodes_with_edges_once(
+        &self,
+        nodes: &[PendingNode],
+        edges: &[PendingEdge],
+    ) -> Result<Vec<Node>, RepositoryError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .map_err(RepositoryError::from)?;
+        match insert_nodes_with_edges_items(&mut connection, nodes, edges).await {
+            Ok(created) => {
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(RepositoryError::from(error));
+                }
+                Ok(created)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -400,123 +425,20 @@ impl GraphRepository for SqliteGraphRepository {
         nodes: &[PendingNode],
         edges: &[PendingEdge],
     ) -> Result<Vec<Node>, RepositoryError> {
-        let mut transaction = self.pool.begin().await?;
-        let mut schemas: HashMap<i64, KindSchema> = HashMap::new();
-        let mut created = Vec::with_capacity(nodes.len());
-        let mut ids = Vec::with_capacity(nodes.len());
-        for pending in nodes {
-            let node = &pending.node;
-            if node.id != 0 {
-                let existing_kind =
-                    sqlx::query_scalar::<_, i64>("SELECT kind_id FROM node WHERE id = ?")
-                        .bind(node.id)
-                        .fetch_optional(&mut *transaction)
-                        .await?;
-                if let Some(existing_kind) = existing_kind
-                    && existing_kind != node.kind_id
-                {
-                    let from = kind_name_by_id(&mut transaction, existing_kind).await?;
-                    let to = kind_name_by_id(&mut transaction, node.kind_id).await?;
-                    return Err(RepositoryError::ContractViolation(format!(
-                        "node {} cannot change kind from '{from}' to '{to}'",
-                        node.id
-                    )));
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.insert_nodes_with_edges_once(nodes, edges).await {
+                Ok(created) => return Ok(created),
+                Err(RepositoryError::Busy(error)) => {
+                    if attempt >= 3 {
+                        return Err(RepositoryError::Busy(error));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50 * attempt)).await;
                 }
+                Err(error) => return Err(error),
             }
-            if let std::collections::hash_map::Entry::Vacant(entry) = schemas.entry(node.kind_id) {
-                let loaded = load_kind_schema(&mut transaction, node.kind_id).await?;
-                entry.insert(loaded);
-            }
-            let empty = serde_json::json!({});
-            let candidate = pending.properties.as_ref().unwrap_or(&empty);
-            if pending.properties.is_some() || node.id == 0 {
-                let schema = schemas.get(&node.kind_id).unwrap();
-                validate_declared_properties(candidate, &schema.properties, schema.strict)
-                    .map_err(RepositoryError::ContractViolation)?;
-            }
-            let mut row = if node.id == 0 {
-                sqlx::query_as::<_, Node>(&format!(
-                    "INSERT INTO node (kind_id, name, description, content) VALUES (?, ?, ?, ?) \
-                     RETURNING {NODE_COLUMNS}"
-                ))
-                .bind(node.kind_id)
-                .bind(&node.name)
-                .bind(&node.description)
-                .bind(&node.content)
-                .fetch_one(&mut *transaction)
-                .await?
-            } else {
-                sqlx::query_as::<_, Node>(&format!(
-                    "INSERT INTO node (id, kind_id, name, description, content) \
-                     VALUES (?, ?, ?, ?, ?) \
-                     ON CONFLICT(id) DO UPDATE SET kind_id = excluded.kind_id, \
-                     name = excluded.name, description = excluded.description, \
-                     content = excluded.content, updated_at = CASE WHEN node.kind_id = excluded.kind_id \
-                       AND node.name = excluded.name AND node.description = excluded.description \
-                       AND node.content = excluded.content THEN node.updated_at ELSE excluded.updated_at END \
-                     RETURNING {NODE_COLUMNS}"
-                ))
-                .bind(node.id)
-                .bind(node.kind_id)
-                .bind(&node.name)
-                .bind(&node.description)
-                .bind(&node.content)
-                .fetch_one(&mut *transaction)
-                .await?
-            };
-            let mut touched = false;
-            if let Some(properties) = &pending.properties {
-                let encoded = serde_json::to_string(properties)
-                    .map_err(|error| RepositoryError::SqlExecutionError(error.to_string()))?;
-                let current =
-                    sqlx::query_scalar::<_, String>("SELECT properties FROM node WHERE id = ?")
-                        .bind(row.id)
-                        .fetch_one(&mut *transaction)
-                        .await?;
-                if encoded != current {
-                    sqlx::query("UPDATE node SET properties = ? WHERE id = ?")
-                        .bind(encoded)
-                        .bind(row.id)
-                        .execute(&mut *transaction)
-                        .await?;
-                    touched = true;
-                }
-            }
-            if let Some(tags) = &pending.tags {
-                let current = node_tags_in(&mut transaction, row.id).await?;
-                if !tags_equal(&current, tags) {
-                    replace_tags(&mut transaction, row.id, tags).await?;
-                    touched = true;
-                }
-            }
-            if touched && node.id != 0 {
-                row = sqlx::query_as::<_, Node>(&format!(
-                    "UPDATE node SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-                     WHERE id = ? RETURNING {NODE_COLUMNS}"
-                ))
-                .bind(row.id)
-                .fetch_one(&mut *transaction)
-                .await?;
-            }
-            ids.push(row.id);
-            created.push(row);
         }
-        let generated: HashSet<i64> = ids.iter().copied().collect();
-        for edge in edges {
-            let source = resolve_node_ref(edge.source, &ids, &generated)?;
-            let destination = resolve_node_ref(edge.destination, &ids, &generated)?;
-            sqlx::query(
-                "INSERT INTO edge (source, destination, edge_type_id) VALUES (?, ?, ?) \
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(source)
-            .bind(destination)
-            .bind(edge.edge_type_id)
-            .execute(&mut *transaction)
-            .await?;
-        }
-        transaction.commit().await?;
-        Ok(created)
     }
 
     async fn get_node(&self, id: i64) -> Result<Option<Node>, RepositoryError> {
@@ -2057,6 +1979,128 @@ async fn update_node_items(
     };
 
     Ok((node, tags))
+}
+
+async fn insert_nodes_with_edges_items(
+    connection: &mut SqliteConnection,
+    nodes: &[PendingNode],
+    edges: &[PendingEdge],
+) -> Result<Vec<Node>, RepositoryError> {
+    let mut schemas: HashMap<i64, KindSchema> = HashMap::new();
+    let mut created = Vec::with_capacity(nodes.len());
+    let mut ids = Vec::with_capacity(nodes.len());
+    for pending in nodes {
+        let node = &pending.node;
+        if node.id != 0 {
+            let existing_kind =
+                sqlx::query_scalar::<_, i64>("SELECT kind_id FROM node WHERE id = ?")
+                    .bind(node.id)
+                    .fetch_optional(&mut *connection)
+                    .await?;
+            if let Some(existing_kind) = existing_kind
+                && existing_kind != node.kind_id
+            {
+                let from = kind_name_by_id(&mut *connection, existing_kind).await?;
+                let to = kind_name_by_id(&mut *connection, node.kind_id).await?;
+                return Err(RepositoryError::ContractViolation(format!(
+                    "node {} cannot change kind from '{from}' to '{to}'",
+                    node.id
+                )));
+            }
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = schemas.entry(node.kind_id) {
+            let loaded = load_kind_schema(&mut *connection, node.kind_id).await?;
+            entry.insert(loaded);
+        }
+        let empty = serde_json::json!({});
+        let candidate = pending.properties.as_ref().unwrap_or(&empty);
+        if pending.properties.is_some() || node.id == 0 {
+            let schema = schemas.get(&node.kind_id).unwrap();
+            validate_declared_properties(candidate, &schema.properties, schema.strict)
+                .map_err(RepositoryError::ContractViolation)?;
+        }
+        let mut row = if node.id == 0 {
+            sqlx::query_as::<_, Node>(&format!(
+                "INSERT INTO node (kind_id, name, description, content) VALUES (?, ?, ?, ?) \
+                 RETURNING {NODE_COLUMNS}"
+            ))
+            .bind(node.kind_id)
+            .bind(&node.name)
+            .bind(&node.description)
+            .bind(&node.content)
+            .fetch_one(&mut *connection)
+            .await?
+        } else {
+            sqlx::query_as::<_, Node>(&format!(
+                "INSERT INTO node (id, kind_id, name, description, content) \
+                 VALUES (?, ?, ?, ?, ?) \
+                 ON CONFLICT(id) DO UPDATE SET kind_id = excluded.kind_id, \
+                 name = excluded.name, description = excluded.description, \
+                 content = excluded.content, updated_at = CASE WHEN node.kind_id = excluded.kind_id \
+                   AND node.name = excluded.name AND node.description = excluded.description \
+                   AND node.content = excluded.content THEN node.updated_at ELSE excluded.updated_at END \
+                 RETURNING {NODE_COLUMNS}"
+            ))
+            .bind(node.id)
+            .bind(node.kind_id)
+            .bind(&node.name)
+            .bind(&node.description)
+            .bind(&node.content)
+            .fetch_one(&mut *connection)
+            .await?
+        };
+        let mut touched = false;
+        if let Some(properties) = &pending.properties {
+            let encoded = serde_json::to_string(properties)
+                .map_err(|error| RepositoryError::SqlExecutionError(error.to_string()))?;
+            let current =
+                sqlx::query_scalar::<_, String>("SELECT properties FROM node WHERE id = ?")
+                    .bind(row.id)
+                    .fetch_one(&mut *connection)
+                    .await?;
+            if encoded != current {
+                sqlx::query("UPDATE node SET properties = ? WHERE id = ?")
+                    .bind(encoded)
+                    .bind(row.id)
+                    .execute(&mut *connection)
+                    .await?;
+                touched = true;
+            }
+        }
+        if let Some(tags) = &pending.tags {
+            let current = node_tags_in(&mut *connection, row.id).await?;
+            if !tags_equal(&current, tags) {
+                replace_tags(&mut *connection, row.id, tags).await?;
+                touched = true;
+            }
+        }
+        if touched && node.id != 0 {
+            row = sqlx::query_as::<_, Node>(&format!(
+                "UPDATE node SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 WHERE id = ? RETURNING {NODE_COLUMNS}"
+            ))
+            .bind(row.id)
+            .fetch_one(&mut *connection)
+            .await?;
+        }
+        ids.push(row.id);
+        created.push(row);
+    }
+    let generated: HashSet<i64> = ids.iter().copied().collect();
+    for edge in edges {
+        let source = resolve_node_ref(edge.source, &ids, &generated)?;
+        let destination = resolve_node_ref(edge.destination, &ids, &generated)?;
+        sqlx::query(
+            "INSERT INTO edge (source, destination, edge_type_id) VALUES (?, ?, ?) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(source)
+        .bind(destination)
+        .bind(edge.edge_type_id)
+        .execute(&mut *connection)
+        .await?;
+    }
+    Ok(created)
 }
 
 async fn node_tags_in(

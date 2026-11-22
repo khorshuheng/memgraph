@@ -1292,6 +1292,7 @@ fn visit_dependencies<'a>(
 }
 
 const MAX_TAG_LENGTH: usize = 128;
+const MAX_TAGS: usize = 64;
 
 fn normalize_property_declarations(
     properties: &[PackProperty],
@@ -1473,20 +1474,29 @@ fn normalize_import_ref(reference: &ImportRef) -> Result<ImportRef, ServiceError
 
 fn normalize_tags(tags: &[String]) -> Result<Vec<String>, ServiceError> {
     let mut normalized: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for tag in tags {
         let tag = tag.trim().to_lowercase();
         if tag.is_empty() {
-            continue;
+            return Err(ServiceError::UnprocessableEntity(
+                "tags must not be blank".to_string(),
+            ));
         }
         if tag.chars().count() > MAX_TAG_LENGTH {
             return Err(ServiceError::UnprocessableEntity(format!(
                 "tag exceeds {MAX_TAG_LENGTH} characters"
             )));
         }
-        if !normalized.contains(&tag) {
+        if seen.insert(tag.clone()) {
+            if normalized.len() == MAX_TAGS {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "at most {MAX_TAGS} tags are allowed"
+                )));
+            }
             normalized.push(tag);
         }
     }
+    normalized.sort();
     Ok(normalized)
 }
 
@@ -3349,13 +3359,59 @@ mod tests {
         let (created, tags) = service
             .create_node(
                 &node(kind_id, "Ada", "pioneer of computing"),
-                &[" Math ".to_string(), "math".to_string(), "".to_string()],
+                &[
+                    " Math ".to_string(),
+                    "math".to_string(),
+                    " LOGIC ".to_string(),
+                ],
             )
             .await
             .unwrap();
-        assert_eq!(tags, vec!["math"]);
+        assert_eq!(tags, vec!["logic", "math"]);
         assert_eq!(created.id, service.get_node(created.id).await.unwrap().id);
-        assert_eq!(service.node_tags(created.id).await.unwrap(), vec!["math"]);
+        assert_eq!(
+            service.node_tags(created.id).await.unwrap(),
+            vec!["logic", "math"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_blank_tags_and_tag_lists_over_the_cap() {
+        let service = service().await;
+        let kind_id = seed_person(&service).await;
+
+        let blank = service
+            .create_node(
+                &node(kind_id, "Ada", ""),
+                &["math".to_string(), "   ".to_string()],
+            )
+            .await;
+        assert!(matches!(
+            blank,
+            Err(ServiceError::UnprocessableEntity(message)) if message.contains("blank")
+        ));
+
+        let at_cap: Vec<String> = (0..64).map(|index| format!("tag{index}")).collect();
+        service
+            .create_node(&node(kind_id, "Grace", ""), &at_cap)
+            .await
+            .expect("64 tags are allowed");
+
+        let over_cap: Vec<String> = (0..65).map(|index| format!("tag{index}")).collect();
+        let over = service
+            .create_node(&node(kind_id, "Edsger", ""), &over_cap)
+            .await;
+        assert!(matches!(
+            over,
+            Err(ServiceError::UnprocessableEntity(message)) if message.contains("at most 64 tags")
+        ));
+
+        let duplicates: Vec<String> = (0..200).map(|_| "same".to_string()).collect();
+        let (_, tags) = service
+            .create_node(&node(kind_id, "Barbara", ""), &duplicates)
+            .await
+            .expect("duplicates collapse before the cap");
+        assert_eq!(tags, vec!["same"]);
     }
 
     #[tokio::test]
@@ -4304,6 +4360,83 @@ mod tests {
         }
         assert_eq!(created, 1);
         assert_eq!(unchanged, 7);
+
+        drop(service);
+        remove_sqlite(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_task_and_plan_writes_succeed() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "memgraph-task-writes-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let service = file_service(&path).await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let service = service.clone();
+            handles.push(tokio::spawn(async move {
+                let mut task = new_task(&format!("concurrent task {index}"));
+                task.parent = Some(goal);
+                task.tags = Some(vec![format!("tag{index}")]);
+                service.create_task(&task).await
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .unwrap()
+                .expect("concurrent task write succeeds");
+        }
+
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let service = service.clone();
+            handles.push(tokio::spawn(async move {
+                let mut task = plan_task(&format!("plan task {index}"), None, &[]);
+                task.tags = Some(vec![format!("plan{index}")]);
+                let mut draft = plan_draft(repo, vec![task]);
+                let plan_goal = draft.goal.as_mut().expect("goal");
+                plan_goal.name = format!("concurrent goal {index}");
+                plan_goal.tags = Some(vec![format!("goal{index}")]);
+                service.create_plan(&draft).await
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .unwrap()
+                .expect("concurrent plan write succeeds");
+        }
+
+        let mut existing = new_task("upsert target");
+        existing.parent = Some(goal);
+        let target = service.create_task(&existing).await.unwrap().id;
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let service = service.clone();
+            handles.push(tokio::spawn(async move {
+                let mut task = new_task("upsert target");
+                task.id = target;
+                task.parent = Some(goal);
+                task.description = format!("update {index}");
+                task.tags = Some(vec![format!("upsert{index}")]);
+                service.create_task(&task).await
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .unwrap()
+                .expect("concurrent task upsert succeeds");
+        }
 
         drop(service);
         remove_sqlite(&path);

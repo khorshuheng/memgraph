@@ -189,6 +189,10 @@ impl From<EdgeTypeModel> for EdgeTypeResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    description = "Tags are trimmed, lowercased and deduplicated; blank tags and more than \
+                   64 tags are rejected."
+)]
 pub struct CreateNodeParameters {
     pub kind_id: i64,
     pub name: String,
@@ -890,6 +894,10 @@ pub struct TagUsageResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    description = "Tags are trimmed, lowercased and deduplicated; blank tags and more than \
+                   64 tags are rejected."
+)]
 pub struct ReplaceTagsParameters {
     #[serde(default)]
     pub tags: Vec<String>,
@@ -899,7 +907,8 @@ pub struct ReplaceTagsParameters {
 #[schema(
     description = "A task created under a parent. Supplying id upserts that node and \
                    replaces its name, description and content; omitted tags leave existing \
-                   tags unchanged, an empty list clears them."
+                   tags unchanged, an empty list clears them. Tags are trimmed, lowercased \
+                   and deduplicated; blank tags and more than 64 tags are rejected."
 )]
 pub struct CreateTaskParameters {
     pub id: Option<i64>,
@@ -960,7 +969,8 @@ impl From<PlanAnchorParameters> for PlanAnchorDraft {
 #[derive(Debug, Deserialize, ToSchema)]
 #[schema(
     description = "A plan goal. Omitted tags leave existing tags unchanged on an id upsert; \
-                   an empty list clears them."
+                   an empty list clears them. Tags are trimmed, lowercased and deduplicated; \
+                   blank tags and more than 64 tags are rejected."
 )]
 pub struct CreatePlanGoalParameters {
     pub id: Option<i64>,
@@ -977,7 +987,8 @@ pub struct CreatePlanGoalParameters {
 #[schema(
     description = "A plan task. Supplying id upserts that node and replaces its name, \
                    description and content; omitted tags leave existing tags unchanged, an \
-                   empty list clears them."
+                   empty list clears them. Tags are trimmed, lowercased and deduplicated; \
+                   blank tags and more than 64 tags are rejected."
 )]
 pub struct CreatePlanTaskParameters {
     pub id: Option<i64>,
@@ -1098,7 +1109,8 @@ impl From<UpdateNodeParameters> for NodePatch {
 #[derive(Debug, Deserialize, ToSchema)]
 #[schema(
     description = "A task patch. Omitted tags leave the current tags unchanged; an empty \
-                   list clears them."
+                   list clears them. Tags are trimmed, lowercased and deduplicated; blank \
+                   tags and more than 64 tags are rejected."
 )]
 pub struct UpdateTaskParameters {
     pub name: Option<String>,
