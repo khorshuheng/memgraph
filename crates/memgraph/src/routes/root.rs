@@ -2,11 +2,13 @@ use axum::{Router, routing::get};
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 use utoipa_redoc::{Redoc, Servable};
 
 use crate::state::AppState;
 
 use super::{graph, health};
+use crate::handler::docs;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -23,6 +25,8 @@ struct ApiDoc;
 pub fn routes(app_state: AppState) -> Router {
     let api_router = health::routes().merge(graph::routes(app_state));
     let (app_router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .routes(routes!(docs::api_index))
+        .routes(routes!(docs::llms_txt))
         .nest("/api", api_router)
         .split_for_parts();
     let api_clone = api.clone();

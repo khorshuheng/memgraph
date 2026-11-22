@@ -368,6 +368,12 @@ pub struct EdgeListResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+pub struct VocabularyResponse {
+    pub kinds: Vec<NodeKindResponse>,
+    pub edge_types: Vec<EdgeTypeResponse>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct GraphExportNodeResponse {
     pub id: i64,
     pub kind_id: i64,

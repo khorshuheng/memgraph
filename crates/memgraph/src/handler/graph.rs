@@ -16,7 +16,7 @@ use crate::{
             PackReportResponse, PageParameters, PlanResponse, PlanTaskResponse,
             ReplaceTagsParameters, SearchHitResponse, SearchParameters, SearchResponse,
             TagUsageResponse, UpdateEdgeParameters, UpdateNodeParameters, UpdateTaskParameters,
-            WorkListResponse, WorkParameters,
+            VocabularyResponse, WorkListResponse, WorkParameters,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
@@ -117,6 +117,46 @@ pub async fn list_edge_types(
     Ok(ApiList {
         status: StatusCode::OK,
         items: edge_types.into_iter().map(Into::into).collect(),
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    get,
+    path = "/vocabulary",
+    responses((status = 200, description = "Node kinds, edge types and declared properties", body = VocabularyResponse))
+)]
+pub async fn vocabulary(
+    State(state): State<AppState>,
+) -> Result<ApiSuccess<VocabularyResponse>, ApiError> {
+    let node_kinds = state.graph_service.list_node_kinds().await?;
+    let ids: Vec<i64> = node_kinds.iter().map(|kind| kind.id).collect();
+    let mut properties = state
+        .graph_service
+        .node_kind_properties_for_ids(&ids)
+        .await?;
+    let kinds = node_kinds
+        .into_iter()
+        .map(|kind| {
+            let declared = properties
+                .remove(&kind.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(Into::into)
+                .collect();
+            NodeKindResponse::with_properties(kind, declared)
+        })
+        .collect();
+    let edge_types = state
+        .graph_service
+        .list_edge_types()
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    Ok(ApiSuccess {
+        status: StatusCode::OK,
+        data: VocabularyResponse { kinds, edge_types },
     })
 }
 
@@ -2329,6 +2369,38 @@ mod tests {
         );
         assert!(export.nodes.iter().all(|node| node.kind == "person"));
         assert_eq!(export.edges[0].edge_type, "knows");
+    }
+
+    #[tokio::test]
+    async fn vocabulary_returns_kinds_types_and_declarations() {
+        let state = test_state().await;
+        seed_kind(&state, "widget").await;
+        state
+            .graph_service
+            .create_edge_type(&EdgeType {
+                id: 0,
+                name: "widget_part".to_string(),
+                description: "widget -> widget".to_string(),
+                resolves: false,
+                single_outgoing: false,
+                acyclic: false,
+                source_kinds: Some("widget".to_string()),
+                destination_kinds: Some("widget".to_string()),
+                updated_at: String::new(),
+            })
+            .await
+            .expect("edge type");
+
+        let data = vocabulary(State(state.clone()))
+            .await
+            .expect("vocabulary")
+            .data;
+        assert!(data.kinds.iter().any(|kind| kind.name == "widget"));
+        assert!(
+            data.edge_types
+                .iter()
+                .any(|edge_type| edge_type.name == "widget_part")
+        );
     }
 
     #[tokio::test]
