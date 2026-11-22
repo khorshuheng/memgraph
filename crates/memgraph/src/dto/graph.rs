@@ -4,14 +4,16 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::model::{
-    ChangeDraft, Edge as EdgeModel, EdgeFilter, EdgeRecord, EdgeType as EdgeTypeModel, GraphExport,
-    ImportConflict, ImportDraft, ImportEdge, ImportNode, ImportRef, ImportReport, ImportStatus,
-    Neighbor as NeighborModel, NeighborDirection as NeighborDirectionModel, Node as NodeModel,
-    NodeFilter, NodeKind as NodeKindModel, NodeKindProperty, NodePatch, NodeSelector, PackDraft,
-    PackEdgeType, PackNodeKind, PackReport, Plan as PlanModel, PlanAnchorDraft, PlanDraft,
-    PlanGoalDraft, PlanTask as PlanTaskModel, PlanTaskDraft, ReachFilter,
-    RelationDirection as RelationDirectionModel, SearchScope as SearchScopeModel, TaskDraft,
-    TaskPatch, WorkFilter, WorkPage, WorkTask,
+    ChangeDraft, Edge as EdgeModel, EdgeCondition, EdgeFilter, EdgeRecord,
+    EdgeType as EdgeTypeModel, GraphExport, ImportConflict, ImportDraft, ImportEdge, ImportNode,
+    ImportRef, ImportReport, ImportStatus, Neighbor as NeighborModel,
+    NeighborDirection as NeighborDirectionModel, Node as NodeModel, NodeFilter,
+    NodeKind as NodeKindModel, NodeKindProperty, NodePatch, NodeSelector, PackDraft, PackEdgeType,
+    PackNodeKind, PackReport, Plan as PlanModel, PlanAnchorDraft, PlanDraft, PlanGoalDraft,
+    PlanTask as PlanTaskModel, PlanTaskDraft, QueryDirection, QueryOrder, QueryPage, QueryRequest,
+    QuerySelect, ReachFilter, RelationDirection as RelationDirectionModel,
+    SearchScope as SearchScopeModel, SortDirection, TaskDraft, TaskPatch, WorkFilter, WorkPage,
+    WorkTask,
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1430,6 +1432,176 @@ impl From<CreateChangeParameters> for ChangeDraft {
             files: params.files,
             properties: params.properties,
             tags: params.tags,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum QuerySelectParameters {
+    #[default]
+    Nodes,
+    Edges,
+}
+
+impl From<QuerySelectParameters> for QuerySelect {
+    fn from(select: QuerySelectParameters) -> Self {
+        match select {
+            QuerySelectParameters::Nodes => QuerySelect::Nodes,
+            QuerySelectParameters::Edges => QuerySelect::Edges,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryDirectionParameters {
+    #[serde(alias = "out")]
+    Outgoing,
+    #[serde(alias = "in")]
+    Incoming,
+    #[default]
+    Both,
+}
+
+impl From<QueryDirectionParameters> for QueryDirection {
+    fn from(direction: QueryDirectionParameters) -> Self {
+        match direction {
+            QueryDirectionParameters::Outgoing => QueryDirection::Outgoing,
+            QueryDirectionParameters::Incoming => QueryDirection::Incoming,
+            QueryDirectionParameters::Both => QueryDirection::Both,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDirectionParameters {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl From<SortDirectionParameters> for SortDirection {
+    fn from(direction: SortDirectionParameters) -> Self {
+        match direction {
+            SortDirectionParameters::Asc => SortDirection::Asc,
+            SortDirectionParameters::Desc => SortDirection::Desc,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct EdgeConditionParameters {
+    pub edge_type: String,
+    #[serde(default)]
+    pub direction: QueryDirectionParameters,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct QueryOrderParameters {
+    pub field: String,
+    #[serde(default)]
+    pub direction: SortDirectionParameters,
+}
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct QueryWhereParameters {
+    pub kind: Option<String>,
+    pub name: Option<String>,
+    pub name_contains: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub properties: Option<serde_json::Map<String, serde_json::Value>>,
+    pub has_edge: Option<EdgeConditionParameters>,
+    pub not_has_edge: Option<EdgeConditionParameters>,
+    pub within: Option<i64>,
+    pub via: Option<String>,
+    pub descend: Option<String>,
+    pub edge_type: Option<String>,
+    pub source: Option<i64>,
+    pub destination: Option<i64>,
+    pub since: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(
+    description = "A read-only query. select=nodes supports kind, name, name_contains, tags, \
+                   properties, has_edge, not_has_edge, within/via/descend and since; \
+                   select=edges supports edge_type, source, destination and since."
+)]
+pub struct QueryParameters {
+    #[serde(default)]
+    pub select: QuerySelectParameters,
+    #[serde(default, rename = "where")]
+    pub filter: QueryWhereParameters,
+    #[serde(default)]
+    pub order: Vec<QueryOrderParameters>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    #[serde(default)]
+    pub fields: Vec<String>,
+}
+
+impl From<QueryParameters> for QueryRequest {
+    fn from(params: QueryParameters) -> Self {
+        let filter = params.filter;
+        QueryRequest {
+            select: params.select.into(),
+            kind: filter.kind,
+            name: filter.name,
+            name_contains: filter.name_contains,
+            tags: filter.tags,
+            properties: filter.properties.unwrap_or_default(),
+            has_edge: filter.has_edge.map(|condition| EdgeCondition {
+                edge_type: condition.edge_type,
+                direction: condition.direction.into(),
+            }),
+            not_has_edge: filter.not_has_edge.map(|condition| EdgeCondition {
+                edge_type: condition.edge_type,
+                direction: condition.direction.into(),
+            }),
+            reach: ReachFilter {
+                within: filter.within,
+                via: filter.via,
+                descend: filter.descend,
+            },
+            edge_type: filter.edge_type,
+            source: filter.source,
+            destination: filter.destination,
+            since: filter.since,
+            order: params
+                .order
+                .into_iter()
+                .map(|entry| QueryOrder {
+                    field: entry.field,
+                    direction: entry.direction.into(),
+                })
+                .collect(),
+            limit: params.limit,
+            offset: params.offset,
+            fields: params.fields,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct QueryResponse {
+    #[schema(value_type = Vec<Object>)]
+    pub items: Vec<serde_json::Value>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+impl From<QueryPage> for QueryResponse {
+    fn from(page: QueryPage) -> Self {
+        QueryResponse {
+            items: page.items,
+            total: page.total,
+            limit: page.limit,
+            offset: page.offset,
         }
     }
 }

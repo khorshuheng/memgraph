@@ -270,6 +270,67 @@ pub struct NodeWithMetadata {
     pub properties: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuerySelect {
+    #[default]
+    Nodes,
+    Edges,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryDirection {
+    Outgoing,
+    Incoming,
+    Both,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeCondition {
+    pub edge_type: String,
+    pub direction: QueryDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryOrder {
+    pub field: String,
+    pub direction: SortDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct QueryRequest {
+    pub select: QuerySelect,
+    pub kind: Option<String>,
+    pub name: Option<String>,
+    pub name_contains: Option<String>,
+    pub tags: Vec<String>,
+    pub properties: serde_json::Map<String, serde_json::Value>,
+    pub has_edge: Option<EdgeCondition>,
+    pub not_has_edge: Option<EdgeCondition>,
+    pub reach: ReachFilter,
+    pub edge_type: Option<String>,
+    pub source: Option<i64>,
+    pub destination: Option<i64>,
+    pub since: Option<String>,
+    pub order: Vec<QueryOrder>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryPage {
+    pub items: Vec<serde_json::Value>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackStatus {
     Created,

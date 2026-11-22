@@ -5,13 +5,14 @@ use sqlx::sqlite::Sqlite;
 use sqlx::{FromRow, QueryBuilder, Row, SqliteConnection, SqlitePool};
 
 use crate::model::{
-    Edge, EdgeFilter, EdgeRecord, EdgeType, EdgeTypeUsage, GraphExport, GraphExportEdge,
-    GraphExportNode, ImportConflict, ImportDraft, ImportEdgeResult, ImportNodeResult, ImportRef,
-    ImportReport, ImportStatus, IsolatedNode, KindUsage, Neighbor, NeighborDirection, Node,
-    NodeFilter, NodeKind, NodeKindProperty, NodePatch, NodeRef, PackDraft, PackEdgeType, PackItem,
-    PackNodeKind, PackProperty, PackReport, PackStatus, PendingEdge, PendingNode, PropertyType,
-    ReachFilter, RelationDirection, SearchHit, SearchPage, SearchScope, TagUsage, WorkFilter,
-    encode_kind_list, split_kind_list, validate_declared_properties,
+    Edge, EdgeCondition, EdgeFilter, EdgeRecord, EdgeType, EdgeTypeUsage, GraphExport,
+    GraphExportEdge, GraphExportNode, ImportConflict, ImportDraft, ImportEdgeResult,
+    ImportNodeResult, ImportRef, ImportReport, ImportStatus, IsolatedNode, KindUsage, Neighbor,
+    NeighborDirection, Node, NodeFilter, NodeKind, NodeKindProperty, NodePatch, NodeRef, PackDraft,
+    PackEdgeType, PackItem, PackNodeKind, PackProperty, PackReport, PackStatus, PendingEdge,
+    PendingNode, PropertyType, QueryDirection, QueryRequest, ReachFilter, RelationDirection,
+    SearchHit, SearchPage, SearchScope, SortDirection, TagUsage, WorkFilter, encode_kind_list,
+    split_kind_list, validate_declared_properties,
 };
 
 use super::error::RepositoryError;
@@ -107,6 +108,34 @@ pub struct WorkSnapshot {
     pub offset: i64,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct QueryNodeRow {
+    pub id: i64,
+    pub kind_id: i64,
+    pub kind: String,
+    pub name: String,
+    pub description: String,
+    pub content: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct QueryEdgeRow {
+    pub source: i64,
+    pub destination: i64,
+    pub edge_type_id: i64,
+    pub edge_type: String,
+    pub created_at: String,
+    pub properties: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeQuerySnapshot {
+    pub rows: Vec<QueryNodeRow>,
+    pub tags: HashMap<i64, Vec<String>>,
+    pub properties: HashMap<i64, String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeBatchSnapshot {
     pub nodes: Vec<Node>,
@@ -188,6 +217,18 @@ pub trait GraphRepository: Send + Sync {
         offset: i64,
     ) -> Result<(Vec<EdgeRecord>, i64), RepositoryError>;
     async fn graph_export(&self) -> Result<GraphExport, RepositoryError>;
+    async fn query_nodes(
+        &self,
+        query: &QueryRequest,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(NodeQuerySnapshot, i64), RepositoryError>;
+    async fn query_edges(
+        &self,
+        query: &QueryRequest,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<QueryEdgeRow>, i64), RepositoryError>;
     async fn work_snapshot(
         &self,
         filter: &WorkFilter,
@@ -964,6 +1005,58 @@ impl GraphRepository for SqliteGraphRepository {
                     return Err(RepositoryError::from(error));
                 }
                 Ok(export)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn query_nodes(
+        &self,
+        query: &QueryRequest,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(NodeQuerySnapshot, i64), RepositoryError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN")
+            .execute(&mut *connection)
+            .await
+            .map_err(RepositoryError::from)?;
+        match query_nodes_items(&mut connection, query, limit, offset).await {
+            Ok(result) => {
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(RepositoryError::from(error));
+                }
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn query_edges(
+        &self,
+        query: &QueryRequest,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<QueryEdgeRow>, i64), RepositoryError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN")
+            .execute(&mut *connection)
+            .await
+            .map_err(RepositoryError::from)?;
+        match query_edges_items(&mut connection, query, limit, offset).await {
+            Ok(result) => {
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(RepositoryError::from(error));
+                }
+                Ok(result)
             }
             Err(error) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
@@ -2507,6 +2600,266 @@ async fn graph_export_items(
         })
         .collect();
     Ok(GraphExport { nodes, edges })
+}
+
+fn push_node_query_conditions(builder: &mut QueryBuilder<Sqlite>, query: &QueryRequest) {
+    if query.reach.within.is_some() {
+        builder.push(" AND n.id IN (SELECT id FROM reach)");
+    }
+    if let Some(kind) = &query.kind {
+        builder.push(" AND k.name = ");
+        builder.push_bind(kind.clone());
+    }
+    if let Some(name) = &query.name {
+        builder.push(" AND n.name = ");
+        builder.push_bind(name.clone());
+    }
+    if let Some(name_contains) = &query.name_contains {
+        builder.push(" AND instr(n.name, ");
+        builder.push_bind(name_contains.clone());
+        builder.push(") > 0");
+    }
+    if let Some(since) = &query.since {
+        builder.push(" AND n.updated_at >= ");
+        builder.push_bind(since.clone());
+    }
+    for tag in &query.tags {
+        builder.push(" AND EXISTS(SELECT 1 FROM node_tag qt WHERE qt.node_id = n.id AND qt.tag = ");
+        builder.push_bind(tag.clone());
+        builder.push(")");
+    }
+    push_property_filters(builder, &query.properties);
+    if let Some(condition) = &query.has_edge {
+        push_query_edge_condition(builder, condition, false);
+    }
+    if let Some(condition) = &query.not_has_edge {
+        push_query_edge_condition(builder, condition, true);
+    }
+}
+
+fn push_query_edge_condition(
+    builder: &mut QueryBuilder<Sqlite>,
+    condition: &EdgeCondition,
+    negate: bool,
+) {
+    builder.push(if negate {
+        " AND NOT EXISTS ("
+    } else {
+        " AND EXISTS ("
+    });
+    builder.push(
+        "SELECT 1 FROM edge qe JOIN edge_type qt ON qt.id = qe.edge_type_id WHERE qt.name = ",
+    );
+    builder.push_bind(condition.edge_type.clone());
+    builder.push(" AND (");
+    match condition.direction {
+        QueryDirection::Outgoing => {
+            builder.push("qe.source = n.id");
+        }
+        QueryDirection::Incoming => {
+            builder.push("qe.destination = n.id");
+        }
+        QueryDirection::Both => {
+            builder.push("qe.source = n.id OR qe.destination = n.id");
+        }
+    }
+    builder.push("))");
+}
+
+fn push_node_query_order(builder: &mut QueryBuilder<Sqlite>, order: &[crate::model::QueryOrder]) {
+    builder.push(" ORDER BY ");
+    if order.is_empty() {
+        builder.push("n.id ASC");
+        return;
+    }
+    for (index, entry) in order.iter().enumerate() {
+        if index > 0 {
+            builder.push(", ");
+        }
+        builder.push(match entry.field.as_str() {
+            "id" => "n.id",
+            "name" => "n.name",
+            "updated_at" => "n.updated_at",
+            "kind" => "k.name",
+            _ => "n.id",
+        });
+        builder.push(match entry.direction {
+            SortDirection::Asc => " ASC",
+            SortDirection::Desc => " DESC",
+        });
+    }
+}
+
+fn push_edge_query_conditions(builder: &mut QueryBuilder<Sqlite>, query: &QueryRequest) {
+    if let Some(edge_type) = &query.edge_type {
+        builder.push(" AND t.name = ");
+        builder.push_bind(edge_type.clone());
+    }
+    if let Some(source) = query.source {
+        builder.push(" AND e.source = ");
+        builder.push_bind(source);
+    }
+    if let Some(destination) = query.destination {
+        builder.push(" AND e.destination = ");
+        builder.push_bind(destination);
+    }
+    if let Some(since) = &query.since {
+        builder.push(" AND e.created_at >= ");
+        builder.push_bind(since.clone());
+    }
+}
+
+fn push_edge_query_order(builder: &mut QueryBuilder<Sqlite>, order: &[crate::model::QueryOrder]) {
+    builder.push(" ORDER BY ");
+    if order.is_empty() {
+        builder.push("e.source ASC");
+        return;
+    }
+    for (index, entry) in order.iter().enumerate() {
+        if index > 0 {
+            builder.push(", ");
+        }
+        builder.push(match entry.field.as_str() {
+            "source" => "e.source",
+            "destination" => "e.destination",
+            "created_at" => "e.created_at",
+            "edge_type" => "t.name",
+            _ => "e.source",
+        });
+        builder.push(match entry.direction {
+            SortDirection::Asc => " ASC",
+            SortDirection::Desc => " DESC",
+        });
+    }
+}
+
+async fn node_tag_map(
+    connection: &mut SqliteConnection,
+    ids: &[i64],
+) -> Result<HashMap<i64, Vec<String>>, RepositoryError> {
+    let mut tags: HashMap<i64, Vec<String>> = HashMap::new();
+    if ids.is_empty() {
+        return Ok(tags);
+    }
+    let mut builder = QueryBuilder::new("SELECT node_id, tag FROM node_tag WHERE node_id IN (");
+    {
+        let mut separated = builder.separated(", ");
+        for id in ids {
+            separated.push_bind(*id);
+        }
+    }
+    builder.push(") ORDER BY node_id, tag");
+    let rows = builder
+        .build_query_as::<(i64, String)>()
+        .fetch_all(&mut *connection)
+        .await?;
+    for (node_id, tag) in rows {
+        tags.entry(node_id).or_default().push(tag);
+    }
+    Ok(tags)
+}
+
+async fn node_property_map(
+    connection: &mut SqliteConnection,
+    ids: &[i64],
+) -> Result<HashMap<i64, String>, RepositoryError> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut builder = QueryBuilder::new("SELECT id, properties FROM node WHERE id IN (");
+    {
+        let mut separated = builder.separated(", ");
+        for id in ids {
+            separated.push_bind(*id);
+        }
+    }
+    builder.push(") ORDER BY id");
+    let rows = builder
+        .build_query_as::<(i64, String)>()
+        .fetch_all(&mut *connection)
+        .await?;
+    Ok(rows.into_iter().collect())
+}
+
+async fn query_nodes_items(
+    connection: &mut SqliteConnection,
+    query: &QueryRequest,
+    limit: i64,
+    offset: i64,
+) -> Result<(NodeQuerySnapshot, i64), RepositoryError> {
+    let mut count = QueryBuilder::new("");
+    if query.reach.within.is_some() {
+        push_reach_cte(&mut count, &query.reach);
+    }
+    count.push("SELECT count(*) FROM node n JOIN node_kind k ON k.id = n.kind_id WHERE 1 = 1");
+    push_node_query_conditions(&mut count, query);
+    let total = count
+        .build_query_scalar::<i64>()
+        .fetch_one(&mut *connection)
+        .await?;
+
+    let mut page = QueryBuilder::new("");
+    if query.reach.within.is_some() {
+        push_reach_cte(&mut page, &query.reach);
+    }
+    page.push(
+        "SELECT n.id, n.kind_id, k.name AS kind, n.name, n.description, n.content, \
+         n.updated_at FROM node n JOIN node_kind k ON k.id = n.kind_id WHERE 1 = 1",
+    );
+    push_node_query_conditions(&mut page, query);
+    push_node_query_order(&mut page, &query.order);
+    page.push(" LIMIT ");
+    page.push_bind(limit);
+    page.push(" OFFSET ");
+    page.push_bind(offset);
+    let rows = page
+        .build_query_as::<QueryNodeRow>()
+        .fetch_all(&mut *connection)
+        .await?;
+    let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+    let tags = node_tag_map(connection, &ids).await?;
+    let properties = node_property_map(connection, &ids).await?;
+    Ok((
+        NodeQuerySnapshot {
+            rows,
+            tags,
+            properties,
+        },
+        total,
+    ))
+}
+
+async fn query_edges_items(
+    connection: &mut SqliteConnection,
+    query: &QueryRequest,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<QueryEdgeRow>, i64), RepositoryError> {
+    let mut count = QueryBuilder::new(
+        "SELECT count(*) FROM edge e JOIN edge_type t ON t.id = e.edge_type_id WHERE 1 = 1",
+    );
+    push_edge_query_conditions(&mut count, query);
+    let total = count
+        .build_query_scalar::<i64>()
+        .fetch_one(&mut *connection)
+        .await?;
+
+    let mut page = QueryBuilder::new(
+        "SELECT e.source, e.destination, e.edge_type_id, t.name AS edge_type, \
+         e.created_at, e.properties FROM edge e JOIN edge_type t ON t.id = e.edge_type_id \
+         WHERE 1 = 1",
+    );
+    push_edge_query_conditions(&mut page, query);
+    push_edge_query_order(&mut page, &query.order);
+    page.push(" LIMIT ");
+    page.push_bind(limit);
+    page.push(" OFFSET ");
+    page.push_bind(offset);
+    let rows = page
+        .build_query_as::<QueryEdgeRow>()
+        .fetch_all(&mut *connection)
+        .await?;
+    Ok((rows, total))
 }
 
 async fn node_batch_items(

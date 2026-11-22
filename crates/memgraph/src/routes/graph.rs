@@ -23,6 +23,7 @@ pub(crate) fn routes(app_state: AppState) -> OpenApiRouter {
         .routes(routes!(list_neighbors))
         .routes(routes!(add_edge, list_edges, update_edge, remove_edge))
         .routes(routes!(search))
+        .routes(routes!(query))
         .routes(routes!(graph_export))
         .routes(routes!(graph_health))
         .with_state(app_state)

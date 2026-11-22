@@ -161,6 +161,12 @@ pub const ENDPOINTS: &[EndpointDoc] = &[
     },
     EndpointDoc {
         method: "POST",
+        path: "/api/query",
+        description: "Read-only JSON query over nodes or edges with structural predicates, ordering, paging and field projection.",
+        example: "curl -X POST $BASE/api/query -H 'content-type: application/json' -d '{\"select\":\"nodes\",\"where\":{\"kind\":\"task\",\"not_has_edge\":{\"edge_type\":\"implements\",\"direction\":\"in\"}},\"order\":[{\"field\":\"updated_at\",\"direction\":\"desc\"}],\"fields\":[\"id\",\"kind\",\"name\"],\"limit\":10}'",
+    },
+    EndpointDoc {
+        method: "POST",
         path: "/api/tasks",
         description: "Create or upsert a task under a goal or task.",
         example: "curl -X POST $BASE/api/tasks -H 'content-type: application/json' -d '{\"name\":\"new task\",\"description\":\"\",\"content\":\"\",\"parent\":119}'",

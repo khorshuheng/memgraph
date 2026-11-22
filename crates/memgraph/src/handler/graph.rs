@@ -13,17 +13,17 @@ use crate::{
             EdgeListResponse, EdgeTypeResponse, FillNames, GoalTreeResponse, GraphExportResponse,
             ImportParameters, ImportReportResponse, ListNodesParameters, ListNodesResponse,
             NeighborParameters, NeighborResponse, NodeKindResponse, NodeResponse,
-            PackReportResponse, PageParameters, PlanResponse, PlanTaskResponse,
-            ReplaceTagsParameters, SearchHitResponse, SearchParameters, SearchResponse,
-            TagUsageResponse, UpdateEdgeParameters, UpdateNodeParameters, UpdateTaskParameters,
-            VocabularyResponse, WorkListResponse, WorkParameters,
+            PackReportResponse, PageParameters, PlanResponse, PlanTaskResponse, QueryParameters,
+            QueryResponse, ReplaceTagsParameters, SearchHitResponse, SearchParameters,
+            SearchResponse, TagUsageResponse, UpdateEdgeParameters, UpdateNodeParameters,
+            UpdateTaskParameters, VocabularyResponse, WorkListResponse, WorkParameters,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
     },
     model::{
         ChangeDraft, Edge, EdgeFilter, EdgeType, ImportDraft, Node, NodeFilter, NodeKind,
-        NodePatch, PackDraft, PlanDraft, TaskDraft, TaskPatch, WorkFilter,
+        NodePatch, PackDraft, PlanDraft, QueryRequest, TaskDraft, TaskPatch, WorkFilter,
     },
     state::AppState,
 };
@@ -870,6 +870,28 @@ pub async fn search(
     Ok(ApiSuccess {
         status: StatusCode::OK,
         data,
+    })
+}
+
+#[utoipa::path(
+    tag = "Graph",
+    post,
+    path = "/query",
+    request_body = QueryParameters,
+    responses(
+        (status = 200, description = "Read-only node or edge query", body = QueryResponse),
+        (status = 422, description = "Unknown filter, field, order or vocabulary name")
+    )
+)]
+pub async fn query(
+    State(state): State<AppState>,
+    Json(params): Json<QueryParameters>,
+) -> Result<ApiSuccess<QueryResponse>, ApiError> {
+    let request: QueryRequest = params.into();
+    let page = state.graph_service.query(&request).await?;
+    Ok(ApiSuccess {
+        status: StatusCode::OK,
+        data: page.into(),
     })
 }
 
@@ -2369,6 +2391,37 @@ mod tests {
         );
         assert!(export.nodes.iter().all(|node| node.kind == "person"));
         assert_eq!(export.edges[0].edge_type, "knows");
+    }
+
+    #[tokio::test]
+    async fn query_endpoint_projects_requested_fields() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "person").await;
+        new_node(&state, kind, "first", "", "", &["Math"]).await;
+        new_node(&state, kind, "second", "", "", &[]).await;
+
+        let params: QueryParameters = serde_json::from_value(serde_json::json!({
+            "select": "nodes",
+            "where": {"kind": "person"},
+            "fields": ["id", "kind", "name"],
+            "limit": 1
+        }))
+        .expect("query parameters");
+        let data = query(State(state.clone()), Json(params))
+            .await
+            .expect("query")
+            .data;
+        assert_eq!(data.total, 2);
+        assert_eq!(data.items.len(), 1);
+        assert_eq!(
+            data.items[0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["id", "kind", "name"]
+        );
     }
 
     #[tokio::test]

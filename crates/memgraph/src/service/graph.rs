@@ -8,8 +8,9 @@ use crate::{
         ImportNode, ImportRef, ImportReport, Neighbor, NeighborDirection, Node, NodeFilter,
         NodeKind, NodeKindProperty, NodePage, NodePatch, NodeRef, NodeSelector, NodeWithMetadata,
         PackDraft, PackEdgeType, PackNodeKind, PackProperty, PackReport, PendingEdge, PendingNode,
-        Plan, PlanDraft, PlanTask, PlanTaskDraft, PropertyType, ReachFilter, SearchPage, TagUsage,
-        TaskDraft, TaskPatch, WorkDependency, WorkFilter, WorkPage, WorkRef, WorkStatus, WorkTask,
+        Plan, PlanDraft, PlanTask, PlanTaskDraft, PropertyType, QueryOrder, QueryPage,
+        QueryRequest, QuerySelect, ReachFilter, SearchPage, SortDirection, TagUsage, TaskDraft,
+        TaskPatch, WorkDependency, WorkFilter, WorkPage, WorkRef, WorkStatus, WorkTask,
     },
     repository::graph::{GraphRepository, WorkSnapshot},
 };
@@ -19,6 +20,28 @@ use super::error::ServiceError;
 const DEFAULT_DESCEND: &str = "part_of";
 const DESCEND_NONE: &str = "none";
 const MAX_BATCH_IDS: usize = 200;
+const NODE_QUERY_FIELDS: [&str; 9] = [
+    "id",
+    "kind_id",
+    "kind",
+    "name",
+    "description",
+    "content",
+    "tags",
+    "properties",
+    "updated_at",
+];
+const EDGE_QUERY_FIELDS: [&str; 6] = [
+    "source",
+    "destination",
+    "edge_type_id",
+    "edge_type",
+    "properties",
+    "created_at",
+];
+const NODE_ORDER_FIELDS: [&str; 4] = ["id", "name", "updated_at", "kind"];
+const EDGE_ORDER_FIELDS: [&str; 4] = ["source", "destination", "created_at", "edge_type"];
+const MAX_QUERY_ORDER: usize = 3;
 
 #[derive(Clone)]
 pub struct GraphService {
@@ -1189,6 +1212,186 @@ impl GraphService {
         self.repository.graph_export().await.map_err(Into::into)
     }
 
+    pub async fn query(&self, request: &QueryRequest) -> Result<QueryPage, ServiceError> {
+        let limit = request
+            .limit
+            .unwrap_or(self.paging.default_limit)
+            .clamp(1, self.paging.max_limit);
+        let offset = request.offset.unwrap_or(0).max(0);
+        if let Some(since) = &request.since
+            && since.trim().is_empty()
+        {
+            return Err(ServiceError::UnprocessableEntity(
+                "since must not be blank".to_string(),
+            ));
+        }
+        match request.select {
+            QuerySelect::Nodes => self.query_nodes(request, limit, offset).await,
+            QuerySelect::Edges => self.query_edges(request, limit, offset).await,
+        }
+    }
+
+    async fn query_nodes(
+        &self,
+        request: &QueryRequest,
+        limit: i64,
+        offset: i64,
+    ) -> Result<QueryPage, ServiceError> {
+        if request.edge_type.is_some() || request.source.is_some() || request.destination.is_some()
+        {
+            return Err(ServiceError::UnprocessableEntity(
+                "edge_type, source and destination require select=edges".to_string(),
+            ));
+        }
+        if let Some(kind) = &request.kind {
+            let exists = self
+                .repository
+                .list_node_kinds()
+                .await?
+                .iter()
+                .any(|node_kind| &node_kind.name == kind);
+            if !exists {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "node kind '{kind}' is not defined"
+                )));
+            }
+        }
+        if let Some(condition) = &request.has_edge {
+            self.validate_edge_type_name(&condition.edge_type).await?;
+        }
+        if let Some(condition) = &request.not_has_edge {
+            self.validate_edge_type_name(&condition.edge_type).await?;
+        }
+        let fields = query_fields(&request.fields, &NODE_QUERY_FIELDS, &["id", "kind", "name"])?;
+        let order = query_order(&request.order, &NODE_ORDER_FIELDS, "id")?;
+        let mut effective = request.clone();
+        effective.tags = normalize_tags(&request.tags)?;
+        effective.reach = self.normalize_reach(&request.reach).await?;
+        effective.order = order;
+        if let Some(since) = &effective.since {
+            effective.since = Some(since.trim().to_string());
+        }
+        let (snapshot, total) = self
+            .repository
+            .query_nodes(&effective, limit, offset)
+            .await?;
+        let mut items = Vec::with_capacity(snapshot.rows.len());
+        for row in snapshot.rows {
+            let mut value = serde_json::Map::new();
+            for field in &fields {
+                let field_value = match field.as_str() {
+                    "id" => serde_json::json!(row.id),
+                    "kind_id" => serde_json::json!(row.kind_id),
+                    "kind" => serde_json::json!(row.kind),
+                    "name" => serde_json::json!(row.name),
+                    "description" => serde_json::json!(row.description),
+                    "content" => serde_json::json!(row.content),
+                    "tags" => {
+                        serde_json::json!(snapshot.tags.get(&row.id).cloned().unwrap_or_default())
+                    }
+                    "properties" => serde_json::from_str(
+                        snapshot
+                            .properties
+                            .get(&row.id)
+                            .map(String::as_str)
+                            .unwrap_or("{}"),
+                    )
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                    "updated_at" => serde_json::json!(row.updated_at),
+                    _ => unreachable!(),
+                };
+                value.insert(field.clone(), field_value);
+            }
+            items.push(serde_json::Value::Object(value));
+        }
+        Ok(QueryPage {
+            items,
+            total,
+            limit,
+            offset,
+        })
+    }
+
+    async fn query_edges(
+        &self,
+        request: &QueryRequest,
+        limit: i64,
+        offset: i64,
+    ) -> Result<QueryPage, ServiceError> {
+        if request.kind.is_some()
+            || request.name.is_some()
+            || request.name_contains.is_some()
+            || !request.tags.is_empty()
+            || !request.properties.is_empty()
+            || request.has_edge.is_some()
+            || request.not_has_edge.is_some()
+            || request.reach.within.is_some()
+            || request.reach.via.is_some()
+            || request.reach.descend.is_some()
+        {
+            return Err(ServiceError::UnprocessableEntity(
+                "node filters require select=nodes".to_string(),
+            ));
+        }
+        if let Some(edge_type) = &request.edge_type {
+            self.validate_edge_type_name(edge_type).await?;
+        }
+        let fields = query_fields(
+            &request.fields,
+            &EDGE_QUERY_FIELDS,
+            &["source", "destination", "edge_type"],
+        )?;
+        let order = query_order(&request.order, &EDGE_ORDER_FIELDS, "source")?;
+        let mut effective = request.clone();
+        effective.order = order;
+        if let Some(since) = &effective.since {
+            effective.since = Some(since.trim().to_string());
+        }
+        let (rows, total) = self
+            .repository
+            .query_edges(&effective, limit, offset)
+            .await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut value = serde_json::Map::new();
+            for field in &fields {
+                let field_value = match field.as_str() {
+                    "source" => serde_json::json!(row.source),
+                    "destination" => serde_json::json!(row.destination),
+                    "edge_type_id" => serde_json::json!(row.edge_type_id),
+                    "edge_type" => serde_json::json!(row.edge_type),
+                    "properties" => serde_json::from_str(&row.properties)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    "created_at" => serde_json::json!(row.created_at),
+                    _ => unreachable!(),
+                };
+                value.insert(field.clone(), field_value);
+            }
+            items.push(serde_json::Value::Object(value));
+        }
+        Ok(QueryPage {
+            items,
+            total,
+            limit,
+            offset,
+        })
+    }
+
+    async fn validate_edge_type_name(&self, name: &str) -> Result<(), ServiceError> {
+        let exists = self
+            .repository
+            .list_edge_types()
+            .await?
+            .iter()
+            .any(|edge_type| edge_type.name == name);
+        if !exists {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "edge type '{name}' is not defined"
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn work_report(
         &self,
         filter: &WorkFilter,
@@ -1315,6 +1518,68 @@ fn assemble_work_page(snapshot: WorkSnapshot) -> WorkPage {
         limit: snapshot.limit,
         offset: snapshot.offset,
     }
+}
+
+fn query_fields(
+    requested: &[String],
+    allowed: &[&str],
+    defaults: &[&str],
+) -> Result<Vec<String>, ServiceError> {
+    let mut fields: Vec<String> = Vec::new();
+    if requested.is_empty() {
+        fields.extend(defaults.iter().map(|field| field.to_string()));
+    } else {
+        for field in requested {
+            let field = field.trim();
+            if field.is_empty() {
+                return Err(ServiceError::UnprocessableEntity(
+                    "fields must not contain blank entries".to_string(),
+                ));
+            }
+            if !fields.iter().any(|existing| existing == field) {
+                fields.push(field.to_string());
+            }
+        }
+    }
+    for field in &fields {
+        if !allowed.contains(&field.as_str()) {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "field '{field}' is not queryable; allowed: {}",
+                allowed.join(", ")
+            )));
+        }
+    }
+    Ok(fields)
+}
+
+fn query_order(
+    order: &[QueryOrder],
+    allowed: &[&str],
+    default: &str,
+) -> Result<Vec<QueryOrder>, ServiceError> {
+    if order.len() > MAX_QUERY_ORDER {
+        return Err(ServiceError::UnprocessableEntity(format!(
+            "at most {MAX_QUERY_ORDER} order entries are allowed"
+        )));
+    }
+    let mut entries = Vec::with_capacity(order.len());
+    for entry in order {
+        if !allowed.contains(&entry.field.as_str()) {
+            return Err(ServiceError::UnprocessableEntity(format!(
+                "order field '{}' is not sortable; allowed: {}",
+                entry.field,
+                allowed.join(", ")
+            )));
+        }
+        entries.push(entry.clone());
+    }
+    if entries.is_empty() {
+        entries.push(QueryOrder {
+            field: default.to_string(),
+            direction: SortDirection::Asc,
+        });
+    }
+    Ok(entries)
 }
 
 fn edge_type_ref<'a>(edge_types: &'a [EdgeType], name: &str) -> Result<&'a EdgeType, ServiceError> {
@@ -1899,8 +2164,8 @@ mod tests {
     use crate::{
         database::{create_sqlite_pool, migrate},
         model::{
-            ImportConflict, ImportRef, PlanAnchorDraft, PlanGoalDraft, RelationDirection,
-            SearchScope,
+            EdgeCondition, ImportConflict, ImportRef, PlanAnchorDraft, PlanGoalDraft,
+            QueryDirection, RelationDirection, SearchScope,
         },
         repository::graph::SqliteGraphRepository,
     };
@@ -7605,6 +7870,248 @@ mod tests {
         assert!(matches!(
             service.nodes_by_ids(&too_many).await,
             Err(ServiceError::UnprocessableEntity(message)) if message.contains("at most 200")
+        ));
+    }
+
+    #[tokio::test]
+    async fn queries_nodes_with_structural_predicates_and_projection() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+        let change_kind = seeded_kind(&service, "change").await;
+        let implements = seeded_edge_type(&service, "implements").await;
+
+        let mut done = new_task("done query task");
+        done.parent = Some(goal);
+        done.tags = Some(vec!["phase:p0".to_string()]);
+        done.properties = Some(serde_json::json!({"owner": "ada"}));
+        let done = service.create_task(&done).await.unwrap();
+        let mut pending = new_task("pending query task");
+        pending.parent = Some(goal);
+        pending.depends_on = vec![done.id];
+        let pending = service.create_task(&pending).await.unwrap();
+        let change = service
+            .upsert_node(&node(change_kind, "qchange", ""))
+            .await
+            .unwrap();
+        service
+            .add_edge(&Edge {
+                source: change.id,
+                destination: done.id,
+                edge_type_id: implements,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let unfinished = QueryRequest {
+            kind: Some("task".to_string()),
+            not_has_edge: Some(EdgeCondition {
+                edge_type: "implements".to_string(),
+                direction: QueryDirection::Incoming,
+            }),
+            ..Default::default()
+        };
+        let page = service.query(&unfinished).await.unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0]["id"], pending.id);
+        assert_eq!(
+            page.items[0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["id", "kind", "name"]
+        );
+
+        let finished = QueryRequest {
+            kind: Some("task".to_string()),
+            has_edge: Some(EdgeCondition {
+                edge_type: "implements".to_string(),
+                direction: QueryDirection::Incoming,
+            }),
+            fields: vec![
+                "id".to_string(),
+                "tags".to_string(),
+                "properties".to_string(),
+            ],
+            ..Default::default()
+        };
+        let page = service.query(&finished).await.unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0]["id"], done.id);
+        assert_eq!(page.items[0]["tags"], serde_json::json!(["phase:p0"]));
+        assert_eq!(
+            page.items[0]["properties"],
+            serde_json::json!({"owner": "ada"})
+        );
+
+        let within = QueryRequest {
+            kind: Some("task".to_string()),
+            reach: ReachFilter {
+                within: Some(goal),
+                via: None,
+                descend: None,
+            },
+            order: vec![QueryOrder {
+                field: "updated_at".to_string(),
+                direction: SortDirection::Desc,
+            }],
+            ..Default::default()
+        };
+        let page = service.query(&within).await.unwrap();
+        assert_eq!(page.total, 2);
+
+        let future = QueryRequest {
+            since: Some("9999-01-01T00:00:00.000Z".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(service.query(&future).await.unwrap().total, 0);
+    }
+
+    #[tokio::test]
+    async fn queries_edges_with_filters_and_fields() {
+        let service = service().await;
+        let task_kind = seeded_kind(&service, "task").await;
+        let depends_on = seeded_edge_type(&service, "depends_on").await;
+        let first = service
+            .upsert_node(&node(task_kind, "edge first", ""))
+            .await
+            .unwrap();
+        let second = service
+            .upsert_node(&node(task_kind, "edge second", ""))
+            .await
+            .unwrap();
+        service
+            .add_edge(&Edge {
+                source: second.id,
+                destination: first.id,
+                edge_type_id: depends_on,
+                created_at: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let request = QueryRequest {
+            select: QuerySelect::Edges,
+            edge_type: Some("depends_on".to_string()),
+            source: Some(second.id),
+            fields: vec![
+                "source".to_string(),
+                "destination".to_string(),
+                "edge_type".to_string(),
+            ],
+            ..Default::default()
+        };
+        let page = service.query(&request).await.unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0]["source"], second.id);
+        assert_eq!(page.items[0]["destination"], first.id);
+        assert_eq!(page.items[0]["edge_type"], "depends_on");
+
+        let goal_edges = service
+            .query(&QueryRequest {
+                select: QuerySelect::Edges,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(goal_edges.total, 1);
+    }
+
+    #[tokio::test]
+    async fn query_rejects_unknown_or_mismatched_filters() {
+        let service = service().await;
+        let unknown_field = service
+            .query(&QueryRequest {
+                fields: vec!["bogus".to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            unknown_field,
+            ServiceError::UnprocessableEntity(message) if message.contains("not queryable")
+        ));
+
+        let unknown_order = service
+            .query(&QueryRequest {
+                order: vec![QueryOrder {
+                    field: "bogus".to_string(),
+                    direction: SortDirection::Asc,
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            unknown_order,
+            ServiceError::UnprocessableEntity(message) if message.contains("not sortable")
+        ));
+
+        let unknown_kind = service
+            .query(&QueryRequest {
+                kind: Some("bogus".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            unknown_kind,
+            ServiceError::UnprocessableEntity(message) if message.contains("not defined")
+        ));
+
+        let edge_filter_on_nodes = service
+            .query(&QueryRequest {
+                source: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            edge_filter_on_nodes,
+            ServiceError::UnprocessableEntity(message) if message.contains("select=edges")
+        ));
+
+        let node_filter_on_edges = service
+            .query(&QueryRequest {
+                select: QuerySelect::Edges,
+                kind: Some("task".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            node_filter_on_edges,
+            ServiceError::UnprocessableEntity(message) if message.contains("select=nodes")
+        ));
+
+        let blank_since = service
+            .query(&QueryRequest {
+                since: Some("   ".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            blank_since,
+            ServiceError::UnprocessableEntity(message) if message.contains("since")
+        ));
+
+        let unknown_edge = service
+            .query(&QueryRequest {
+                has_edge: Some(EdgeCondition {
+                    edge_type: "bogus".to_string(),
+                    direction: QueryDirection::Both,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            unknown_edge,
+            ServiceError::UnprocessableEntity(message) if message.contains("not defined")
         ));
     }
 
