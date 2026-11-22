@@ -355,14 +355,31 @@ impl GraphService {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<NodePage, ServiceError> {
+        self.list_nodes_page_ordered(filter, limit, offset, &[], None)
+            .await
+    }
+
+    pub async fn list_nodes_page_ordered(
+        &self,
+        filter: &NodeFilter,
+        limit: Option<i64>,
+        offset: Option<i64>,
+        order: &[QueryOrder],
+        since: Option<&str>,
+    ) -> Result<NodePage, ServiceError> {
         let filter = self.normalize_node_filter(filter).await?;
+        let since = match since {
+            Some(since) => Some(validate_since(since)?),
+            None => None,
+        };
+        let order = query_order(order, &NODE_ORDER_FIELDS, "id")?;
         let limit = limit
             .unwrap_or(self.paging.default_limit)
             .clamp(1, self.paging.max_limit);
         let offset = offset.unwrap_or(0).max(0);
         let (items, total) = self
             .repository
-            .list_nodes_page(&filter, limit, offset)
+            .list_nodes_page(&filter, limit, offset, &order, since.as_deref())
             .await?;
         Ok(NodePage {
             items,

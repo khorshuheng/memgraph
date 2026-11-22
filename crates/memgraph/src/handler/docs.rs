@@ -72,8 +72,8 @@ pub const ENDPOINTS: &[EndpointDoc] = &[
     EndpointDoc {
         method: "GET",
         path: "/api/nodes",
-        description: "List or filter nodes by kind, name, name_contains, tags, properties or reach.",
-        example: "curl '$BASE/api/nodes?kind=task&name_contains=status&limit=20'",
+        description: "List or filter nodes by kind, name, name_contains, tags, properties or reach; order with field:dir, filter with since, and project with fields.",
+        example: "curl '$BASE/api/nodes?kind=task&order=updated_at:desc&fields=id,kind,name&limit=20'",
     },
     EndpointDoc {
         method: "GET",
@@ -192,19 +192,19 @@ pub const ENDPOINTS: &[EndpointDoc] = &[
     EndpointDoc {
         method: "GET",
         path: "/api/work/pending",
-        description: "All unfinished tasks with done/blocked state and dependencies.",
+        description: "All unfinished tasks with done/blocked state and dependencies; fields projects the task shape.",
         example: "curl '$BASE/api/work/pending?repo=1&limit=20'",
     },
     EndpointDoc {
         method: "GET",
         path: "/api/work/next",
-        description: "Unfinished tasks whose dependencies are all done.",
+        description: "Unfinished tasks whose dependencies are all done; fields projects the task shape.",
         example: "curl '$BASE/api/work/next?repo=1'",
     },
     EndpointDoc {
         method: "GET",
         path: "/api/goals/{goal_id}/tree",
-        description: "Goal plus its transitive part_of task tree with status and implementing changes.",
+        description: "Goal plus its transitive part_of task tree with status and implementing changes; fields projects the task shape.",
         example: "curl '$BASE/api/goals/119/tree?limit=100'",
     },
     EndpointDoc {

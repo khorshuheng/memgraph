@@ -17,6 +17,7 @@ use crate::{
             QueryResponse, ReplaceTagsParameters, SearchHitResponse, SearchParameters,
             SearchResponse, TagUsageResponse, UpdateEdgeParameters, UpdateNodeParameters,
             UpdateTaskParameters, VocabularyResponse, WorkListResponse, WorkParameters,
+            WorkTaskResponse,
         },
         health::GraphHealthResponse,
         wrapper::{ApiError, ApiList, ApiSuccess},
@@ -27,6 +28,92 @@ use crate::{
     },
     state::AppState,
 };
+
+const NODE_PROJECTION_FIELDS: [&str; 10] = [
+    "id",
+    "kind_id",
+    "kind",
+    "name",
+    "description",
+    "content",
+    "tags",
+    "properties",
+    "version",
+    "updated_at",
+];
+const WORK_PROJECTION_FIELDS: [&str; 7] = [
+    "id",
+    "name",
+    "status",
+    "updated_at",
+    "goal",
+    "depends_on",
+    "implemented_by",
+];
+
+fn parse_fields(raw: Option<&str>) -> Result<Vec<String>, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut fields = Vec::new();
+    for field in raw.split(',') {
+        let field = field.trim();
+        if field.is_empty() {
+            return Err(
+                ApiError::unprocessable("fields must not contain blank entries")
+                    .with_field("fields"),
+            );
+        }
+        if !fields.iter().any(|existing| existing == field) {
+            fields.push(field.to_string());
+        }
+    }
+    Ok(fields)
+}
+
+fn project_value(
+    value: serde_json::Value,
+    fields: &[String],
+    allowed: &[&str],
+    label: &str,
+) -> Result<serde_json::Value, ApiError> {
+    if fields.is_empty() {
+        return Ok(value);
+    }
+    let object = value.as_object().cloned().unwrap_or_default();
+    let mut projected = serde_json::Map::new();
+    for field in fields {
+        if !allowed.contains(&field.as_str()) {
+            return Err(ApiError::unprocessable(format!(
+                "field '{field}' is not projectable; allowed: {}",
+                allowed.join(", ")
+            ))
+            .with_field(label));
+        }
+        if let Some(value) = object.get(field) {
+            projected.insert(field.clone(), value.clone());
+        }
+    }
+    Ok(serde_json::Value::Object(projected))
+}
+
+fn project_node(node: NodeResponse, fields: &[String]) -> Result<serde_json::Value, ApiError> {
+    project_value(
+        serde_json::to_value(node).unwrap_or(serde_json::Value::Null),
+        fields,
+        &NODE_PROJECTION_FIELDS,
+        "fields",
+    )
+}
+
+fn project_work(task: WorkTaskResponse, fields: &[String]) -> Result<serde_json::Value, ApiError> {
+    project_value(
+        serde_json::to_value(task).unwrap_or(serde_json::Value::Null),
+        fields,
+        &WORK_PROJECTION_FIELDS,
+        "fields",
+    )
+}
 
 async fn fill_names<T: FillNames>(state: &AppState, data: &mut T) -> Result<(), ApiError> {
     let (kinds, edge_types) = state.graph_service.name_maps().await?;
@@ -368,6 +455,11 @@ pub async fn list_nodes(
     let ids = params
         .id_list()
         .map_err(|message| ApiError::unprocessable(message).with_field("ids"))?;
+    let fields = parse_fields(params.fields.as_deref())?;
+    let order = params
+        .order_list()
+        .map_err(|message| ApiError::unprocessable(message).with_field("order"))?;
+    let since = params.since.clone();
     if let Some(ids) = ids {
         if params.kind.is_some()
             || params.name.is_some()
@@ -377,6 +469,8 @@ pub async fn list_nodes(
             || params.via.is_some()
             || params.descend.is_some()
             || params.properties.is_some()
+            || !order.is_empty()
+            || since.is_some()
             || params.limit.is_some()
             || params.offset.is_some()
         {
@@ -387,21 +481,25 @@ pub async fn list_nodes(
         }
         let nodes = state.graph_service.nodes_by_ids(&ids).await?;
         let total = nodes.len() as i64;
-        let mut data = ListNodesResponse {
-            items: nodes
-                .into_iter()
-                .map(|item| {
-                    NodeResponse::with_tags_and_properties(item.node, item.tags, item.properties)
-                })
-                .collect(),
-            total,
-            limit: total,
-            offset: 0,
-        };
-        fill_names(&state, &mut data).await?;
+        let mut items: Vec<NodeResponse> = nodes
+            .into_iter()
+            .map(|item| {
+                NodeResponse::with_tags_and_properties(item.node, item.tags, item.properties)
+            })
+            .collect();
+        fill_names(&state, &mut items).await?;
+        let items = items
+            .into_iter()
+            .map(|node| project_node(node, &fields))
+            .collect::<Result<Vec<_>, _>>()?;
         return Ok(ApiSuccess {
             status: StatusCode::OK,
-            data,
+            data: ListNodesResponse {
+                items,
+                total,
+                limit: total,
+                offset: 0,
+            },
         });
     }
     let limit = params.limit;
@@ -413,31 +511,35 @@ pub async fn list_nodes(
     filter.properties = properties;
     let page = state
         .graph_service
-        .list_nodes_page(&filter, limit, offset)
+        .list_nodes_page_ordered(&filter, limit, offset, &order, since.as_deref())
         .await?;
     let ids: Vec<i64> = page.items.iter().map(|node| node.id).collect();
     let mut tags = state.graph_service.node_tags_for_ids(&ids).await?;
     let mut properties = state.graph_service.node_properties_for_ids(&ids).await?;
-    let mut data = ListNodesResponse {
-        items: page
-            .items
-            .into_iter()
-            .map(|node| {
-                let node_tags = tags.remove(&node.id).unwrap_or_default();
-                let node_properties = properties
-                    .remove(&node.id)
-                    .unwrap_or_else(|| serde_json::json!({}));
-                NodeResponse::with_tags_and_properties(node, node_tags, node_properties)
-            })
-            .collect(),
-        total: page.total,
-        limit: page.limit,
-        offset: page.offset,
-    };
-    fill_names(&state, &mut data).await?;
+    let mut items: Vec<NodeResponse> = page
+        .items
+        .into_iter()
+        .map(|node| {
+            let node_tags = tags.remove(&node.id).unwrap_or_default();
+            let node_properties = properties
+                .remove(&node.id)
+                .unwrap_or_else(|| serde_json::json!({}));
+            NodeResponse::with_tags_and_properties(node, node_tags, node_properties)
+        })
+        .collect();
+    fill_names(&state, &mut items).await?;
+    let items = items
+        .into_iter()
+        .map(|node| project_node(node, &fields))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data,
+        data: ListNodesResponse {
+            items,
+            total: page.total,
+            limit: page.limit,
+            offset: page.offset,
+        },
     })
 }
 
@@ -630,6 +732,7 @@ pub async fn work_pending(
     State(state): State<AppState>,
     Query(params): Query<WorkParameters>,
 ) -> Result<ApiSuccess<WorkListResponse>, ApiError> {
+    let fields = parse_fields(params.fields.as_deref())?;
     let limit = params.limit;
     let offset = params.offset;
     let filter: WorkFilter = params.into();
@@ -637,9 +740,20 @@ pub async fn work_pending(
         .graph_service
         .work_report(&filter, false, limit, offset)
         .await?;
+    let items = page
+        .items
+        .into_iter()
+        .map(WorkTaskResponse::from)
+        .map(|task| project_work(task, &fields))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: page.into(),
+        data: WorkListResponse {
+            items,
+            total: page.total,
+            limit: page.limit,
+            offset: page.offset,
+        },
     })
 }
 
@@ -658,6 +772,7 @@ pub async fn work_next(
     State(state): State<AppState>,
     Query(params): Query<WorkParameters>,
 ) -> Result<ApiSuccess<WorkListResponse>, ApiError> {
+    let fields = parse_fields(params.fields.as_deref())?;
     let limit = params.limit;
     let offset = params.offset;
     let filter: WorkFilter = params.into();
@@ -665,9 +780,20 @@ pub async fn work_next(
         .graph_service
         .work_report(&filter, true, limit, offset)
         .await?;
+    let items = page
+        .items
+        .into_iter()
+        .map(WorkTaskResponse::from)
+        .map(|task| project_work(task, &fields))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(ApiSuccess {
         status: StatusCode::OK,
-        data: page.into(),
+        data: WorkListResponse {
+            items,
+            total: page.total,
+            limit: page.limit,
+            offset: page.offset,
+        },
     })
 }
 
@@ -687,15 +813,22 @@ pub async fn goal_tree(
     Path(goal_id): Path<i64>,
     Query(params): Query<PageParameters>,
 ) -> Result<ApiSuccess<GoalTreeResponse>, ApiError> {
+    let fields = parse_fields(params.fields.as_deref())?;
     let (goal, page) = state
         .graph_service
         .goal_tree(goal_id, params.limit, params.offset)
         .await?;
     let tags = state.graph_service.node_tags(goal.id).await?;
     let properties = state.graph_service.node_properties(goal.id).await?;
+    let tasks = page
+        .items
+        .into_iter()
+        .map(WorkTaskResponse::from)
+        .map(|task| project_work(task, &fields))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut data = GoalTreeResponse {
         goal: NodeResponse::with_tags_and_properties(goal, tags, properties),
-        tasks: page.items.into_iter().map(Into::into).collect(),
+        tasks,
         total: page.total,
         limit: page.limit,
         offset: page.offset,
@@ -1237,6 +1370,9 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                order: None,
+                since: None,
+                fields: None,
                 ids: None,
                 properties: None,
                 limit: None,
@@ -1246,7 +1382,13 @@ mod tests {
         .await
         .expect("list nodes");
         assert_eq!(listed.data.items.len(), 2);
-        assert!(listed.data.items.iter().all(|node| !node.tags.is_empty()));
+        assert!(
+            listed
+                .data
+                .items
+                .iter()
+                .all(|node| node["tags"].as_array().is_some_and(|tags| !tags.is_empty()))
+        );
         assert_eq!(listed.data.total, 2);
 
         let tags = list_tags(State(state.clone())).await.expect("list tags");
@@ -1627,6 +1769,9 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                order: None,
+                since: None,
+                fields: None,
                 ids: None,
                 properties: None,
                 limit: None,
@@ -1636,7 +1781,7 @@ mod tests {
         .await
         .expect("list");
         assert_eq!(
-            listed.data.items[0].properties,
+            listed.data.items[0]["properties"],
             serde_json::json!({"status": "verified"})
         );
 
@@ -1699,6 +1844,9 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                order: None,
+                since: None,
+                fields: None,
                 ids: None,
                 properties: Some(r#"{"status":"verified"}"#.to_string()),
                 limit: None,
@@ -1708,7 +1856,7 @@ mod tests {
         .await
         .expect("filtered list");
         assert_eq!(listed.data.items.len(), 1);
-        assert_eq!(listed.data.items[0].name, "verified");
+        assert_eq!(listed.data.items[0]["name"], "verified");
 
         let found = search(
             State(state.clone()),
@@ -1735,6 +1883,9 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                order: None,
+                since: None,
+                fields: None,
                 ids: None,
                 properties: Some("[1]".to_string()),
                 limit: None,
@@ -2093,6 +2244,9 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                order: None,
+                since: None,
+                fields: None,
                 ids: None,
                 properties: Some(r#"{"a\"b":1}"#.to_string()),
                 limit: None,
@@ -2122,6 +2276,9 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                order: None,
+                since: None,
+                fields: None,
                 ids: None,
                 properties: None,
                 limit: Some(2),
@@ -2145,6 +2302,9 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                order: None,
+                since: None,
+                fields: None,
                 ids: None,
                 properties: None,
                 limit: Some(10_000),
@@ -2186,6 +2346,7 @@ mod tests {
             Query(WorkParameters {
                 goal: Some(goal),
                 repo: None,
+                fields: None,
                 limit: None,
                 offset: None,
             }),
@@ -2194,15 +2355,16 @@ mod tests {
         .expect("pending");
         assert_eq!(pending.data.items.len(), 1);
         assert_eq!(pending.data.total, 1);
-        assert_eq!(pending.data.items[0].id, task.id);
-        assert_eq!(pending.data.items[0].status, "pending");
-        assert_eq!(pending.data.items[0].goal.as_ref().expect("goal").id, goal);
+        assert_eq!(pending.data.items[0]["id"], task.id);
+        assert_eq!(pending.data.items[0]["status"], "pending");
+        assert_eq!(pending.data.items[0]["goal"]["id"], goal);
 
         let next = work_next(
             State(state.clone()),
             Query(WorkParameters {
                 goal: None,
                 repo: None,
+                fields: None,
                 limit: None,
                 offset: None,
             }),
@@ -2211,10 +2373,34 @@ mod tests {
         .expect("next");
         assert_eq!(next.data.items.len(), 1);
 
+        let compact_work = work_pending(
+            State(state.clone()),
+            Query(WorkParameters {
+                goal: Some(goal),
+                repo: None,
+                fields: Some("id,status".to_string()),
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("compact pending")
+        .data;
+        assert_eq!(
+            compact_work.items[0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["id", "status"]
+        );
+
         let tree = goal_tree(
             State(state.clone()),
             Path(goal),
             Query(PageParameters {
+                fields: Some("id,status".to_string()),
                 limit: None,
                 offset: None,
             }),
@@ -2225,12 +2411,13 @@ mod tests {
         assert_eq!(tree.goal.id, goal);
         assert_eq!(tree.tasks.len(), 1);
         assert_eq!(tree.total, 1);
-        assert_eq!(tree.tasks[0].status, "pending");
+        assert_eq!(tree.tasks[0]["status"], "pending");
 
         let error = goal_tree(
             State(state.clone()),
             Path(task.id),
             Query(PageParameters {
+                fields: None,
                 limit: None,
                 offset: None,
             }),
@@ -2243,6 +2430,7 @@ mod tests {
             State(state.clone()),
             Path(999_999),
             Query(PageParameters {
+                fields: None,
                 limit: None,
                 offset: None,
             }),
@@ -2317,6 +2505,7 @@ mod tests {
             Query(WorkParameters {
                 goal: Some(goal),
                 repo: None,
+                fields: None,
                 limit: None,
                 offset: None,
             }),
@@ -2324,6 +2513,120 @@ mod tests {
         .await
         .expect("pending");
         assert!(pending.data.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_nodes_projects_orders_and_filters_since() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "person").await;
+        new_node(&state, kind, "beta", "", "", &[]).await;
+        new_node(&state, kind, "alpha", "", "", &[]).await;
+
+        let listed = list_nodes(
+            State(state.clone()),
+            Query(ListNodesParameters {
+                kind: None,
+                name: None,
+                name_contains: None,
+                scope: None,
+                within: None,
+                via: None,
+                descend: None,
+                ids: None,
+                properties: None,
+                order: Some("name:desc".to_string()),
+                since: None,
+                fields: Some("id,name".to_string()),
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("ordered projection")
+        .data;
+        assert_eq!(listed.items.len(), 2);
+        assert_eq!(listed.items[0]["name"], "beta");
+        assert_eq!(listed.items[1]["name"], "alpha");
+        assert_eq!(
+            listed.items[0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["id", "name"]
+        );
+
+        let future = list_nodes(
+            State(state.clone()),
+            Query(ListNodesParameters {
+                kind: None,
+                name: None,
+                name_contains: None,
+                scope: None,
+                within: None,
+                via: None,
+                descend: None,
+                ids: None,
+                properties: None,
+                order: None,
+                since: Some("9999-01-01".to_string()),
+                fields: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("since filter")
+        .data;
+        assert!(future.items.is_empty());
+
+        let bad_field = list_nodes(
+            State(state.clone()),
+            Query(ListNodesParameters {
+                kind: None,
+                name: None,
+                name_contains: None,
+                scope: None,
+                within: None,
+                via: None,
+                descend: None,
+                ids: None,
+                properties: None,
+                order: None,
+                since: None,
+                fields: Some("bogus".to_string()),
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect_err("unknown field");
+        assert_eq!(bad_field.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(bad_field.field.as_deref(), Some("fields"));
+
+        let bad_order = list_nodes(
+            State(state.clone()),
+            Query(ListNodesParameters {
+                kind: None,
+                name: None,
+                name_contains: None,
+                scope: None,
+                within: None,
+                via: None,
+                descend: None,
+                ids: None,
+                properties: None,
+                order: Some("bogus".to_string()),
+                since: None,
+                fields: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect_err("unknown order field");
+        assert_eq!(bad_order.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
@@ -2368,6 +2671,9 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                order: None,
+                since: None,
+                fields: None,
                 ids: Some(format!("{},{}", second.id, first.id)),
                 properties: None,
                 limit: None,
@@ -2378,12 +2684,16 @@ mod tests {
         .expect("batch")
         .data;
         assert_eq!(
-            batch.items.iter().map(|node| node.id).collect::<Vec<_>>(),
+            batch
+                .items
+                .iter()
+                .map(|node| node["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
             vec![second.id, first.id]
         );
         assert_eq!(batch.total, 2);
-        assert_eq!(batch.items[1].tags, vec!["math"]);
-        assert_eq!(batch.items[0].kind, "person");
+        assert_eq!(batch.items[1]["tags"], serde_json::json!(["math"]));
+        assert_eq!(batch.items[0]["kind"], "person");
 
         let named = list_nodes(
             State(state.clone()),
@@ -2395,6 +2705,9 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                order: None,
+                since: None,
+                fields: None,
                 ids: None,
                 properties: None,
                 limit: None,
@@ -2405,7 +2718,7 @@ mod tests {
         .expect("name contains")
         .data;
         assert_eq!(named.total, 1);
-        assert_eq!(named.items[0].name, "first");
+        assert_eq!(named.items[0]["name"], "first");
 
         let error = list_nodes(
             State(state.clone()),
@@ -2417,6 +2730,9 @@ mod tests {
                 within: None,
                 via: None,
                 descend: None,
+                order: None,
+                since: None,
+                fields: None,
                 ids: Some(first.id.to_string()),
                 properties: None,
                 limit: None,

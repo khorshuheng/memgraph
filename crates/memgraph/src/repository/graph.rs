@@ -22,6 +22,8 @@ const NODE_KIND_COLUMNS: &str =
 const EDGE_TYPE_COLUMNS: &str = "id, name, description, resolves, single_outgoing, acyclic, source_kinds, destination_kinds, \
      updated_at";
 const NODE_COLUMNS: &str = "id, kind_id, name, description, content, version, updated_at";
+const NODE_COLUMNS_QUALIFIED: &str =
+    "n.id, n.kind_id, n.name, n.description, n.content, n.version, n.updated_at";
 const MAX_EXPORT_NODES: i64 = 50_000;
 const MAX_EXPORT_EDGES: i64 = 200_000;
 const OUTGOING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
@@ -187,6 +189,8 @@ pub trait GraphRepository: Send + Sync {
         filter: &NodeFilter,
         limit: i64,
         offset: i64,
+        order: &[crate::model::QueryOrder],
+        since: Option<&str>,
     ) -> Result<(Vec<Node>, i64), RepositoryError>;
     async fn node_kinds_for_ids(&self, ids: &[i64]) -> Result<Vec<(i64, String)>, RepositoryError>;
     async fn node_id_by_natural_key(
@@ -615,7 +619,7 @@ impl GraphRepository for SqliteGraphRepository {
     }
 
     async fn list_nodes(&self, filter: &NodeFilter) -> Result<Vec<Node>, RepositoryError> {
-        self.list_nodes_page(filter, -1, 0)
+        self.list_nodes_page(filter, -1, 0, &[], None)
             .await
             .map(|(items, _)| items)
     }
@@ -625,6 +629,8 @@ impl GraphRepository for SqliteGraphRepository {
         filter: &NodeFilter,
         limit: i64,
         offset: i64,
+        order: &[crate::model::QueryOrder],
+        since: Option<&str>,
     ) -> Result<(Vec<Node>, i64), RepositoryError> {
         let mut transaction = self.pool.begin().await?;
 
@@ -632,8 +638,8 @@ impl GraphRepository for SqliteGraphRepository {
         if filter.reach.within.is_some() {
             push_reach_cte(&mut count, &filter.reach);
         }
-        count.push("SELECT count(*) FROM node n WHERE 1 = 1");
-        push_node_conditions(&mut count, filter);
+        count.push("SELECT count(*) FROM node n JOIN node_kind k ON k.id = n.kind_id WHERE 1 = 1");
+        push_node_conditions(&mut count, filter, since);
         let total = count
             .build_query_scalar::<i64>()
             .fetch_one(&mut *transaction)
@@ -643,9 +649,13 @@ impl GraphRepository for SqliteGraphRepository {
         if filter.reach.within.is_some() {
             push_reach_cte(&mut page, &filter.reach);
         }
-        page.push(format!("SELECT {NODE_COLUMNS} FROM node n WHERE 1 = 1"));
-        push_node_conditions(&mut page, filter);
-        page.push(" ORDER BY n.id LIMIT ");
+        page.push(format!(
+            "SELECT {NODE_COLUMNS_QUALIFIED} FROM node n JOIN node_kind k ON k.id = n.kind_id \
+             WHERE 1 = 1"
+        ));
+        push_node_conditions(&mut page, filter, since);
+        push_node_query_order(&mut page, order);
+        page.push(" LIMIT ");
         page.push_bind(limit);
         page.push(" OFFSET ");
         page.push_bind(offset);
@@ -3190,7 +3200,11 @@ fn push_reach_cte(builder: &mut QueryBuilder<Sqlite>, reach: &ReachFilter) {
     builder.push(")) ");
 }
 
-fn push_node_conditions(builder: &mut QueryBuilder<Sqlite>, filter: &NodeFilter) {
+fn push_node_conditions(
+    builder: &mut QueryBuilder<Sqlite>,
+    filter: &NodeFilter,
+    since: Option<&str>,
+) {
     if filter.reach.within.is_some() {
         builder.push(" AND n.id IN (SELECT id FROM reach)");
     }
@@ -3207,6 +3221,10 @@ fn push_node_conditions(builder: &mut QueryBuilder<Sqlite>, filter: &NodeFilter)
         builder.push(" AND instr(n.name, ");
         builder.push_bind(name_contains.clone());
         builder.push(") > 0");
+    }
+    if let Some(since) = since {
+        builder.push(" AND n.updated_at >= ");
+        builder.push_bind(since.to_string());
     }
     builder.push(scope_clause(filter.scope));
     push_property_filters(builder, &filter.properties);

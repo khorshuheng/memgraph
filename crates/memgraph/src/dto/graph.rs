@@ -560,13 +560,17 @@ pub struct ListNodesParameters {
     pub descend: Option<String>,
     pub ids: Option<String>,
     pub properties: Option<String>,
+    pub order: Option<String>,
+    pub since: Option<String>,
+    pub fields: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ListNodesResponse {
-    pub items: Vec<NodeResponse>,
+    #[schema(value_type = Vec<Object>)]
+    pub items: Vec<serde_json::Value>,
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
@@ -575,6 +579,54 @@ pub struct ListNodesResponse {
 impl ListNodesParameters {
     pub fn property_filter(&self) -> Result<serde_json::Map<String, serde_json::Value>, String> {
         parse_property_filter(self.properties.as_deref())
+    }
+
+    pub fn order_list(&self) -> Result<Vec<QueryOrder>, String> {
+        let Some(raw) = self.order.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let mut entries = Vec::new();
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (field, direction) = match entry.split_once(':') {
+                Some((field, direction)) => (field.trim(), direction.trim()),
+                None => (entry, "asc"),
+            };
+            let direction = match direction.to_ascii_lowercase().as_str() {
+                "asc" | "ascending" => SortDirection::Asc,
+                "desc" | "descending" => SortDirection::Desc,
+                other => {
+                    return Err(format!(
+                        "order direction must be asc or desc, got '{other}'"
+                    ));
+                }
+            };
+            entries.push(QueryOrder {
+                field: field.to_string(),
+                direction,
+            });
+        }
+        Ok(entries)
+    }
+
+    pub fn field_list(&self) -> Result<Vec<String>, String> {
+        let Some(raw) = self.fields.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let mut fields = Vec::new();
+        for field in raw.split(',') {
+            let field = field.trim();
+            if field.is_empty() {
+                return Err("fields must not contain blank entries".to_string());
+            }
+            if !fields.iter().any(|existing| existing == field) {
+                fields.push(field.to_string());
+            }
+        }
+        Ok(fields)
     }
 
     pub fn id_list(&self) -> Result<Option<Vec<i64>>, String> {
@@ -1298,6 +1350,7 @@ impl From<UpdateTaskParameters> for TaskPatch {
 pub struct WorkParameters {
     pub goal: Option<i64>,
     pub repo: Option<i64>,
+    pub fields: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -1314,6 +1367,7 @@ impl From<WorkParameters> for WorkFilter {
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct PageParameters {
+    pub fields: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -1380,7 +1434,8 @@ impl From<WorkTask> for WorkTaskResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct WorkListResponse {
-    pub items: Vec<WorkTaskResponse>,
+    #[schema(value_type = Vec<Object>)]
+    pub items: Vec<serde_json::Value>,
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
@@ -1389,7 +1444,11 @@ pub struct WorkListResponse {
 impl From<WorkPage> for WorkListResponse {
     fn from(page: WorkPage) -> Self {
         WorkListResponse {
-            items: page.items.into_iter().map(Into::into).collect(),
+            items: page
+                .items
+                .into_iter()
+                .map(|task| serde_json::to_value(WorkTaskResponse::from(task)).unwrap_or_default())
+                .collect(),
             total: page.total,
             limit: page.limit,
             offset: page.offset,
@@ -1400,7 +1459,8 @@ impl From<WorkPage> for WorkListResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct GoalTreeResponse {
     pub goal: NodeResponse,
-    pub tasks: Vec<WorkTaskResponse>,
+    #[schema(value_type = Vec<Object>)]
+    pub tasks: Vec<serde_json::Value>,
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
@@ -1649,14 +1709,6 @@ impl FillNames for NeighborResponse {
     fn fill_names(&mut self, kinds: &HashMap<i64, String>, edge_types: &HashMap<i64, String>) {
         self.edge.fill_names(kinds, edge_types);
         self.node.fill_names(kinds, edge_types);
-    }
-}
-
-impl FillNames for ListNodesResponse {
-    fn fill_names(&mut self, kinds: &HashMap<i64, String>, edge_types: &HashMap<i64, String>) {
-        for item in &mut self.items {
-            item.fill_names(kinds, edge_types);
-        }
     }
 }
 
