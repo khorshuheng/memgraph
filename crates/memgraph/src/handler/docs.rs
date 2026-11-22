@@ -255,7 +255,7 @@ pub struct ApiIndexResponse {
     tag = "Docs",
     get,
     path = "/api",
-    responses((status = 200, description = "Endpoint index with one example per route", body = ApiIndexResponse))
+    responses((status = 200, description = "Endpoint index with one example per route", body = ApiSuccess<ApiIndexResponse>))
 )]
 pub async fn api_index() -> ApiSuccess<ApiIndexResponse> {
     ApiSuccess {
@@ -309,6 +309,8 @@ fn llms_text() -> String {
          Successful responses are `{\"data\": ...}`; unpaged lists put the array in `data`, \
          paged lists put `{items,total,limit,offset}` in `data`. Errors are \
          `{\"error\":{code,message,field?,hint?,retryable}}`.\n\n\
+         Nodes created before the created_at migration have created_at approximated \
+         from updated_at; direct SQL inserts must supply created_at (API writes always do).\n\n\
          POST requests accept an `Idempotency-Key` header; retrying the same key and \
          body replays the stored response. PATCH requests accept \
          `If-Match: \"<version>\"` and return 412 when the node changed.\n\n\
@@ -358,6 +360,23 @@ mod tests {
                 endpoint.path
             );
         }
+    }
+
+    #[tokio::test]
+    async fn openapi_wraps_api_success_responses() {
+        let doc = crate::routes::root::openapi_doc().await;
+        let value: serde_json::Value = serde_json::from_str(&doc.to_json().unwrap()).unwrap();
+        let reference = |path: &str| {
+            value["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+                ["$ref"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(reference("/api/health").ends_with("ApiSuccess_HealthCheckResponse"));
+        assert!(reference("/api/nodes/{node_id}").ends_with("ApiSuccess_NodeResponse"));
+        assert!(reference("/api/nodes").ends_with("ApiSuccess_ListNodesResponse"));
+        assert!(reference("/api/node-kinds").ends_with("ApiList_NodeKindResponse"));
     }
 
     #[tokio::test]

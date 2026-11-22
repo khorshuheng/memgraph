@@ -155,7 +155,7 @@ fn parse_if_match(headers: &HeaderMap) -> Result<Option<i64>, ApiError> {
     post,
     path = "/node-kinds",
     request_body = CreateNodeKindParameters,
-    responses((status = 201, description = "Node kind created", body = NodeKindResponse))
+    responses((status = 201, description = "Node kind created", body = ApiSuccess<NodeKindResponse>))
 )]
 pub async fn create_node_kind(
     State(state): State<AppState>,
@@ -206,7 +206,7 @@ pub async fn list_node_kinds(
     post,
     path = "/edge-types",
     request_body = CreateEdgeTypeParameters,
-    responses((status = 201, description = "Edge type created", body = EdgeTypeResponse))
+    responses((status = 201, description = "Edge type created", body = ApiSuccess<EdgeTypeResponse>))
 )]
 pub async fn create_edge_type(
     State(state): State<AppState>,
@@ -240,7 +240,7 @@ pub async fn list_edge_types(
     tag = "Graph",
     get,
     path = "/vocabulary",
-    responses((status = 200, description = "Node kinds, edge types and declared properties", body = VocabularyResponse))
+    responses((status = 200, description = "Node kinds, edge types and declared properties", body = ApiSuccess<VocabularyResponse>))
 )]
 pub async fn vocabulary(
     State(state): State<AppState>,
@@ -281,7 +281,7 @@ pub async fn vocabulary(
     post,
     path = "/pack",
     request_body = ApplyPackParameters,
-    responses((status = 200, description = "Vocabulary pack applied", body = PackReportResponse))
+    responses((status = 200, description = "Vocabulary pack applied", body = ApiSuccess<PackReportResponse>))
 )]
 pub async fn apply_pack(
     State(state): State<AppState>,
@@ -300,7 +300,7 @@ pub async fn apply_pack(
     post,
     path = "/nodes",
     request_body = CreateNodeParameters,
-    responses((status = 201, description = "Node created", body = NodeResponse))
+    responses((status = 201, description = "Node created", body = ApiSuccess<NodeResponse>))
 )]
 pub async fn create_node(
     State(state): State<AppState>,
@@ -327,7 +327,7 @@ pub async fn create_node(
     post,
     path = "/tasks",
     request_body = CreateTaskParameters,
-    responses((status = 201, description = "Task created", body = NodeResponse))
+    responses((status = 201, description = "Task created", body = ApiSuccess<NodeResponse>))
 )]
 pub async fn create_task(
     State(state): State<AppState>,
@@ -351,7 +351,7 @@ pub async fn create_task(
     path = "/changes",
     request_body = CreateChangeParameters,
     responses(
-        (status = 201, description = "Change recorded", body = NodeResponse),
+        (status = 201, description = "Change recorded", body = ApiSuccess<NodeResponse>),
         (status = 404, description = "A referenced task was not found"),
         (status = 409, description = "A change with this commit already exists"),
         (status = 422, description = "A referenced file is unknown, a node has the wrong kind, or properties violate the change kind")
@@ -378,7 +378,7 @@ pub async fn create_change(
     post,
     path = "/plans",
     request_body = CreatePlanParameters,
-    responses((status = 201, description = "Plan created", body = PlanResponse))
+    responses((status = 201, description = "Plan created", body = ApiSuccess<PlanResponse>))
 )]
 pub async fn create_plan(
     State(state): State<AppState>,
@@ -428,7 +428,7 @@ pub async fn create_plan(
     post,
     path = "/graph/import",
     request_body = ImportParameters,
-    responses((status = 200, description = "Batch import applied", body = ImportReportResponse))
+    responses((status = 200, description = "Batch import applied", body = ApiSuccess<ImportReportResponse>))
 )]
 pub async fn import_graph(
     State(state): State<AppState>,
@@ -447,7 +447,7 @@ pub async fn import_graph(
     get,
     path = "/nodes",
     params(ListNodesParameters),
-    responses((status = 200, description = "List nodes", body = ListNodesResponse))
+    responses((status = 200, description = "List nodes", body = ApiSuccess<ListNodesResponse>))
 )]
 pub async fn list_nodes(
     State(state): State<AppState>,
@@ -550,7 +550,7 @@ pub async fn list_nodes(
     path = "/tasks/{task_id}",
     request_body = UpdateTaskParameters,
     params(("task_id" = i64, Path, description = "Task id")),
-    responses((status = 200, description = "Task updated", body = NodeResponse))
+    responses((status = 200, description = "Task updated", body = ApiSuccess<NodeResponse>))
 )]
 pub async fn update_task(
     State(state): State<AppState>,
@@ -584,7 +584,7 @@ pub async fn update_task(
     get,
     path = "/nodes/{node_id}",
     params(("node_id" = i64, Path, description = "Node id")),
-    responses((status = 200, description = "Node", body = NodeResponse))
+    responses((status = 200, description = "Node", body = ApiSuccess<NodeResponse>))
 )]
 pub async fn get_node(
     State(state): State<AppState>,
@@ -608,7 +608,7 @@ pub async fn get_node(
     request_body = UpdateNodeParameters,
     params(("node_id" = i64, Path, description = "Node id")),
     responses(
-        (status = 200, description = "Node updated", body = NodeResponse),
+        (status = 200, description = "Node updated", body = ApiSuccess<NodeResponse>),
         (status = 404, description = "Node not found"),
         (status = 409, description = "Another node already uses that name"),
         (status = 422, description = "Empty or invalid patch")
@@ -724,7 +724,7 @@ pub async fn list_tags(
     path = "/work/pending",
     params(WorkParameters),
     responses(
-        (status = 200, description = "Unfinished tasks with their dependency state", body = WorkListResponse),
+        (status = 200, description = "Unfinished tasks with their dependency state", body = ApiSuccess<WorkListResponse>),
         (status = 404, description = "Goal or repo filter not found"),
         (status = 422, description = "Filter node has the wrong kind")
     )
@@ -764,7 +764,7 @@ pub async fn work_pending(
     path = "/work/next",
     params(WorkParameters),
     responses(
-        (status = 200, description = "Unfinished tasks whose dependencies are all done", body = WorkListResponse),
+        (status = 200, description = "Unfinished tasks whose dependencies are all done", body = ApiSuccess<WorkListResponse>),
         (status = 404, description = "Goal or repo filter not found"),
         (status = 422, description = "Filter node has the wrong kind")
     )
@@ -804,7 +804,7 @@ pub async fn work_next(
     path = "/goals/{goal_id}/tree",
     params(PageParameters, ("goal_id" = i64, Path, description = "Goal id")),
     responses(
-        (status = 200, description = "Goal with its task tree and status", body = GoalTreeResponse),
+        (status = 200, description = "Goal with its task tree and status", body = ApiSuccess<GoalTreeResponse>),
         (status = 404, description = "Goal not found"),
         (status = 422, description = "Node is not a goal")
     )
@@ -887,7 +887,7 @@ pub async fn list_neighbors(
     path = "/edges",
     params(EdgeListParameters),
     responses(
-        (status = 200, description = "Edges matching the filters", body = EdgeListResponse),
+        (status = 200, description = "Edges matching the filters", body = ApiSuccess<EdgeListResponse>),
         (status = 422, description = "Edge type filter is not defined")
     )
 )]
@@ -1010,7 +1010,7 @@ pub async fn remove_edge(
     get,
     path = "/search",
     params(SearchParameters),
-    responses((status = 200, description = "Full-text and tag search", body = SearchResponse))
+    responses((status = 200, description = "Full-text and tag search", body = ApiSuccess<SearchResponse>))
 )]
 pub async fn search(
     State(state): State<AppState>,
@@ -1070,7 +1070,7 @@ pub async fn search(
     path = "/query",
     request_body = QueryParameters,
     responses(
-        (status = 200, description = "Read-only node or edge query", body = QueryResponse),
+        (status = 200, description = "Read-only node or edge query", body = ApiSuccess<QueryResponse>),
         (status = 422, description = "Unknown filter, field, order or vocabulary name")
     )
 )]
@@ -1091,7 +1091,7 @@ pub async fn query(
     get,
     path = "/graph/export",
     responses(
-        (status = 200, description = "Compact node and edge snapshot", body = GraphExportResponse),
+        (status = 200, description = "Compact node and edge snapshot", body = ApiSuccess<GraphExportResponse>),
         (status = 413, description = "Graph exceeds the export limits")
     )
 )]
@@ -1111,7 +1111,7 @@ pub async fn graph_export(
     tag = "Graph",
     get,
     path = "/graph-health",
-    responses((status = 200, description = "Read-only graph shape report", body = GraphHealthResponse))
+    responses((status = 200, description = "Read-only graph shape report", body = ApiSuccess<GraphHealthResponse>))
 )]
 pub async fn graph_health(
     State(state): State<AppState>,

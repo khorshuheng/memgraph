@@ -10,7 +10,7 @@ use crate::dto::{
     get,
     path = "/health",
     responses(
-        (status = 200, description = "Health check passed", body = HealthCheckResponse)
+        (status = 200, description = "Health check passed", body = ApiSuccess<HealthCheckResponse>)
     )
 )]
 pub async fn health_check() -> Result<ApiSuccess<HealthCheckResponse>, ApiError> {

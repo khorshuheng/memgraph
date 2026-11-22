@@ -172,6 +172,13 @@ async fn idempotency(State(state): State<AppState>, request: Request, next: Next
         .with_hint("retry shortly")
         .with_retryable()
         .into_response(),
+        IdempotencyReservation::Stale => ApiError::new(
+            StatusCode::CONFLICT,
+            "idempotency_key_stale",
+            "this Idempotency-Key was used before the response format changed",
+        )
+        .with_hint("retry with a new Idempotency-Key")
+        .into_response(),
     }
 }
 

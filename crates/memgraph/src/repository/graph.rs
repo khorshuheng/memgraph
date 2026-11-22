@@ -25,6 +25,7 @@ const NODE_COLUMNS: &str =
     "id, kind_id, name, description, content, version, created_at, updated_at";
 const NODE_COLUMNS_QUALIFIED: &str =
     "n.id, n.kind_id, n.name, n.description, n.content, n.version, n.created_at, n.updated_at";
+const IDEMPOTENCY_RESPONSE_VERSION: i64 = 2;
 const MAX_EXPORT_NODES: i64 = 50_000;
 const MAX_EXPORT_EDGES: i64 = 200_000;
 const OUTGOING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
@@ -146,6 +147,7 @@ pub enum IdempotencyReservation {
     Replay { status: u16, body: Vec<u8> },
     Conflict,
     InProgress,
+    Stale,
 }
 
 #[derive(Debug, Clone)]
@@ -3112,26 +3114,34 @@ async fn idempotency_reserve_items(
     .execute(&mut *connection)
     .await?;
     let inserted = sqlx::query(
-        "INSERT INTO idempotency_key (key, method, path, request_body) \
-         VALUES (?, ?, ?, ?) ON CONFLICT(key) DO NOTHING",
+        "INSERT INTO idempotency_key (key, method, path, request_body, schema_version) \
+         VALUES (?, ?, ?, ?, ?) ON CONFLICT(key) DO NOTHING",
     )
     .bind(key)
     .bind(method)
     .bind(path)
     .bind(body.to_vec())
+    .bind(IDEMPOTENCY_RESPONSE_VERSION)
     .execute(&mut *connection)
     .await?;
     if inserted.rows_affected() == 1 {
         return Ok(IdempotencyReservation::Reserved);
     }
-    let row = sqlx::query_as::<_, (String, String, Vec<u8>, Option<i64>, Option<Vec<u8>>)>(
-        "SELECT method, path, request_body, status, response_body \
+    let row = sqlx::query_as::<_, (String, String, Vec<u8>, Option<i64>, Option<Vec<u8>>, i64)>(
+        "SELECT method, path, request_body, status, response_body, schema_version \
          FROM idempotency_key WHERE key = ?",
     )
     .bind(key)
     .fetch_optional(&mut *connection)
     .await?
     .ok_or_else(|| RepositoryError::SqlExecutionError("idempotency row vanished".to_string()))?;
+    if row.5 != IDEMPOTENCY_RESPONSE_VERSION {
+        sqlx::query("DELETE FROM idempotency_key WHERE key = ?")
+            .bind(key)
+            .execute(&mut *connection)
+            .await?;
+        return Ok(IdempotencyReservation::Stale);
+    }
     if row.0 != method || row.1 != path || row.2 != body {
         return Ok(IdempotencyReservation::Conflict);
     }

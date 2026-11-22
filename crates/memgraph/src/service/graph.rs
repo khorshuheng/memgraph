@@ -8576,6 +8576,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idempotency_rejects_responses_from_an_older_schema() {
+        let (service, pool) = service_with_pool().await;
+        sqlx::query(
+            "INSERT INTO idempotency_key \
+             (key, method, path, request_body, status, response_body, schema_version) \
+             VALUES ('old', 'POST', '/api/nodes', ?, 201, ?, 1)",
+        )
+        .bind(b"{}".to_vec())
+        .bind(b"{\"id\":1}".to_vec())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            service
+                .idempotency_reserve("old", "POST", "/api/nodes", b"{}")
+                .await
+                .unwrap(),
+            IdempotencyReservation::Stale
+        );
+        assert_eq!(
+            service
+                .idempotency_reserve("old", "POST", "/api/nodes", b"{}")
+                .await
+                .unwrap(),
+            IdempotencyReservation::Reserved
+        );
+    }
+
+    #[tokio::test]
     async fn idempotency_reservations_expire_when_stale() {
         let (service, pool) = service_with_pool().await;
         assert_eq!(

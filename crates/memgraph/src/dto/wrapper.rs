@@ -4,14 +4,15 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use utoipa::ToSchema;
 
-#[derive(Debug, Serialize)]
-pub struct ApiSuccess<T: Serialize> {
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiSuccess<T: Serialize + ToSchema> {
     #[serde(skip_serializing)]
+    #[schema(ignore)]
     pub status: StatusCode,
     pub data: T,
 }
 
-impl<T: Serialize> IntoResponse for ApiSuccess<T> {
+impl<T: Serialize + ToSchema> IntoResponse for ApiSuccess<T> {
     fn into_response(self) -> Response {
         (self.status, Json(self)).into_response()
     }
