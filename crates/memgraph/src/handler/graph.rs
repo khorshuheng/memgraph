@@ -1310,6 +1310,9 @@ mod tests {
                 description: Some("changed".to_string()),
                 content: None,
                 properties: None,
+                parent: None,
+                depends_on: None,
+                affects: None,
                 tags: Some(vec!["Other".to_string()]),
             }),
         )
@@ -1327,6 +1330,9 @@ mod tests {
                 description: Some("again".to_string()),
                 content: None,
                 properties: None,
+                parent: None,
+                depends_on: None,
+                affects: None,
                 tags: None,
             }),
         )
@@ -1344,6 +1350,9 @@ mod tests {
                 description: None,
                 content: None,
                 properties: None,
+                parent: None,
+                depends_on: None,
+                affects: None,
                 tags: Some(vec![]),
             }),
         )
@@ -1563,6 +1572,9 @@ mod tests {
                 description: None,
                 content: None,
                 properties: None,
+                parent: None,
+                depends_on: None,
+                affects: None,
                 tags: None,
             }),
         )
@@ -2513,6 +2525,113 @@ mod tests {
         .await
         .expect("pending");
         assert!(pending.data.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_patch_updates_wiring_and_upsert_keeps_parent() {
+        let state = test_state().await;
+        let goal = seed_anchored_goal(&state).await;
+        let first = create_task(
+            State(state.clone()),
+            Json(CreateTaskParameters {
+                id: None,
+                name: "wiring first".to_string(),
+                description: String::new(),
+                content: String::new(),
+                parent: Some(goal),
+                depends_on: vec![],
+                affects: vec![],
+                properties: None,
+                tags: None,
+            }),
+        )
+        .await
+        .expect("first task")
+        .data;
+        let second = create_task(
+            State(state.clone()),
+            Json(CreateTaskParameters {
+                id: None,
+                name: "wiring second".to_string(),
+                description: String::new(),
+                content: String::new(),
+                parent: Some(goal),
+                depends_on: vec![],
+                affects: vec![],
+                properties: None,
+                tags: None,
+            }),
+        )
+        .await
+        .expect("second task")
+        .data;
+
+        let updated = update_task(
+            State(state.clone()),
+            Path(first.id),
+            HeaderMap::new(),
+            Json(UpdateTaskParameters {
+                name: None,
+                description: None,
+                content: None,
+                properties: None,
+                tags: None,
+                parent: Some(second.id),
+                depends_on: Some(vec![second.id]),
+                affects: Some(vec![]),
+            }),
+        )
+        .await
+        .expect("patch wiring")
+        .data;
+        assert_eq!(updated.version, first.version + 1);
+
+        let parents = state
+            .graph_service
+            .neighbors(
+                first.id,
+                crate::model::NeighborDirection::Outgoing,
+                Some("part_of"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            parents
+                .iter()
+                .map(|neighbor| neighbor.node.id)
+                .collect::<Vec<_>>(),
+            vec![second.id]
+        );
+
+        let upserted = create_task(
+            State(state.clone()),
+            Json(CreateTaskParameters {
+                id: Some(first.id),
+                name: "wiring first".to_string(),
+                description: "changed".to_string(),
+                content: String::new(),
+                parent: None,
+                depends_on: vec![],
+                affects: vec![],
+                properties: None,
+                tags: None,
+            }),
+        )
+        .await
+        .expect("upsert without parent")
+        .data;
+        assert_eq!(upserted.description, "changed");
+        let parents = state
+            .graph_service
+            .neighbors(
+                first.id,
+                crate::model::NeighborDirection::Outgoing,
+                Some("part_of"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].node.id, second.id);
     }
 
     #[tokio::test]

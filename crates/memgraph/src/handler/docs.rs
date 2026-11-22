@@ -168,13 +168,13 @@ pub const ENDPOINTS: &[EndpointDoc] = &[
     EndpointDoc {
         method: "POST",
         path: "/api/tasks",
-        description: "Create or upsert a task under a goal or task.",
+        description: "Create or upsert a task under a goal or task; parent may be omitted on an upsert.",
         example: "curl -X POST $BASE/api/tasks -H 'content-type: application/json' -d '{\"name\":\"new task\",\"description\":\"\",\"content\":\"\",\"parent\":119}'",
     },
     EndpointDoc {
         method: "PATCH",
         path: "/api/tasks/{task_id}",
-        description: "Patch a task's fields, tags or properties.",
+        description: "Patch a task's fields, tags, properties or wiring (parent, depends_on, affects).",
         example: "curl -X PATCH $BASE/api/tasks/120 -H 'content-type: application/json' -d '{\"tags\":[\"phase:p0\"]}'",
     },
     EndpointDoc {

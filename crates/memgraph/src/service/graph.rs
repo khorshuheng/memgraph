@@ -619,7 +619,7 @@ impl GraphService {
     ) -> Result<Node, ServiceError> {
         if patch.is_empty() {
             return Err(ServiceError::UnprocessableEntity(
-                "provide at least one of name, description, content or tags".to_string(),
+                "provide at least one field, tag or wiring change".to_string(),
             ));
         }
         let node = self.get_node(task_id).await?;
@@ -629,16 +629,91 @@ impl GraphService {
                 "node {task_id} is not a task"
             )));
         }
+        let needs_wiring =
+            patch.parent.is_some() || patch.depends_on.is_some() || patch.affects.is_some();
+        if needs_wiring {
+            if patch.parent == Some(task_id) {
+                return Err(ServiceError::UnprocessableEntity(
+                    "a task cannot be its own parent".to_string(),
+                ));
+            }
+            let mut referenced = Vec::new();
+            if let Some(parent) = patch.parent {
+                referenced.push(parent);
+            }
+            if let Some(depends_on) = &patch.depends_on {
+                referenced.extend(depends_on.iter().copied());
+            }
+            if let Some(affects) = &patch.affects {
+                referenced.extend(affects.iter().copied());
+            }
+            let kinds = self.node_kind_names(&referenced).await?;
+            let edge_types = self.repository.list_edge_types().await?;
+            if let Some(parent) = patch.parent {
+                let part_of = edge_type_ref(&edge_types, "part_of")?;
+                require_kind(
+                    &kinds,
+                    parent,
+                    &part_of.destination_kind_list(),
+                    "part_of parent",
+                )?;
+                if !self.repository.is_anchored(parent).await? {
+                    return Err(ServiceError::UnprocessableEntity(format!(
+                        "part_of parent references node {parent}, which is not attached to a repo via belongs_to"
+                    )));
+                }
+            }
+            if let Some(depends_on) = &patch.depends_on {
+                let edge = edge_type_ref(&edge_types, "depends_on")?;
+                require_kinds_for(
+                    &kinds,
+                    depends_on,
+                    &edge.destination_kind_list(),
+                    "depends_on target",
+                )?;
+            }
+            if let Some(affects) = &patch.affects {
+                let edge = edge_type_ref(&edge_types, "affects")?;
+                require_kinds_for(
+                    &kinds,
+                    affects,
+                    &edge.destination_kind_list(),
+                    "affects target",
+                )?;
+            }
+        }
+        let mut node_patch = NodePatch {
+            name: patch.name.clone(),
+            description: patch.description.clone(),
+            content: patch.content.clone(),
+            tags: patch.tags.clone(),
+            properties: patch.properties.clone(),
+        };
+        if let Some(name) = &node_patch.name {
+            node_patch.name = Some(node_name(name)?);
+        }
+        if let Some(tags) = &node_patch.tags {
+            node_patch.tags = Some(normalize_tags(tags)?);
+        }
+        if let Some(properties) = &node_patch.properties
+            && !properties.is_object()
+        {
+            return Err(ServiceError::UnprocessableEntity(
+                "properties must be a JSON object".to_string(),
+            ));
+        }
+        if let Some(name) = &node_patch.name {
+            self.require_available_name(task_kind, name, task_id)
+                .await?;
+        }
         let (updated, _) = self
-            .update_node_with_version(
+            .repository
+            .update_task(
                 task_id,
-                &NodePatch {
-                    name: patch.name.clone(),
-                    description: patch.description.clone(),
-                    content: patch.content.clone(),
-                    tags: patch.tags.clone(),
-                    properties: patch.properties.clone(),
-                },
+                &node_patch,
+                patch.parent,
+                patch.depends_on.as_deref(),
+                patch.affects.as_deref(),
                 expected_version,
             )
             .await?;
@@ -658,12 +733,21 @@ impl GraphService {
                 draft.id
             )));
         }
-        let Some(parent) = draft.parent else {
-            return Err(ServiceError::UnprocessableEntity(
-                "a task requires a parent: provide the goal or task it belongs to".to_string(),
-            ));
-        };
         let task_kind = self.kind_id("task").await?;
+        if draft.parent.is_none() {
+            if draft.id == 0 {
+                return Err(ServiceError::UnprocessableEntity(
+                    "a task requires a parent: provide the goal or task it belongs to".to_string(),
+                ));
+            }
+            let existing = self.get_node(draft.id).await?;
+            if existing.kind_id != task_kind {
+                return Err(ServiceError::UnprocessableEntity(format!(
+                    "node {} is not a task",
+                    draft.id
+                )));
+            }
+        }
         self.require_available_name(task_kind, &draft.name, draft.id)
             .await?;
         let edge_types = self.repository.list_edge_types().await?;
@@ -680,12 +764,14 @@ impl GraphService {
         referenced.extend(draft.depends_on.iter().copied());
         referenced.extend(draft.affects.iter().copied());
         let kinds = self.node_kind_names(&referenced).await?;
-        require_kind(
-            &kinds,
-            parent,
-            &part_of.destination_kind_list(),
-            "part_of parent",
-        )?;
+        if let Some(parent) = draft.parent {
+            require_kind(
+                &kinds,
+                parent,
+                &part_of.destination_kind_list(),
+                "part_of parent",
+            )?;
+        }
         require_kinds_for(
             &kinds,
             &draft.depends_on,
@@ -698,7 +784,9 @@ impl GraphService {
             &affects.destination_kind_list(),
             "affects target",
         )?;
-        if !self.repository.is_anchored(parent).await? {
+        if let Some(parent) = draft.parent
+            && !self.repository.is_anchored(parent).await?
+        {
             return Err(ServiceError::UnprocessableEntity(format!(
                 "part_of parent references node {parent}, which is not attached to a repo via belongs_to"
             )));
@@ -714,11 +802,13 @@ impl GraphService {
             updated_at: String::new(),
         };
         let mut edges = Vec::new();
-        edges.push(PendingEdge {
-            source: NodeRef::New(0),
-            destination: NodeRef::Existing(parent),
-            edge_type_id: part_of.id,
-        });
+        if let Some(parent) = draft.parent {
+            edges.push(PendingEdge {
+                source: NodeRef::New(0),
+                destination: NodeRef::Existing(parent),
+                edge_type_id: part_of.id,
+            });
+        }
         for dependency in &draft.depends_on {
             edges.push(PendingEdge {
                 source: NodeRef::New(0),
@@ -3277,6 +3367,9 @@ mod tests {
                     description: Some("recalibrated widget".to_string()),
                     content: None,
                     properties: None,
+                    parent: None,
+                    depends_on: None,
+                    affects: None,
                     tags: None,
                 },
             )
@@ -3326,6 +3419,9 @@ mod tests {
                         description: None,
                         content: None,
                         properties: None,
+                        parent: None,
+                        depends_on: None,
+                        affects: None,
                         tags: None,
                     },
                 )
@@ -3341,6 +3437,9 @@ mod tests {
                         description: Some("x".to_string()),
                         content: None,
                         properties: None,
+                        parent: None,
+                        depends_on: None,
+                        affects: None,
                         tags: None,
                     },
                 )
@@ -3356,6 +3455,9 @@ mod tests {
                         description: Some("x".to_string()),
                         content: None,
                         properties: None,
+                        parent: None,
+                        depends_on: None,
+                        affects: None,
                         tags: None,
                     },
                 )
@@ -5773,6 +5875,9 @@ mod tests {
                                 description: None,
                                 content: None,
                                 properties: None,
+                                parent: None,
+                                depends_on: None,
+                                affects: None,
                                 tags: None,
                             },
                         )
@@ -7507,6 +7612,9 @@ mod tests {
                     description: None,
                     content: None,
                     properties: None,
+                    parent: None,
+                    depends_on: None,
+                    affects: None,
                     tags: Some(vec!["other".to_string()]),
                 },
             )
@@ -8482,6 +8590,168 @@ mod tests {
                 .unwrap(),
             IdempotencyReservation::Reserved
         );
+    }
+
+    #[tokio::test]
+    async fn task_patches_replace_wiring() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+        let file_kind = seeded_kind(&service, "file").await;
+        let file = service
+            .upsert_node(&node(file_kind, "src/lib.rs", ""))
+            .await
+            .unwrap();
+
+        let mut first = new_task("wiring first");
+        first.parent = Some(goal);
+        let first = service.create_task(&first).await.unwrap();
+        let mut second = new_task("wiring second");
+        second.parent = Some(goal);
+        let second = service.create_task(&second).await.unwrap();
+        let mut third = new_task("wiring third");
+        third.parent = Some(goal);
+        third.depends_on = vec![second.id];
+        third.affects = vec![file.id];
+        let third = service.create_task(&third).await.unwrap();
+
+        let patch = TaskPatch {
+            parent: Some(second.id),
+            depends_on: Some(vec![first.id]),
+            affects: Some(vec![]),
+            ..Default::default()
+        };
+        let updated = service.update_task(third.id, &patch).await.unwrap();
+        assert_eq!(updated.version, third.version + 1);
+
+        let parents = service
+            .neighbors(third.id, NeighborDirection::Outgoing, Some("part_of"))
+            .await
+            .unwrap();
+        assert_eq!(
+            parents
+                .iter()
+                .map(|neighbor| neighbor.node.id)
+                .collect::<Vec<_>>(),
+            vec![second.id]
+        );
+        let dependencies = service
+            .neighbors(third.id, NeighborDirection::Outgoing, Some("depends_on"))
+            .await
+            .unwrap();
+        assert_eq!(
+            dependencies
+                .iter()
+                .map(|neighbor| neighbor.node.id)
+                .collect::<Vec<_>>(),
+            vec![first.id]
+        );
+        let affected = service
+            .neighbors(third.id, NeighborDirection::Outgoing, Some("affects"))
+            .await
+            .unwrap();
+        assert!(affected.is_empty());
+
+        let cleared = TaskPatch {
+            depends_on: Some(vec![]),
+            ..Default::default()
+        };
+        service.update_task(third.id, &cleared).await.unwrap();
+        assert!(
+            service
+                .neighbors(third.id, NeighborDirection::Outgoing, Some("depends_on"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(matches!(
+            service
+                .update_task_checked(third.id, &patch, third.version)
+                .await,
+            Err(ServiceError::PreconditionFailed(_))
+        ));
+
+        for invalid in [
+            TaskPatch {
+                parent: Some(file.id),
+                ..Default::default()
+            },
+            TaskPatch {
+                parent: Some(third.id),
+                ..Default::default()
+            },
+            TaskPatch {
+                depends_on: Some(vec![file.id]),
+                ..Default::default()
+            },
+            TaskPatch {
+                affects: Some(vec![first.id]),
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                service.update_task(third.id, &invalid).await,
+                Err(ServiceError::UnprocessableEntity(_))
+            ));
+        }
+
+        let cycle = TaskPatch {
+            parent: Some(third.id),
+            ..Default::default()
+        };
+        assert!(matches!(
+            service.update_task(second.id, &cycle).await,
+            Err(ServiceError::UnprocessableEntity(_)) | Err(ServiceError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn task_upserts_can_omit_the_parent() {
+        let service = service().await;
+        let repo = seeded_repo(&service).await;
+        let goal = anchored_goal(&service, repo).await;
+        let mut task = new_task("parent optional");
+        task.parent = Some(goal);
+        let task = service.create_task(&task).await.unwrap();
+
+        let mut upsert = new_task("parent optional");
+        upsert.id = task.id;
+        upsert.description = "changed".to_string();
+        let updated = service.create_task(&upsert).await.unwrap();
+        assert_eq!(updated.description, "changed");
+        assert_eq!(
+            service
+                .neighbors(task.id, NeighborDirection::Outgoing, Some("part_of"))
+                .await
+                .unwrap()
+                .iter()
+                .map(|neighbor| neighbor.node.id)
+                .collect::<Vec<_>>(),
+            vec![goal]
+        );
+
+        let mut new_without_parent = new_task("no parent");
+        assert!(matches!(
+            service.create_task(&new_without_parent).await,
+            Err(ServiceError::UnprocessableEntity(message)) if message.contains("requires a parent")
+        ));
+        new_without_parent.id = 999_999;
+        assert!(matches!(
+            service.create_task(&new_without_parent).await,
+            Err(ServiceError::EntityNotFound)
+        ));
+        let goal_kind = seeded_kind(&service, "goal").await;
+        let goal_node = service
+            .upsert_node(&node(goal_kind, "not a task", ""))
+            .await
+            .unwrap();
+        let mut wrong_kind = new_task("not a task upsert");
+        wrong_kind.id = goal_node.id;
+        assert!(matches!(
+            service.create_task(&wrong_kind).await,
+            Err(ServiceError::UnprocessableEntity(message)) if message.contains("not a task")
+        ));
     }
 
     #[tokio::test]

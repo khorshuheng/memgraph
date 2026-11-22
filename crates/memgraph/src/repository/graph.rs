@@ -168,6 +168,15 @@ pub trait GraphRepository: Send + Sync {
         patch: &NodePatch,
         expected_version: Option<i64>,
     ) -> Result<(Node, Vec<String>), RepositoryError>;
+    async fn update_task(
+        &self,
+        node_id: i64,
+        patch: &NodePatch,
+        parent: Option<i64>,
+        depends_on: Option<&[i64]>,
+        affects: Option<&[i64]>,
+        expected_version: Option<i64>,
+    ) -> Result<(Node, Vec<String>), RepositoryError>;
 
     async fn upsert_node(&self, node: &Node) -> Result<Node, RepositoryError>;
     async fn upsert_node_with_tags(
@@ -330,6 +339,45 @@ impl SqliteGraphRepository {
             .await
             .map_err(RepositoryError::from)?;
         match update_node_items(&mut connection, node_id, patch, expected_version).await {
+            Ok(result) => {
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(RepositoryError::from(error));
+                }
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn update_task_once(
+        &self,
+        node_id: i64,
+        patch: &NodePatch,
+        parent: Option<i64>,
+        depends_on: Option<&[i64]>,
+        affects: Option<&[i64]>,
+        expected_version: Option<i64>,
+    ) -> Result<(Node, Vec<String>), RepositoryError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .map_err(RepositoryError::from)?;
+        match update_task_items(
+            &mut connection,
+            node_id,
+            patch,
+            parent,
+            depends_on,
+            affects,
+            expected_version,
+        )
+        .await
+        {
             Ok(result) => {
                 if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
                     let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
@@ -541,6 +589,41 @@ impl GraphRepository for SqliteGraphRepository {
             attempt += 1;
             match self
                 .update_node_once(node_id, patch, expected_version)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(RepositoryError::Busy(error)) => {
+                    if attempt >= 3 {
+                        return Err(RepositoryError::Busy(error));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50 * attempt)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn update_task(
+        &self,
+        node_id: i64,
+        patch: &NodePatch,
+        parent: Option<i64>,
+        depends_on: Option<&[i64]>,
+        affects: Option<&[i64]>,
+        expected_version: Option<i64>,
+    ) -> Result<(Node, Vec<String>), RepositoryError> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self
+                .update_task_once(
+                    node_id,
+                    patch,
+                    parent,
+                    depends_on,
+                    affects,
+                    expected_version,
+                )
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -2344,6 +2427,90 @@ async fn node_kind_name(
     .fetch_optional(&mut *connection)
     .await?;
     name.ok_or_else(|| RepositoryError::ContractViolation(format!("node {node_id} does not exist")))
+}
+
+async fn update_task_items(
+    connection: &mut SqliteConnection,
+    node_id: i64,
+    patch: &NodePatch,
+    parent: Option<i64>,
+    depends_on: Option<&[i64]>,
+    affects: Option<&[i64]>,
+    expected_version: Option<i64>,
+) -> Result<(Node, Vec<String>), RepositoryError> {
+    let before_version = sqlx::query_scalar::<_, i64>("SELECT version FROM node WHERE id = ?")
+        .bind(node_id)
+        .fetch_optional(&mut *connection)
+        .await?;
+    let (mut node, tags) = update_node_items(connection, node_id, patch, expected_version).await?;
+    let fields_changed = before_version.is_some_and(|version| node.version != version);
+    let mut wiring_changed = false;
+    if let Some(parent) = parent {
+        wiring_changed |= replace_edge_set(connection, node_id, "part_of", &[parent]).await?;
+    }
+    if let Some(targets) = depends_on {
+        wiring_changed |= replace_edge_set(connection, node_id, "depends_on", targets).await?;
+    }
+    if let Some(targets) = affects {
+        wiring_changed |= replace_edge_set(connection, node_id, "affects", targets).await?;
+    }
+    if wiring_changed && !fields_changed {
+        node = sqlx::query_as::<_, Node>(&format!(
+            "UPDATE node SET version = version + 1, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ? RETURNING {NODE_COLUMNS}"
+        ))
+        .bind(node_id)
+        .fetch_one(&mut *connection)
+        .await?;
+    }
+    Ok((node, tags))
+}
+
+async fn replace_edge_set(
+    connection: &mut SqliteConnection,
+    source: i64,
+    edge_type_name: &str,
+    targets: &[i64],
+) -> Result<bool, RepositoryError> {
+    let edge_type_id = sqlx::query_scalar::<_, i64>("SELECT id FROM edge_type WHERE name = ?")
+        .bind(edge_type_name)
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| {
+            RepositoryError::ContractViolation(format!(
+                "edge type '{edge_type_name}' is not defined"
+            ))
+        })?;
+    let current: Vec<i64> = sqlx::query_scalar::<_, i64>(
+        "SELECT destination FROM edge WHERE source = ? AND edge_type_id = ?",
+    )
+    .bind(source)
+    .bind(edge_type_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    let current: HashSet<i64> = current.into_iter().collect();
+    let desired: HashSet<i64> = targets.iter().copied().collect();
+    if current == desired {
+        return Ok(false);
+    }
+    for destination in current.difference(&desired) {
+        sqlx::query("DELETE FROM edge WHERE source = ? AND destination = ? AND edge_type_id = ?")
+            .bind(source)
+            .bind(*destination)
+            .bind(edge_type_id)
+            .execute(&mut *connection)
+            .await?;
+    }
+    for destination in desired.difference(&current) {
+        sqlx::query("INSERT INTO edge (source, destination, edge_type_id) VALUES (?, ?, ?)")
+            .bind(source)
+            .bind(*destination)
+            .bind(edge_type_id)
+            .execute(&mut *connection)
+            .await?;
+    }
+    Ok(true)
 }
 
 async fn update_node_items(

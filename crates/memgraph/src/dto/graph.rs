@@ -1321,7 +1321,9 @@ impl From<UpdateNodeParameters> for NodePatch {
 #[schema(
     description = "A task patch. Omitted tags leave the current tags unchanged; an empty \
                    list clears them. Tags are trimmed, lowercased and deduplicated; blank \
-                   tags and more than 64 tags are rejected."
+                   tags and more than 64 tags are rejected. parent moves the task \
+                   under one new part_of parent; depends_on and affects replace the \
+                   whole edge set when supplied and clear it when empty."
 )]
 pub struct UpdateTaskParameters {
     pub name: Option<String>,
@@ -1331,6 +1333,12 @@ pub struct UpdateTaskParameters {
     pub properties: Option<serde_json::Value>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub parent: Option<i64>,
+    #[serde(default)]
+    pub depends_on: Option<Vec<i64>>,
+    #[serde(default)]
+    pub affects: Option<Vec<i64>>,
 }
 
 impl From<UpdateTaskParameters> for TaskPatch {
@@ -1341,6 +1349,9 @@ impl From<UpdateTaskParameters> for TaskPatch {
             content: params.content,
             properties: params.properties,
             tags: params.tags,
+            parent: params.parent,
+            depends_on: params.depends_on,
+            affects: params.affects,
         }
     }
 }

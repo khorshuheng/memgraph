@@ -751,13 +751,16 @@ impl NodePatch {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TaskPatch {
     pub name: Option<String>,
     pub description: Option<String>,
     pub content: Option<String>,
     pub properties: Option<serde_json::Value>,
     pub tags: Option<Vec<String>>,
+    pub parent: Option<i64>,
+    pub depends_on: Option<Vec<i64>>,
+    pub affects: Option<Vec<i64>>,
 }
 
 impl TaskPatch {
@@ -767,6 +770,9 @@ impl TaskPatch {
             && self.content.is_none()
             && self.properties.is_none()
             && self.tags.is_none()
+            && self.parent.is_none()
+            && self.depends_on.is_none()
+            && self.affects.is_none()
     }
 }
 
