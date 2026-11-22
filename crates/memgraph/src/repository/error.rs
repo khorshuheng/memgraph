@@ -23,6 +23,8 @@ pub enum RepositoryError {
     Busy(String),
     #[error("limit exceeded: {0}")]
     LimitExceeded(String),
+    #[error("precondition failed: {0}")]
+    PreconditionFailed(String),
 }
 
 impl From<sqlx::Error> for RepositoryError {

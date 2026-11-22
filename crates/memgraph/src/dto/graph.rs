@@ -216,6 +216,7 @@ impl From<CreateNodeParameters> for NodeModel {
             name: params.name,
             description: params.description,
             content: params.content,
+            version: 0,
             updated_at: String::new(),
         }
     }
@@ -231,6 +232,7 @@ pub struct NodeResponse {
     pub content: String,
     pub tags: Vec<String>,
     pub properties: serde_json::Value,
+    pub version: i64,
     pub updated_at: String,
 }
 
@@ -249,6 +251,7 @@ impl NodeResponse {
             content: node.content,
             tags,
             properties,
+            version: node.version,
             updated_at: node.updated_at,
         }
     }
@@ -265,6 +268,7 @@ impl From<NodeModel> for NodeResponse {
             content: node.content,
             tags: Vec::new(),
             properties: serde_json::json!({}),
+            version: node.version,
             updated_at: node.updated_at,
         }
     }

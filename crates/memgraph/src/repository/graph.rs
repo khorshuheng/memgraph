@@ -21,19 +21,19 @@ const NODE_KIND_COLUMNS: &str =
     "id, version, name, description, unique_name, strict_properties, updated_at";
 const EDGE_TYPE_COLUMNS: &str = "id, name, description, resolves, single_outgoing, acyclic, source_kinds, destination_kinds, \
      updated_at";
-const NODE_COLUMNS: &str = "id, kind_id, name, description, content, updated_at";
+const NODE_COLUMNS: &str = "id, kind_id, name, description, content, version, updated_at";
 const MAX_EXPORT_NODES: i64 = 50_000;
 const MAX_EXPORT_EDGES: i64 = 200_000;
 const OUTGOING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
     e.properties AS edge_properties, \
-    n.id, n.kind_id, n.name, n.description, n.content, n.updated_at \
+    n.id, n.kind_id, n.name, n.description, n.content, n.version, n.updated_at \
     FROM edge e JOIN node n ON n.id = e.destination \
     WHERE e.source = ? \
       AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
     ORDER BY e.edge_type_id, e.destination";
 const INCOMING_NEIGHBORS: &str = "SELECT e.source, e.destination, e.edge_type_id, e.created_at, \
     e.properties AS edge_properties, \
-    n.id, n.kind_id, n.name, n.description, n.content, n.updated_at \
+    n.id, n.kind_id, n.name, n.description, n.content, n.version, n.updated_at \
     FROM edge e JOIN node n ON n.id = e.source \
     WHERE e.destination = ? \
       AND (? IS NULL OR e.edge_type_id = (SELECT id FROM edge_type WHERE name = ?)) \
@@ -136,6 +136,14 @@ pub struct NodeQuerySnapshot {
     pub properties: HashMap<i64, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdempotencyReservation {
+    Reserved,
+    Replay { status: u16, body: Vec<u8> },
+    Conflict,
+    InProgress,
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeBatchSnapshot {
     pub nodes: Vec<Node>,
@@ -156,6 +164,7 @@ pub trait GraphRepository: Send + Sync {
         &self,
         node_id: i64,
         patch: &NodePatch,
+        expected_version: Option<i64>,
     ) -> Result<(Node, Vec<String>), RepositoryError>;
 
     async fn upsert_node(&self, node: &Node) -> Result<Node, RepositoryError>;
@@ -229,6 +238,20 @@ pub trait GraphRepository: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<QueryEdgeRow>, i64), RepositoryError>;
+    async fn idempotency_reserve(
+        &self,
+        key: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<IdempotencyReservation, RepositoryError>;
+    async fn idempotency_complete(
+        &self,
+        key: &str,
+        status: i64,
+        body: &[u8],
+    ) -> Result<(), RepositoryError>;
+    async fn idempotency_abort(&self, key: &str) -> Result<(), RepositoryError>;
     async fn work_snapshot(
         &self,
         filter: &WorkFilter,
@@ -294,19 +317,46 @@ impl SqliteGraphRepository {
         &self,
         node_id: i64,
         patch: &NodePatch,
+        expected_version: Option<i64>,
     ) -> Result<(Node, Vec<String>), RepositoryError> {
         let mut connection = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *connection)
             .await
             .map_err(RepositoryError::from)?;
-        match update_node_items(&mut connection, node_id, patch).await {
+        match update_node_items(&mut connection, node_id, patch, expected_version).await {
             Ok(result) => {
                 if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
                     let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
                     return Err(RepositoryError::from(error));
                 }
                 Ok(result)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn upsert_node_with_tags_once(
+        &self,
+        node: &Node,
+        tags: &[String],
+        properties: Option<&serde_json::Value>,
+    ) -> Result<Node, RepositoryError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .map_err(RepositoryError::from)?;
+        match upsert_node_with_tags_items(&mut connection, node, tags, properties).await {
+            Ok(row) => {
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(RepositoryError::from(error));
+                }
+                Ok(row)
             }
             Err(error) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
@@ -479,11 +529,15 @@ impl GraphRepository for SqliteGraphRepository {
         &self,
         node_id: i64,
         patch: &NodePatch,
+        expected_version: Option<i64>,
     ) -> Result<(Node, Vec<String>), RepositoryError> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.update_node_once(node_id, patch).await {
+            match self
+                .update_node_once(node_id, patch, expected_version)
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(RepositoryError::Busy(error)) => {
                     if attempt >= 3 {
@@ -502,27 +556,23 @@ impl GraphRepository for SqliteGraphRepository {
         tags: &[String],
         properties: Option<&serde_json::Value>,
     ) -> Result<Node, RepositoryError> {
-        let mut transaction = self.pool.begin().await?;
-        let schema = load_kind_schema(&mut transaction, node.kind_id).await?;
-        let empty = serde_json::json!({});
-        let candidate = properties.unwrap_or(&empty);
-        if properties.is_some() || node.id == 0 {
-            validate_declared_properties(candidate, &schema.properties, schema.strict)
-                .map_err(RepositoryError::ContractViolation)?;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self
+                .upsert_node_with_tags_once(node, tags, properties)
+                .await
+            {
+                Ok(row) => return Ok(row),
+                Err(RepositoryError::Busy(error)) => {
+                    if attempt >= 3 {
+                        return Err(RepositoryError::Busy(error));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50 * attempt)).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        let row = insert_node(&mut *transaction, node).await?;
-        replace_tags(&mut transaction, row.id, tags).await?;
-        if let Some(properties) = properties {
-            let encoded = serde_json::to_string(properties)
-                .map_err(|error| RepositoryError::SqlExecutionError(error.to_string()))?;
-            sqlx::query("UPDATE node SET properties = ? WHERE id = ?")
-                .bind(encoded)
-                .bind(row.id)
-                .execute(&mut *transaction)
-                .await?;
-        }
-        transaction.commit().await?;
-        Ok(row)
     }
 
     async fn insert_nodes_with_edges(
@@ -752,7 +802,17 @@ impl GraphRepository for SqliteGraphRepository {
 
     async fn set_node_tags(&self, node_id: i64, tags: &[String]) -> Result<(), RepositoryError> {
         let mut transaction = self.pool.begin().await?;
-        replace_tags(&mut transaction, node_id, tags).await?;
+        let current = node_tags_in(&mut transaction, node_id).await?;
+        if !tags_equal(&current, tags) {
+            replace_tags(&mut transaction, node_id, tags).await?;
+            sqlx::query(
+                "UPDATE node SET version = version + 1, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+            )
+            .bind(node_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -1065,6 +1125,60 @@ impl GraphRepository for SqliteGraphRepository {
         }
     }
 
+    async fn idempotency_reserve(
+        &self,
+        key: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<IdempotencyReservation, RepositoryError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .map_err(RepositoryError::from)?;
+        let result = idempotency_reserve_items(&mut connection, key, method, path, body).await;
+        match result {
+            Ok(reservation) => {
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(RepositoryError::from(error));
+                }
+                Ok(reservation)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn idempotency_complete(
+        &self,
+        key: &str,
+        status: i64,
+        body: &[u8],
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE idempotency_key SET status = ?, response_body = ? \
+             WHERE key = ? AND status IS NULL",
+        )
+        .bind(status)
+        .bind(body.to_vec())
+        .bind(key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn idempotency_abort(&self, key: &str) -> Result<(), RepositoryError> {
+        sqlx::query("DELETE FROM idempotency_key WHERE key = ? AND status IS NULL")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn search_nodes(
         &self,
         query: Option<&str>,
@@ -1097,8 +1211,8 @@ impl GraphRepository for SqliteGraphRepository {
 
         let rows = if let Some(fts_query) = query {
             let mut builder = QueryBuilder::new(
-                "SELECT n.id, n.kind_id, n.name, n.description, n.content, n.updated_at, \
-                 bm25(node_fts) AS score FROM node_fts \
+                "SELECT n.id, n.kind_id, n.name, n.description, n.content, n.version, \
+                 n.updated_at, bm25(node_fts) AS score FROM node_fts \
                  JOIN node n ON n.id = node_fts.rowid WHERE node_fts MATCH ",
             );
             builder.push_bind(fts_query);
@@ -1114,8 +1228,8 @@ impl GraphRepository for SqliteGraphRepository {
                 .await?
         } else {
             let mut builder = QueryBuilder::new(
-                "SELECT n.id, n.kind_id, n.name, n.description, n.content, n.updated_at, \
-                 0.0 AS score FROM node n WHERE 1 = 1",
+                "SELECT n.id, n.kind_id, n.name, n.description, n.content, n.version, \
+                 n.updated_at, 0.0 AS score FROM node n WHERE 1 = 1",
             );
             push_tag_filter(&mut builder, tags);
             push_property_filters(&mut builder, properties);
@@ -1273,6 +1387,7 @@ struct SearchRow {
     name: String,
     description: String,
     content: String,
+    version: i64,
     updated_at: String,
     score: f64,
 }
@@ -1286,6 +1401,7 @@ impl SearchRow {
                 name: self.name,
                 description: self.description,
                 content: self.content,
+                version: self.version,
                 updated_at: self.updated_at,
             },
             score: self.score.abs(),
@@ -2034,8 +2150,8 @@ async fn import_node(
             }
             sqlx::query(
                 "UPDATE node SET name = ?, description = ?, content = ?, \
-                 properties = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-                 WHERE id = ?",
+                 properties = ?, version = version + 1, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
             )
             .bind(&node.name)
             .bind(next_description)
@@ -2179,6 +2295,7 @@ async fn update_node_items(
     connection: &mut SqliteConnection,
     node_id: i64,
     patch: &NodePatch,
+    expected_version: Option<i64>,
 ) -> Result<(Node, Vec<String>), RepositoryError> {
     let existing =
         sqlx::query_as::<_, Node>(&format!("SELECT {NODE_COLUMNS} FROM node WHERE id = ?"))
@@ -2186,6 +2303,15 @@ async fn update_node_items(
             .fetch_optional(&mut *connection)
             .await?
             .ok_or(RepositoryError::RowNotFound)?;
+
+    if let Some(expected) = expected_version
+        && existing.version != expected
+    {
+        return Err(RepositoryError::PreconditionFailed(format!(
+            "node {node_id} is at version {}, not {expected}",
+            existing.version
+        )));
+    }
 
     if let Some(properties) = &patch.properties {
         let schema = load_kind_schema(&mut *connection, existing.kind_id).await?;
@@ -2266,7 +2392,7 @@ async fn update_node_items(
     let node = if fields_changed {
         sqlx::query_as::<_, Node>(&format!(
             "UPDATE node SET name = ?, description = ?, content = ?, properties = ?, \
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
              WHERE id = ? RETURNING {NODE_COLUMNS}"
         ))
         .bind(name)
@@ -2338,7 +2464,10 @@ async fn insert_nodes_with_edges_items(
                  VALUES (?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET kind_id = excluded.kind_id, \
                  name = excluded.name, description = excluded.description, \
-                 content = excluded.content, updated_at = CASE WHEN node.kind_id = excluded.kind_id \
+                 content = excluded.content, version = CASE WHEN node.kind_id = excluded.kind_id \
+                   AND node.name = excluded.name AND node.description = excluded.description \
+                   AND node.content = excluded.content THEN node.version ELSE node.version + 1 END, \
+                 updated_at = CASE WHEN node.kind_id = excluded.kind_id \
                    AND node.name = excluded.name AND node.description = excluded.description \
                    AND node.content = excluded.content THEN node.updated_at ELSE excluded.updated_at END \
                  RETURNING {NODE_COLUMNS}"
@@ -2378,7 +2507,8 @@ async fn insert_nodes_with_edges_items(
         }
         if touched && node.id != 0 {
             row = sqlx::query_as::<_, Node>(&format!(
-                "UPDATE node SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                "UPDATE node SET version = version + 1, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
                  WHERE id = ? RETURNING {NODE_COLUMNS}"
             ))
             .bind(row.id)
@@ -2735,6 +2865,58 @@ fn push_edge_query_order(builder: &mut QueryBuilder<Sqlite>, order: &[crate::mod
     builder.push(", e.source ASC, e.edge_type_id ASC, e.destination ASC");
 }
 
+async fn idempotency_reserve_items(
+    connection: &mut SqliteConnection,
+    key: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<IdempotencyReservation, RepositoryError> {
+    sqlx::query(
+        "DELETE FROM idempotency_key WHERE status IS NULL \
+         AND created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-300 seconds')",
+    )
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(
+        "DELETE FROM idempotency_key \
+         WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')",
+    )
+    .execute(&mut *connection)
+    .await?;
+    let inserted = sqlx::query(
+        "INSERT INTO idempotency_key (key, method, path, request_body) \
+         VALUES (?, ?, ?, ?) ON CONFLICT(key) DO NOTHING",
+    )
+    .bind(key)
+    .bind(method)
+    .bind(path)
+    .bind(body.to_vec())
+    .execute(&mut *connection)
+    .await?;
+    if inserted.rows_affected() == 1 {
+        return Ok(IdempotencyReservation::Reserved);
+    }
+    let row = sqlx::query_as::<_, (String, String, Vec<u8>, Option<i64>, Option<Vec<u8>>)>(
+        "SELECT method, path, request_body, status, response_body \
+         FROM idempotency_key WHERE key = ?",
+    )
+    .bind(key)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| RepositoryError::SqlExecutionError("idempotency row vanished".to_string()))?;
+    if row.0 != method || row.1 != path || row.2 != body {
+        return Ok(IdempotencyReservation::Conflict);
+    }
+    match (row.3, row.4) {
+        (Some(status), Some(response)) => Ok(IdempotencyReservation::Replay {
+            status: status as u16,
+            body: response,
+        }),
+        _ => Ok(IdempotencyReservation::InProgress),
+    }
+}
+
 async fn node_tag_map(
     connection: &mut SqliteConnection,
     ids: &[i64],
@@ -3034,6 +3216,42 @@ fn push_tag_filter(builder: &mut QueryBuilder<Sqlite>, tags: &[String]) {
     builder.push(")");
 }
 
+async fn upsert_node_with_tags_items(
+    connection: &mut SqliteConnection,
+    node: &Node,
+    tags: &[String],
+    properties: Option<&serde_json::Value>,
+) -> Result<Node, RepositoryError> {
+    let schema = load_kind_schema(connection, node.kind_id).await?;
+    let empty = serde_json::json!({});
+    let candidate = properties.unwrap_or(&empty);
+    if properties.is_some() || node.id == 0 {
+        validate_declared_properties(candidate, &schema.properties, schema.strict)
+            .map_err(RepositoryError::ContractViolation)?;
+    }
+    let row = insert_node(&mut *connection, node)
+        .await
+        .map_err(RepositoryError::from)?;
+    replace_tags(connection, row.id, tags).await?;
+    if let Some(properties) = properties {
+        let encoded = serde_json::to_string(properties)
+            .map_err(|error| RepositoryError::SqlExecutionError(error.to_string()))?;
+        sqlx::query(
+            "UPDATE node SET properties = ?, version = version + 1, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        )
+        .bind(encoded)
+        .bind(row.id)
+        .execute(&mut *connection)
+        .await?;
+    }
+    let row = sqlx::query_as::<_, Node>(&format!("SELECT {NODE_COLUMNS} FROM node WHERE id = ?"))
+        .bind(row.id)
+        .fetch_one(&mut *connection)
+        .await?;
+    Ok(row)
+}
+
 async fn insert_node<'e, E>(executor: E, node: &Node) -> Result<Node, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = Sqlite>,
@@ -3054,6 +3272,9 @@ where
             "INSERT INTO node (id, kind_id, name, description, content) VALUES (?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET kind_id = excluded.kind_id, name = excluded.name, \
              description = excluded.description, content = excluded.content, \
+             version = CASE WHEN node.kind_id = excluded.kind_id \
+               AND node.name = excluded.name AND node.description = excluded.description \
+               AND node.content = excluded.content THEN node.version ELSE node.version + 1 END, \
              updated_at = CASE WHEN node.kind_id = excluded.kind_id \
                AND node.name = excluded.name AND node.description = excluded.description \
                AND node.content = excluded.content THEN node.updated_at ELSE excluded.updated_at END \

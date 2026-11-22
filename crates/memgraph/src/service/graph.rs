@@ -12,7 +12,7 @@ use crate::{
         QueryRequest, QuerySelect, ReachFilter, SearchPage, SortDirection, TagUsage, TaskDraft,
         TaskPatch, WorkDependency, WorkFilter, WorkPage, WorkRef, WorkStatus, WorkTask,
     },
-    repository::graph::{GraphRepository, WorkSnapshot},
+    repository::graph::{GraphRepository, IdempotencyReservation, WorkSnapshot},
 };
 
 use super::error::ServiceError;
@@ -284,6 +284,25 @@ impl GraphService {
         node_id: i64,
         patch: &NodePatch,
     ) -> Result<(Node, Vec<String>), ServiceError> {
+        self.update_node_with_version(node_id, patch, None).await
+    }
+
+    pub async fn update_node_checked(
+        &self,
+        node_id: i64,
+        patch: &NodePatch,
+        expected_version: i64,
+    ) -> Result<(Node, Vec<String>), ServiceError> {
+        self.update_node_with_version(node_id, patch, Some(expected_version))
+            .await
+    }
+
+    async fn update_node_with_version(
+        &self,
+        node_id: i64,
+        patch: &NodePatch,
+        expected_version: Option<i64>,
+    ) -> Result<(Node, Vec<String>), ServiceError> {
         let node = self.get_node(node_id).await?;
         if patch.is_empty() {
             return Err(ServiceError::UnprocessableEntity(
@@ -309,7 +328,7 @@ impl GraphService {
                 .await?;
         }
         self.repository
-            .update_node(node_id, &normalized)
+            .update_node(node_id, &normalized, expected_version)
             .await
             .map_err(Into::into)
     }
@@ -539,6 +558,25 @@ impl GraphService {
     }
 
     pub async fn update_task(&self, task_id: i64, patch: &TaskPatch) -> Result<Node, ServiceError> {
+        self.update_task_with_version(task_id, patch, None).await
+    }
+
+    pub async fn update_task_checked(
+        &self,
+        task_id: i64,
+        patch: &TaskPatch,
+        expected_version: i64,
+    ) -> Result<Node, ServiceError> {
+        self.update_task_with_version(task_id, patch, Some(expected_version))
+            .await
+    }
+
+    async fn update_task_with_version(
+        &self,
+        task_id: i64,
+        patch: &TaskPatch,
+        expected_version: Option<i64>,
+    ) -> Result<Node, ServiceError> {
         if patch.is_empty() {
             return Err(ServiceError::UnprocessableEntity(
                 "provide at least one of name, description, content or tags".to_string(),
@@ -552,7 +590,7 @@ impl GraphService {
             )));
         }
         let (updated, _) = self
-            .update_node(
+            .update_node_with_version(
                 task_id,
                 &NodePatch {
                     name: patch.name.clone(),
@@ -561,6 +599,7 @@ impl GraphService {
                     tags: patch.tags.clone(),
                     properties: patch.properties.clone(),
                 },
+                expected_version,
             )
             .await?;
         Ok(updated)
@@ -631,6 +670,7 @@ impl GraphService {
             name: draft.name.clone(),
             description: draft.description.clone(),
             content: draft.content.clone(),
+            version: 0,
             updated_at: String::new(),
         };
         let mut edges = Vec::new();
@@ -820,6 +860,7 @@ impl GraphService {
             name: commit,
             description: title.to_string(),
             content: draft.summary.clone(),
+            version: 0,
             updated_at: String::new(),
         };
         let pending = PendingNode {
@@ -1174,6 +1215,38 @@ impl GraphService {
             .map(|edge_type| (edge_type.id, edge_type.name))
             .collect();
         Ok((kinds, edge_types))
+    }
+
+    pub async fn idempotency_reserve(
+        &self,
+        key: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<IdempotencyReservation, ServiceError> {
+        self.repository
+            .idempotency_reserve(key, method, path, body)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn idempotency_complete(
+        &self,
+        key: &str,
+        status: i64,
+        body: &[u8],
+    ) -> Result<(), ServiceError> {
+        self.repository
+            .idempotency_complete(key, status, body)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn idempotency_abort(&self, key: &str) -> Result<(), ServiceError> {
+        self.repository
+            .idempotency_abort(key)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn list_edges(
@@ -1778,6 +1851,7 @@ fn build_plan_nodes(
                 name: goal.name.clone(),
                 description: goal.description.clone(),
                 content: goal.content.clone(),
+                version: 0,
                 updated_at: String::new(),
             },
             properties: goal.properties.clone(),
@@ -1792,6 +1866,7 @@ fn build_plan_nodes(
                 name: task.name.clone(),
                 description: task.description.clone(),
                 content: task.content.clone(),
+                version: 0,
                 updated_at: String::new(),
             },
             properties: task.properties.clone(),
@@ -2314,6 +2389,7 @@ mod tests {
             name: name.to_string(),
             description: String::new(),
             content: content.to_string(),
+            version: 0,
             updated_at: String::new(),
         }
     }
@@ -2325,6 +2401,7 @@ mod tests {
             name: name.to_string(),
             description: description.to_string(),
             content: String::new(),
+            version: 0,
             updated_at: String::new(),
         }
     }
@@ -5105,6 +5182,37 @@ mod tests {
         assert_eq!(created, 1);
         assert_eq!(unchanged, 7);
 
+        drop(service);
+        remove_sqlite(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_node_creates_succeed() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "memgraph-node-writes-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let service = file_service(&path).await;
+        let kind = seed_person(&service).await;
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let service = service.clone();
+            handles.push(tokio::spawn(async move {
+                service
+                    .create_node(&node(kind, &format!("person {index}"), ""), &[])
+                    .await
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .unwrap()
+                .expect("concurrent node create succeeds");
+        }
         drop(service);
         remove_sqlite(&path);
     }
@@ -8245,6 +8353,126 @@ mod tests {
             unknown_edge,
             ServiceError::UnprocessableEntity(message) if message.contains("not defined")
         ));
+    }
+
+    #[tokio::test]
+    async fn idempotency_reservations_replay_conflict_and_abort() {
+        let service = service().await;
+        assert_eq!(
+            service
+                .idempotency_reserve("key-1", "POST", "/api/nodes", b"{\"a\":1}")
+                .await
+                .unwrap(),
+            IdempotencyReservation::Reserved
+        );
+        assert_eq!(
+            service
+                .idempotency_reserve("key-1", "POST", "/api/nodes", b"{\"a\":1}")
+                .await
+                .unwrap(),
+            IdempotencyReservation::InProgress
+        );
+        assert_eq!(
+            service
+                .idempotency_reserve("key-1", "POST", "/api/nodes", b"{\"a\":2}")
+                .await
+                .unwrap(),
+            IdempotencyReservation::Conflict
+        );
+        service
+            .idempotency_complete("key-1", 201, b"{\"id\":1}")
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .idempotency_reserve("key-1", "POST", "/api/nodes", b"{\"a\":1}")
+                .await
+                .unwrap(),
+            IdempotencyReservation::Replay {
+                status: 201,
+                body: b"{\"id\":1}".to_vec(),
+            }
+        );
+        assert_eq!(
+            service
+                .idempotency_reserve("key-2", "POST", "/api/nodes", b"{}")
+                .await
+                .unwrap(),
+            IdempotencyReservation::Reserved
+        );
+        service.idempotency_abort("key-2").await.unwrap();
+        assert_eq!(
+            service
+                .idempotency_reserve("key-2", "POST", "/api/nodes", b"{}")
+                .await
+                .unwrap(),
+            IdempotencyReservation::Reserved
+        );
+        service.idempotency_abort("key-1").await.unwrap();
+        assert!(matches!(
+            service
+                .idempotency_reserve("key-1", "POST", "/api/nodes", b"{\"a\":1}")
+                .await
+                .unwrap(),
+            IdempotencyReservation::Replay { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn idempotency_reservations_expire_when_stale() {
+        let (service, pool) = service_with_pool().await;
+        assert_eq!(
+            service
+                .idempotency_reserve("stale", "POST", "/api/nodes", b"{}")
+                .await
+                .unwrap(),
+            IdempotencyReservation::Reserved
+        );
+        sqlx::query(
+            "UPDATE idempotency_key SET created_at = '2000-01-01T00:00:00.000Z' \
+             WHERE key = 'stale'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            service
+                .idempotency_reserve("stale", "POST", "/api/nodes", b"{}")
+                .await
+                .unwrap(),
+            IdempotencyReservation::Reserved
+        );
+    }
+
+    #[tokio::test]
+    async fn if_match_versions_reject_stale_updates() {
+        let service = service().await;
+        let kind = seed_person(&service).await;
+        let created = service
+            .create_node(&node(kind, "ada", ""), &[])
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(created.version, 1);
+        let patch = NodePatch {
+            description: Some("first".to_string()),
+            ..Default::default()
+        };
+        let (updated, _) = service
+            .update_node_checked(created.id, &patch, 1)
+            .await
+            .unwrap();
+        assert_eq!(updated.version, 2);
+        assert!(matches!(
+            service.update_node_checked(created.id, &patch, 1).await,
+            Err(ServiceError::PreconditionFailed(_))
+        ));
+        service
+            .replace_node_tags(created.id, &["phase:p0".to_string()])
+            .await
+            .unwrap();
+        let current = service.get_node(created.id).await.unwrap();
+        assert_eq!(current.version, 3);
     }
 
     #[tokio::test]

@@ -78,6 +78,7 @@ mod tests {
                 name: name.to_string(),
                 description: format!("{name} description"),
                 content: String::new(),
+                version: 0,
                 updated_at: String::new(),
             })
             .await
@@ -149,6 +150,7 @@ mod tests {
                 name: "src/main.rs".to_string(),
                 description: String::new(),
                 content: String::new(),
+                version: 0,
                 updated_at: String::new(),
             })
             .await;

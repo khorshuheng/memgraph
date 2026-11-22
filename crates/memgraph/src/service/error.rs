@@ -17,6 +17,8 @@ pub enum ServiceError {
     Unavailable(String),
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
+    #[error("precondition failed: {0}")]
+    PreconditionFailed(String),
 }
 
 impl From<RepositoryError> for ServiceError {
@@ -28,6 +30,7 @@ impl From<RepositoryError> for ServiceError {
             RepositoryError::ContractViolation(err) => ServiceError::UnprocessableEntity(err),
             RepositoryError::Busy(err) => ServiceError::Unavailable(err),
             RepositoryError::LimitExceeded(err) => ServiceError::PayloadTooLarge(err),
+            RepositoryError::PreconditionFailed(err) => ServiceError::PreconditionFailed(err),
             err => ServiceError::InternalError(err.to_string()),
         }
     }
@@ -36,30 +39,40 @@ impl From<RepositoryError> for ServiceError {
 impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
         match error {
-            ServiceError::InternalError(_) => ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: error.to_string(),
-            },
-            ServiceError::EntityNotFound => ApiError {
-                status: StatusCode::NOT_FOUND,
-                message: error.to_string(),
-            },
-            ServiceError::Conflict(_) => ApiError {
-                status: StatusCode::CONFLICT,
-                message: error.to_string(),
-            },
-            ServiceError::UnprocessableEntity(_) => ApiError {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                message: error.to_string(),
-            },
-            ServiceError::Unavailable(_) => ApiError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: error.to_string(),
-            },
-            ServiceError::PayloadTooLarge(_) => ApiError {
-                status: StatusCode::PAYLOAD_TOO_LARGE,
-                message: error.to_string(),
-            },
+            ServiceError::InternalError(_) => ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                error.to_string(),
+            ),
+            ServiceError::EntityNotFound => {
+                ApiError::new(StatusCode::NOT_FOUND, "not_found", error.to_string())
+            }
+            ServiceError::Conflict(_) => {
+                ApiError::new(StatusCode::CONFLICT, "conflict", error.to_string())
+            }
+            ServiceError::UnprocessableEntity(_) => ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_request",
+                error.to_string(),
+            ),
+            ServiceError::Unavailable(_) => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                error.to_string(),
+            )
+            .with_hint("retry the request")
+            .with_retryable(),
+            ServiceError::PayloadTooLarge(_) => ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                error.to_string(),
+            ),
+            ServiceError::PreconditionFailed(_) => ApiError::new(
+                StatusCode::PRECONDITION_FAILED,
+                "precondition_failed",
+                error.to_string(),
+            )
+            .with_hint("reload the resource and retry with the current version"),
         }
     }
 }

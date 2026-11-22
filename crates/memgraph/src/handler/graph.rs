@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header},
 };
 
 use crate::{
@@ -32,6 +32,34 @@ async fn fill_names<T: FillNames>(state: &AppState, data: &mut T) -> Result<(), 
     let (kinds, edge_types) = state.graph_service.name_maps().await?;
     data.fill_names(&kinds, &edge_types);
     Ok(())
+}
+
+fn parse_if_match(headers: &HeaderMap) -> Result<Option<i64>, ApiError> {
+    let Some(value) = headers.get(header::IF_MATCH) else {
+        return Ok(None);
+    };
+    let raw = value.to_str().map_err(|_| {
+        ApiError::unprocessable("If-Match must be a numeric version or *").with_field("if-match")
+    })?;
+    let raw = raw.trim();
+    if raw == "*" {
+        return Ok(None);
+    }
+    if raw.contains(',') {
+        return Err(
+            ApiError::unprocessable("If-Match must contain a single version or *")
+                .with_field("if-match"),
+        );
+    }
+    let raw = raw
+        .strip_prefix("W/")
+        .unwrap_or(raw)
+        .trim()
+        .trim_matches('"');
+    let version = raw.parse::<i64>().map_err(|_| {
+        ApiError::unprocessable("If-Match must be a numeric version or *").with_field("if-match")
+    })?;
+    Ok(Some(version))
 }
 
 #[utoipa::path(
@@ -337,10 +365,9 @@ pub async fn list_nodes(
     State(state): State<AppState>,
     Query(params): Query<ListNodesParameters>,
 ) -> Result<ApiSuccess<ListNodesResponse>, ApiError> {
-    let ids = params.id_list().map_err(|message| ApiError {
-        status: StatusCode::UNPROCESSABLE_ENTITY,
-        message,
-    })?;
+    let ids = params
+        .id_list()
+        .map_err(|message| ApiError::unprocessable(message).with_field("ids"))?;
     if let Some(ids) = ids {
         if params.kind.is_some()
             || params.name.is_some()
@@ -353,10 +380,10 @@ pub async fn list_nodes(
             || params.limit.is_some()
             || params.offset.is_some()
         {
-            return Err(ApiError {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                message: "ids cannot be combined with other node filters".to_string(),
-            });
+            return Err(
+                ApiError::unprocessable("ids cannot be combined with other node filters")
+                    .with_field("ids"),
+            );
         }
         let nodes = state.graph_service.nodes_by_ids(&ids).await?;
         let total = nodes.len() as i64;
@@ -379,10 +406,9 @@ pub async fn list_nodes(
     }
     let limit = params.limit;
     let offset = params.offset;
-    let properties = params.property_filter().map_err(|message| ApiError {
-        status: StatusCode::UNPROCESSABLE_ENTITY,
-        message,
-    })?;
+    let properties = params
+        .property_filter()
+        .map_err(|message| ApiError::unprocessable(message).with_field("properties"))?;
     let mut filter: NodeFilter = params.into();
     filter.properties = properties;
     let page = state
@@ -426,10 +452,20 @@ pub async fn list_nodes(
 pub async fn update_task(
     State(state): State<AppState>,
     Path(task_id): Path<i64>,
+    headers: HeaderMap,
     Json(params): Json<UpdateTaskParameters>,
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let patch: TaskPatch = params.into();
-    let updated = state.graph_service.update_task(task_id, &patch).await?;
+    let expected = parse_if_match(&headers)?;
+    let updated = match expected {
+        Some(version) => {
+            state
+                .graph_service
+                .update_task_checked(task_id, &patch, version)
+                .await?
+        }
+        None => state.graph_service.update_task(task_id, &patch).await?,
+    };
     let tags = state.graph_service.node_tags(updated.id).await?;
     let properties = state.graph_service.node_properties(updated.id).await?;
     let mut data = NodeResponse::with_tags_and_properties(updated, tags, properties);
@@ -478,10 +514,20 @@ pub async fn get_node(
 pub async fn update_node(
     State(state): State<AppState>,
     Path(node_id): Path<i64>,
+    headers: HeaderMap,
     Json(params): Json<UpdateNodeParameters>,
 ) -> Result<ApiSuccess<NodeResponse>, ApiError> {
     let patch: NodePatch = params.into();
-    let (node, tags) = state.graph_service.update_node(node_id, &patch).await?;
+    let expected = parse_if_match(&headers)?;
+    let (node, tags) = match expected {
+        Some(version) => {
+            state
+                .graph_service
+                .update_node_checked(node_id, &patch, version)
+                .await?
+        }
+        None => state.graph_service.update_node(node_id, &patch).await?,
+    };
     let properties = state.graph_service.node_properties(node_id).await?;
     let mut data = NodeResponse::with_tags_and_properties(node, tags, properties);
     fill_names(&state, &mut data).await?;
@@ -825,10 +871,9 @@ pub async fn search(
     Query(params): Query<SearchParameters>,
 ) -> Result<ApiSuccess<SearchResponse>, ApiError> {
     let tags = params.tag_list();
-    let properties = params.property_filter().map_err(|message| ApiError {
-        status: StatusCode::UNPROCESSABLE_ENTITY,
-        message,
-    })?;
+    let properties = params
+        .property_filter()
+        .map_err(|message| ApiError::unprocessable(message).with_field("properties"))?;
     let page = state
         .graph_service
         .search(
@@ -1114,6 +1159,7 @@ mod tests {
         let updated = update_task(
             State(state.clone()),
             Path(created.id),
+            HeaderMap::new(),
             Json(UpdateTaskParameters {
                 name: None,
                 description: Some("changed".to_string()),
@@ -1130,6 +1176,7 @@ mod tests {
         let preserved = update_task(
             State(state.clone()),
             Path(created.id),
+            HeaderMap::new(),
             Json(UpdateTaskParameters {
                 name: None,
                 description: Some("again".to_string()),
@@ -1146,6 +1193,7 @@ mod tests {
         let cleared = update_task(
             State(state.clone()),
             Path(created.id),
+            HeaderMap::new(),
             Json(UpdateTaskParameters {
                 name: None,
                 description: None,
@@ -1355,6 +1403,7 @@ mod tests {
         let error = update_task(
             State(state.clone()),
             Path(node.id),
+            HeaderMap::new(),
             Json(UpdateTaskParameters {
                 name: Some("b".to_string()),
                 description: None,
@@ -1477,6 +1526,7 @@ mod tests {
         let updated = update_node(
             State(state.clone()),
             Path(node.id),
+            HeaderMap::new(),
             Json(UpdateNodeParameters {
                 name: Some("second".to_string()),
                 description: Some("changed".to_string()),
@@ -1529,6 +1579,7 @@ mod tests {
         let updated = update_node(
             State(state.clone()),
             Path(created.id),
+            HeaderMap::new(),
             Json(UpdateNodeParameters {
                 name: None,
                 description: None,
@@ -2391,6 +2442,62 @@ mod tests {
         );
         assert!(export.nodes.iter().all(|node| node.kind == "person"));
         assert_eq!(export.edges[0].edge_type, "knows");
+    }
+
+    #[tokio::test]
+    async fn update_node_honours_if_match() {
+        let state = test_state().await;
+        let kind = seed_kind(&state, "person").await;
+        let created = new_node(&state, kind, "ada", "", "", &[]).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::IF_MATCH,
+            axum::http::HeaderValue::from_str(&created.version.to_string()).unwrap(),
+        );
+        let patch = || UpdateNodeParameters {
+            name: None,
+            description: Some("changed".to_string()),
+            content: None,
+            tags: None,
+            properties: None,
+        };
+        let updated = update_node(
+            State(state.clone()),
+            Path(created.id),
+            headers.clone(),
+            Json(patch()),
+        )
+        .await
+        .expect("matching version")
+        .data;
+        assert_eq!(updated.version, created.version + 1);
+
+        let error = update_node(
+            State(state.clone()),
+            Path(created.id),
+            headers,
+            Json(patch()),
+        )
+        .await
+        .expect_err("stale version");
+        assert_eq!(error.status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(error.code, "precondition_failed");
+
+        let mut malformed = HeaderMap::new();
+        malformed.insert(
+            header::IF_MATCH,
+            axum::http::HeaderValue::from_static("not-a-version"),
+        );
+        let error = update_node(
+            State(state.clone()),
+            Path(created.id),
+            malformed,
+            Json(patch()),
+        )
+        .await
+        .expect_err("malformed If-Match");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.field.as_deref(), Some("if-match"));
     }
 
     #[tokio::test]
